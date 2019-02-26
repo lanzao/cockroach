@@ -513,8 +513,10 @@ func TestParse(t *testing.T) {
 		{`PREPARE a (STRING, INT8) AS OPT PLAN 'some-string'`},
 
 		{`EXECUTE a`},
+		{`EXECUTE a DISCARD ROWS`},
 		{`EXECUTE a (1)`},
 		{`EXECUTE a (1, 1)`},
+		{`EXECUTE a (1, 1) DISCARD ROWS`},
 		{`EXECUTE a (1 + 1)`},
 
 		{`DEALLOCATE a`},
@@ -685,6 +687,9 @@ func TestParse(t *testing.T) {
 		{`SELECT 'foo'::CHAR(3)`},
 		{`SELECT 'foo'::VARCHAR(3)`},
 		{`SELECT 'foo'::STRING(3)`},
+		{`SELECT 'foo'::TIMESTAMP(6)`},
+		{`SELECT 'foo'::TIMESTAMPTZ(6)`},
+		{`SELECT 'foo'::TIME(6)`},
 
 		{`SELECT '192.168.0.1'::INET`},
 		{`SELECT '192.168.0.1':::INET`},

@@ -61,6 +61,8 @@ func (p *planner) AlterTable(ctx context.Context, n *tree.AlterTable) (planNode,
 		return nil, err
 	}
 
+	n.HoistAddColumnConstraints()
+
 	// See if there's any "inject statistics" in the query and type check the
 	// expressions.
 	statsData := make(map[int]tree.TypedExpr)
@@ -97,10 +99,6 @@ func (n *alterTableNode) startExec(params runParams) error {
 		switch t := cmd.(type) {
 		case *tree.AlterTableAddColumn:
 			d := t.ColumnDef
-			if len(d.CheckExprs) > 0 {
-				return pgerror.UnimplementedWithIssueError(29639,
-					"adding a CHECK constraint while also adding a column via ALTER not supported")
-			}
 			if d.HasFKConstraint() {
 				return pgerror.UnimplementedWithIssueError(32917,
 					"adding a REFERENCES constraint while also adding a column via ALTER not supported")
@@ -463,11 +461,11 @@ func (n *alterTableNode) startExec(params runParams) error {
 			case sqlbase.ConstraintTypeUnique:
 				return fmt.Errorf("UNIQUE constraint depends on index %q, use DROP INDEX with CASCADE if you really want to drop it", t.Constraint)
 			case sqlbase.ConstraintTypeCheck:
-				for i := range n.tableDesc.Checks {
-					if n.tableDesc.Checks[i].Validity == sqlbase.ConstraintValidity_Validating {
-						return fmt.Errorf("constraint %q in the middle of being added, try again later", t.Constraint)
-					}
-					if n.tableDesc.Checks[i].Name == name {
+				for i, c := range n.tableDesc.Checks {
+					if c.Name == name {
+						if c.Validity == sqlbase.ConstraintValidity_Validating {
+							return fmt.Errorf("constraint %q in the middle of being added, try again later", t.Constraint)
+						}
 						n.tableDesc.Checks = append(n.tableDesc.Checks[:i], n.tableDesc.Checks[i+1:]...)
 						descriptorChanged = true
 						break

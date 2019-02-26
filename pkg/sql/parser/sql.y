@@ -2465,6 +2465,15 @@ execute_stmt:
       Params: $3.exprs(),
     }
   }
+| EXECUTE table_alias_name execute_param_clause DISCARD ROWS
+  {
+    /* SKIP DOC */
+    $$.val = &tree.Execute{
+      Name: tree.Name($2),
+      Params: $3.exprs(),
+      DiscardRows: true,
+    }
+  }
 | EXECUTE error // SHOW HELP: EXECUTE
 
 execute_param_clause:
@@ -6608,7 +6617,14 @@ const_datetime:
     if $2.bool() { return unimplementedWithIssueDetail(sqllex, 26097, "type") }
     $$.val = coltypes.Time
   }
-| TIME '(' ICONST ')' opt_timezone   { return unimplementedWithIssue(sqllex, 32565) }
+| TIME '(' iconst64 ')' opt_timezone
+  {
+    prec := $3.int64()
+    if prec != 6 {
+         return unimplementedWithIssue(sqllex, 32565)
+    }
+    $$.val = &coltypes.TTime{PrecisionSet: true, Precision: int(prec)}
+  }
 | TIMETZ                             { return unimplementedWithIssueDetail(sqllex, 26097, "type") }
 | TIMETZ '(' ICONST ')'              { return unimplementedWithIssueDetail(sqllex, 26097, "type with precision") }
 | TIMESTAMP opt_timezone
@@ -6619,12 +6635,30 @@ const_datetime:
       $$.val = coltypes.Timestamp
     }
   }
-| TIMESTAMP '(' ICONST ')' opt_timezone { return unimplementedWithIssue(sqllex, 32098) }
+| TIMESTAMP '(' iconst64 ')' opt_timezone
+  {
+    prec := $3.int64()
+    if prec != 6 {
+         return unimplementedWithIssue(sqllex, 32098)
+    }
+    if $5.bool() {
+      $$.val = &coltypes.TTimestampTZ{PrecisionSet: true, Precision: int(prec)}
+    } else {
+      $$.val = &coltypes.TTimestamp{PrecisionSet: true, Precision: int(prec)}
+    }
+  }
 | TIMESTAMPTZ
   {
     $$.val = coltypes.TimestampWithTZ
   }
-| TIMESTAMPTZ '(' ICONST ')'            { return unimplementedWithIssue(sqllex, 32098) }
+| TIMESTAMPTZ '(' iconst64 ')'
+  {
+    prec := $3.int64()
+    if prec != 6 {
+         return unimplementedWithIssue(sqllex, 32098)
+    }
+    $$.val = &coltypes.TTimestampTZ{PrecisionSet: true, Precision: int(prec)}
+  }
 
 opt_timezone:
   WITH_LA TIME ZONE { $$.val = true; }

@@ -695,7 +695,7 @@ func TestJSONExists(t *testing.T) {
 			{`baz`, false},
 		},
 		`["a"]`: {{``, false}, {`0`, false}, {`a`, true}},
-		`"a"`:   {{``, false}, {`0`, false}, {`a`, false}},
+		`"a"`:   {{``, false}, {`0`, false}, {`a`, true}},
 		`1`:     {{``, false}, {`0`, false}, {`a`, false}},
 		`true`:  {{``, false}, {`0`, false}, {`a`, false}},
 	}
@@ -1283,6 +1283,41 @@ func TestEncodeJSONInvertedIndex(t *testing.T) {
 				t.Errorf("unexpected encoding mismatch for %v. expected [%#v], got [%#v]",
 					c.value, c.expEnc[j], path)
 			}
+		}
+	}
+}
+
+func TestNumInvertedIndexEntries(t *testing.T) {
+	testCases := []struct {
+		value    string
+		expCount int
+	}{
+		{`1`, 1},
+		{`"a"`, 1},
+		{`null`, 1},
+		{`false`, 1},
+		{`true`, 1},
+		{`[]`, 1},
+		{`{}`, 1},
+		{`[[[]]]`, 1},
+		{`[[{}]]`, 1},
+		{`[{}, []]`, 2},
+		{`[1, 2]`, 2},
+		{`[1, [1]]`, 2},
+		{`[1, 2, 1, 2]`, 2},
+		{`[[1, 2], [2, 3]]`, 3},
+		{`[{"a": 1, "b": 2}]`, 2},
+		{`[{"a": 1, "b": 2}, {"a": 1, "b": 3}]`, 3},
+		{`[{"a": [1, 2], "b": 2}, {"a": [1, 3], "b": 3}]`, 5},
+	}
+	for _, c := range testCases {
+		n, err := NumInvertedIndexEntries(jsonTestShorthand(c.value))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != c.expCount {
+			t.Errorf("unexpected count of index entries for %v. expected %d, got %d",
+				c.value, c.expCount, n)
 		}
 	}
 }

@@ -190,14 +190,8 @@ func (ex *connExecutor) populatePrepared(
 	prepared := stmt.Prepared
 
 	p.extendedEvalCtx.PrepareOnly = true
-	p.extendedEvalCtx.ActiveMemAcc = &prepared.memAcc
-	// constantMemAcc accounts for all constant folded values that are computed
-	// prior to any rows being computed.
-	constantMemAcc := p.extendedEvalCtx.Mon.MakeBoundAccount()
-	p.extendedEvalCtx.ActiveMemAcc = &constantMemAcc
-	defer constantMemAcc.Close(ctx)
 
-	protoTS, err := p.isAsOf(stmt.AST, ex.server.cfg.Clock.Now() /* max */)
+	protoTS, err := p.isAsOf(stmt.AST)
 	if err != nil {
 		return 0, err
 	}

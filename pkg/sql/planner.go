@@ -136,6 +136,12 @@ type planner struct {
 	// want to do 1PC transactions have to implement the autoCommitNode interface.
 	autoCommit bool
 
+	// discardRows is set if we want to discard any results rather than sending
+	// them back to the client. Used for testing/benchmarking. Note that the
+	// resulting schema or the plan are not affected.
+	// See EXECUTE .. DISCARD ROWS.
+	discardRows bool
+
 	// cancelChecker is used by planNodes to check for cancellation of the associated
 	// query.
 	cancelChecker *sqlbase.CancelChecker
@@ -265,15 +271,11 @@ func newInternalPlanner(
 	p.extendedEvalCtx.Placeholders = &p.semaCtx.Placeholders
 	p.extendedEvalCtx.Tables = tables
 
-	acc := plannerMon.MakeBoundAccount()
-	p.extendedEvalCtx.ActiveMemAcc = &acc
-
 	p.queryCacheSession.Init()
 
 	return p, func() {
 		// Note that we capture ctx here. This is only valid as long as we create
 		// the context as explained at the top of the method.
-		acc.Close(ctx)
 		plannerMon.Stop(ctx)
 	}
 }
@@ -556,8 +558,11 @@ func (p *planner) runWithDistSQL(
 	columns := planColumns(plan)
 
 	// Initialize a row container for the DistSQL execution engine to write into.
+	// The caller of this method will call Close on the returned RowContainer,
+	// which will close this account.
+	acc := planCtx.EvalContext().Mon.MakeBoundAccount()
 	ci := sqlbase.ColTypeInfoFromResCols(columns)
-	rows := rowcontainer.NewRowContainer(*p.extendedEvalCtx.ActiveMemAcc, ci, 0 /* rowCapacity */)
+	rows := rowcontainer.NewRowContainer(acc, ci, 0 /* rowCapacity */)
 	rowResultWriter := NewRowResultWriter(rows)
 	recv := MakeDistSQLReceiver(
 		ctx,

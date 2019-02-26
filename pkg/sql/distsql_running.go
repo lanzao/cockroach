@@ -262,6 +262,17 @@ func (dsp *DistSQLPlanner) Run(
 	flow.Cleanup(ctx)
 }
 
+// errorPriority is used to rank errors such that the "best" one is chosen to be
+// presented as the query result.
+type errorPriority int
+
+const (
+	scoreNoError errorPriority = iota
+	scoreTxnRestart
+	scoreTxnAbort
+	scoreNonRetriable
+)
+
 // DistSQLReceiver is a RowReceiver that writes results to a rowResultWriter.
 // This is where the DistSQL execution meets the SQL Session - the RowContainer
 // comes from a client Session.
@@ -286,6 +297,10 @@ type DistSQLReceiver struct {
 	// noColsRequired indicates that the caller is only interested in the
 	// existence of a single row. Used by subqueries in EXISTS mode.
 	noColsRequired bool
+
+	// discardRows is set when we want to discard rows (for testing/benchmarks).
+	// See EXECUTE .. DISCARD ROWS.
+	discardRows bool
 
 	// commErr keeps track of the error received from interacting with the
 	// resultWriter. This represents a "communication error" and as such is unlike
@@ -467,23 +482,27 @@ func (r *DistSQLReceiver) Push(
 					errors.Errorf("received a leaf TxnCoordMeta (%s); but have no root", meta.TxnCoordMeta))
 			}
 		}
-		if meta.Err != nil && r.resultWriter.Err() == nil {
-			if r.txn != nil {
-				if retryErr, ok := meta.Err.(*roachpb.UnhandledRetryableError); ok {
-					// Update the txn in response to remote errors. In the non-DistSQL
-					// world, the TxnCoordSender handles "unhandled" retryable errors,
-					// but this one is coming from a distributed SQL node, which has
-					// left the handling up to the root transaction.
-					meta.Err = r.txn.UpdateStateOnRemoteRetryableErr(r.ctx, &retryErr.PErr)
-					// Update the clock with information from the error. On non-DistSQL
-					// code paths, the DistSender does this.
-					// TODO(andrei): We don't propagate clock signals on success cases
-					// through DistSQL; we should. We also don't propagate them through
-					// non-retryable errors; we also should.
-					r.updateClock(retryErr.PErr.Now)
+		if meta.Err != nil {
+			// Check if the error we just received should take precedence over a
+			// previous error (if any).
+			if errPriority(meta.Err) > errPriority(r.resultWriter.Err()) {
+				if r.txn != nil {
+					if retryErr, ok := meta.Err.(*roachpb.UnhandledRetryableError); ok {
+						// Update the txn in response to remote errors. In the non-DistSQL
+						// world, the TxnCoordSender handles "unhandled" retryable errors,
+						// but this one is coming from a distributed SQL node, which has
+						// left the handling up to the root transaction.
+						meta.Err = r.txn.UpdateStateOnRemoteRetryableErr(r.ctx, &retryErr.PErr)
+						// Update the clock with information from the error. On non-DistSQL
+						// code paths, the DistSender does this.
+						// TODO(andrei): We don't propagate clock signals on success cases
+						// through DistSQL; we should. We also don't propagate them through
+						// non-retryable errors; we also should.
+						r.updateClock(retryErr.PErr.Now)
+					}
 				}
+				r.resultWriter.SetError(meta.Err)
 			}
-			r.resultWriter.SetError(meta.Err)
 		}
 		if len(meta.Ranges) > 0 {
 			if err := r.updateCaches(r.ctx, meta.Ranges); err != nil && r.resultWriter.Err() == nil {
@@ -522,6 +541,12 @@ func (r *DistSQLReceiver) Push(
 		r.resultWriter.IncrementRowsAffected(int(tree.MustBeDInt(row[0].Datum)))
 		return r.status
 	}
+
+	if r.discardRows {
+		// Discard rows.
+		return r.status
+	}
+
 	// If no columns are needed by the output, the consumer is only looking for
 	// whether a single row is pushed or not, so the contents do not matter, and
 	// planNodeToRowSource is not set up to handle decoding the row.
@@ -560,6 +585,29 @@ func (r *DistSQLReceiver) Push(
 		return r.status
 	}
 	return r.status
+}
+
+// errPriority computes the priority of err.
+func errPriority(err error) errorPriority {
+	if err == nil {
+		return scoreNoError
+	}
+	if retryErr, ok := err.(*roachpb.UnhandledRetryableError); ok {
+		pErr := retryErr.PErr
+		switch pErr.GetDetail().(type) {
+		case *roachpb.TransactionAbortedError:
+			return scoreTxnAbort
+		default:
+			return scoreTxnRestart
+		}
+	}
+	if retryErr, ok := err.(*roachpb.TransactionRetryWithProtoRefreshError); ok {
+		if retryErr.PrevTxnAborted() {
+			return scoreTxnAbort
+		}
+		return scoreTxnRestart
+	}
+	return scoreNonRetriable
 }
 
 // ProducerDone is part of the RowReceiver interface.
@@ -659,8 +707,6 @@ func (dsp *DistSQLPlanner) planAndRunSubquery(
 	subqueryMemAccount := subqueryMonitor.MakeBoundAccount()
 	defer subqueryMemAccount.Close(ctx)
 
-	evalCtx.ActiveMemAcc = &subqueryMemAccount
-
 	var subqueryPlanCtx *PlanningCtx
 	var distributeSubquery bool
 	if maybeDistribute {
@@ -709,7 +755,7 @@ func (dsp *DistSQLPlanner) planAndRunSubquery(
 		typ = sqlbase.ColTypeInfoFromColTypes(colTypes)
 	}
 	rows = rowcontainer.NewRowContainer(subqueryMemAccount, typ, 0)
-	defer rows.Close(evalCtx.Ctx())
+	defer rows.Close(ctx)
 
 	subqueryRowReceiver := NewRowResultWriter(rows)
 	subqueryRecv.resultWriter = subqueryRowReceiver

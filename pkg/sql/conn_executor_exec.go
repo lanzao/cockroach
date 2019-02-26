@@ -154,9 +154,9 @@ func (ex *connExecutor) execStmtInOpenState(
 		// nicer to look at for the client.
 		if ctx.Err() != nil && res.Err() != nil {
 			if queryTimedOut {
-				res.OverwriteError(sqlbase.QueryTimeoutError)
+				res.SetError(sqlbase.QueryTimeoutError)
 			} else {
-				res.OverwriteError(sqlbase.QueryCanceledError)
+				res.SetError(sqlbase.QueryCanceledError)
 			}
 		}
 	}
@@ -209,6 +209,7 @@ func (ex *connExecutor) execStmtInOpenState(
 	if err != nil {
 		return makeErrEvent(err)
 	}
+	var discardRows bool
 
 	switch s := stmt.AST.(type) {
 	case *tree.BeginTransaction:
@@ -343,6 +344,8 @@ func (ex *connExecutor) execStmtInOpenState(
 		stmt.AnonymizedStr = ps.AnonymizedStr
 		res.ResetStmtType(ps.AST)
 
+		discardRows = s.DiscardRows
+
 		// Check again if the statement should be parallelized.
 		parallelize, err = ex.maybeSynchronizeParallelStmts(ctx, stmt)
 		if err != nil {
@@ -371,7 +374,7 @@ func (ex *connExecutor) execStmtInOpenState(
 	}
 
 	if os.ImplicitTxn.Get() {
-		asOfTs, err := p.isAsOf(stmt.AST, ex.server.cfg.Clock.Now())
+		asOfTs, err := p.isAsOf(stmt.AST)
 		if err != nil {
 			return makeErrEvent(err)
 		}
@@ -385,7 +388,7 @@ func (ex *connExecutor) execStmtInOpenState(
 		// the transaction's timestamp. This is useful for running AOST statements
 		// using the InternalExecutor inside an external transaction; one might want
 		// to do that to force p.avoidCachedDescriptors to be set below.
-		ts, err := p.isAsOf(stmt.AST, ex.server.cfg.Clock.Now())
+		ts, err := p.isAsOf(stmt.AST)
 		if err != nil {
 			return makeErrEvent(err)
 		}
@@ -405,6 +408,7 @@ func (ex *connExecutor) execStmtInOpenState(
 	p.extendedEvalCtx.Placeholders = &p.semaCtx.Placeholders
 	ex.phaseTimes[plannerStartExecStmt] = timeutil.Now()
 	p.stmt = &stmt
+	p.discardRows = discardRows
 
 	// TODO(andrei): Ideally we'd like to fork off a context for each individual
 	// statement. But the heartbeat loop in TxnCoordSender currently assumes that
@@ -413,12 +417,6 @@ func (ex *connExecutor) execStmtInOpenState(
 	// statement and transaction contexts, we should move to per-statement
 	// contexts.
 	p.cancelChecker = sqlbase.NewCancelChecker(ctx)
-
-	// constantMemAcc accounts for all constant folded values that are computed
-	// prior to any rows being computed.
-	constantMemAcc := p.EvalContext().Mon.MakeBoundAccount()
-	p.EvalContext().ActiveMemAcc = &constantMemAcc
-	defer constantMemAcc.Close(ctx)
 
 	if runInParallel {
 		cols, err := ex.execStmtInParallel(ctx, p, queryDone)
@@ -1045,7 +1043,7 @@ func (ex *connExecutor) execWithDistSQLEngine(
 			return recv.commErr
 		}
 	}
-
+	recv.discardRows = planner.discardRows
 	// We pass in whether or not we wanted to distribute this plan, which tells
 	// the planner whether or not to plan remote table readers.
 	ex.server.cfg.DistSQLPlanner.PlanAndRun(
@@ -1077,7 +1075,7 @@ func (ex *connExecutor) beginTransactionTimestampsAndReadMode(
 	}
 	p := &ex.planner
 	ex.resetPlanner(ctx, p, nil /* txn */, now.GoTime())
-	ts, err := p.EvalAsOfTimestamp(s.Modes.AsOf, now)
+	ts, err := p.EvalAsOfTimestamp(s.Modes.AsOf)
 	if err != nil {
 		return 0, time.Time{}, nil, err
 	}
