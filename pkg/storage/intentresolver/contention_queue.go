@@ -48,7 +48,7 @@ func newPusher(txn *roachpb.Transaction) *pusher {
 }
 
 func (p *pusher) activeTxn() bool {
-	return p.txn != nil && p.txn.Key != nil
+	return p.txn != nil && p.txn.IsWriting()
 }
 
 type contendedKey struct {
@@ -159,6 +159,10 @@ func (cq *contentionQueue) add(
 	if len(wiErr.Intents) != 1 {
 		log.Fatalf(ctx, "write intent error must contain only a single intent: %s", wiErr)
 	}
+	if hasExtremePriority(h) {
+		// Never queue maximum or minimum priority transactions.
+		return nil, wiErr, false
+	}
 	intent := wiErr.Intents[0]
 	key := string(intent.Span.Key)
 	curPusher := newPusher(h.Txn)
@@ -257,18 +261,20 @@ func (cq *contentionQueue) add(
 					log.VEventf(ctx, 3, "%s at front of queue; breaking from loop", txnID(curPusher.txn))
 					break Loop
 				}
-				pushReq := &roachpb.PushTxnRequest{
+
+				b := &client.Batch{}
+				b.Header.Timestamp = cq.clock.Now()
+				b.AddRawRequest(&roachpb.PushTxnRequest{
 					RequestHeader: roachpb.RequestHeader{
 						Key: pusheeTxn.Key,
 					},
-					PusherTxn: getPusherTxn(h),
-					PusheeTxn: *pusheeTxn,
-					PushTo:    h.Timestamp,
-					Now:       cq.clock.Now(),
-					PushType:  roachpb.PUSH_ABORT,
-				}
-				b := &client.Batch{}
-				b.AddRawRequest(pushReq)
+					PusherTxn:       getPusherTxn(h),
+					PusheeTxn:       *pusheeTxn,
+					PushTo:          h.Timestamp.Next(),
+					InclusivePushTo: true,
+					DeprecatedNow:   b.Header.Timestamp,
+					PushType:        roachpb.PUSH_ABORT,
+				})
 				log.VEventf(ctx, 3, "%s pushing %s to detect dependency cycles", txnID(curPusher.txn), pusheeTxn.ID.Short())
 				if err := cq.db.Run(ctx, b); err != nil {
 					log.VErrEventf(ctx, 2, "while waiting in push contention queue to push %s: %s", pusheeTxn.ID.Short(), b.MustPErr())
@@ -348,4 +354,12 @@ func (cq *contentionQueue) add(
 			close(curPusher.waitCh)
 		}
 	}, wiErr, done
+}
+
+func hasExtremePriority(h roachpb.Header) bool {
+	if h.Txn != nil {
+		p := h.Txn.Priority
+		return p == roachpb.MaxTxnPriority || p == roachpb.MinTxnPriority
+	}
+	return false
 }

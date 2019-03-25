@@ -215,9 +215,9 @@ func createTestStoreWithoutStart(
 	cfg.Transport = NewDummyRaftTransport(cfg.Settings)
 	factory := &testSenderFactory{}
 	cfg.DB = client.NewDB(cfg.AmbientCtx, factory, cfg.Clock)
-	store := NewStore(*cfg, eng, &roachpb.NodeDescriptor{NodeID: 1})
+	store := NewStore(context.TODO(), *cfg, eng, &roachpb.NodeDescriptor{NodeID: 1})
 	factory.setStore(store)
-	if err := Bootstrap(
+	if err := InitEngine(
 		context.TODO(), eng, roachpb.StoreIdent{NodeID: 1, StoreID: 1}, cfg.Settings.Version.BootstrapVersion(),
 	); err != nil {
 		t.Fatal(err)
@@ -231,9 +231,9 @@ func createTestStoreWithoutStart(
 			return splits[i].Less(splits[j])
 		})
 	}
-	if err := store.WriteInitialData(
-		context.TODO(), kvs /* initialValues */, cfg.Settings.Version.BootstrapVersion().Version,
-		1 /* numStores */, splits,
+	if err := WriteInitialClusterData(
+		context.TODO(), eng, kvs /* initialValues */, cfg.Settings.Version.BootstrapVersion().Version,
+		1 /* numStores */, splits, cfg.Clock.PhysicalNow(),
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -414,14 +414,14 @@ func TestStoreInitAndBootstrap(t *testing.T) {
 	factory := &testSenderFactory{}
 	cfg.DB = client.NewDB(cfg.AmbientCtx, factory, cfg.Clock)
 	{
-		store := NewStore(cfg, eng, &roachpb.NodeDescriptor{NodeID: 1})
+		store := NewStore(ctx, cfg, eng, &roachpb.NodeDescriptor{NodeID: 1})
 		// Can't start as haven't bootstrapped.
 		if err := store.Start(ctx, stopper); err == nil {
 			t.Error("expected failure starting un-bootstrapped store")
 		}
 
 		// Bootstrap with a fake ident.
-		if err := Bootstrap(ctx, eng, testIdent, cfg.Settings.Version.BootstrapVersion()); err != nil {
+		if err := InitEngine(ctx, eng, testIdent, cfg.Settings.Version.BootstrapVersion()); err != nil {
 			t.Errorf("error bootstrapping store: %s", err)
 		}
 
@@ -442,16 +442,16 @@ func TestStoreInitAndBootstrap(t *testing.T) {
 			return splits[i].Less(splits[j])
 		})
 
-		if err := store.WriteInitialData(
-			ctx, kvs /* initialValues */, cfg.Settings.Version.BootstrapVersion().Version,
-			1 /* numStores */, splits,
+		if err := WriteInitialClusterData(
+			ctx, eng, kvs /* initialValues */, cfg.Settings.Version.BootstrapVersion().Version,
+			1 /* numStores */, splits, cfg.Clock.PhysicalNow(),
 		); err != nil {
 			t.Errorf("failure to create first range: %s", err)
 		}
 	}
 
 	// Now, attempt to initialize a store with a now-bootstrapped range.
-	store := NewStore(cfg, eng, &roachpb.NodeDescriptor{NodeID: 1})
+	store := NewStore(ctx, cfg, eng, &roachpb.NodeDescriptor{NodeID: 1})
 	if err := store.Start(ctx, stopper); err != nil {
 		t.Fatalf("failure initializing bootstrapped store: %s", err)
 	}
@@ -489,7 +489,7 @@ func TestBootstrapOfNonEmptyStore(t *testing.T) {
 	}
 	cfg := TestStoreConfig(nil)
 	cfg.Transport = NewDummyRaftTransport(cfg.Settings)
-	store := NewStore(cfg, eng, &roachpb.NodeDescriptor{NodeID: 1})
+	store := NewStore(ctx, cfg, eng, &roachpb.NodeDescriptor{NodeID: 1})
 
 	// Can't init as haven't bootstrapped.
 	switch err := errors.Cause(store.Start(ctx, stopper)); err.(type) {
@@ -499,7 +499,7 @@ func TestBootstrapOfNonEmptyStore(t *testing.T) {
 	}
 
 	// Bootstrap should fail on non-empty engine.
-	switch err := errors.Cause(Bootstrap(ctx, eng, testIdent, cfg.Settings.Version.BootstrapVersion())); err.(type) {
+	switch err := errors.Cause(InitEngine(ctx, eng, testIdent, cfg.Settings.Version.BootstrapVersion())); err.(type) {
 	case *NotBootstrappedError:
 	default:
 		t.Errorf("unexpected error bootstrapping non-empty store: %v", err)
@@ -726,7 +726,7 @@ func TestStoreRemoveReplicaDestroy(t *testing.T) {
 		t.Fatal("replica was not marked as destroyed")
 	}
 
-	if _, _, _, pErr := repl1.propose(
+	if _, _, _, pErr := repl1.evalAndPropose(
 		context.Background(), lease, roachpb.BatchRequest{}, nil, &allSpans,
 	); !pErr.Equal(expErr) {
 		t.Fatalf("expected error %s, but got %v", expErr, pErr)
@@ -1543,7 +1543,7 @@ func TestStoreResolveWriteIntent(t *testing.T) {
 				return nil
 			}
 			if exp, act := manual.UnixNano(), pr.PushTo.WallTime; exp > act {
-				return roachpb.NewError(fmt.Errorf("expected PushTo >= WallTime, but got %d < %d:\n%+v", act, exp, pr))
+				return roachpb.NewError(fmt.Errorf("expected PushTo > WallTime, but got %d < %d:\n%+v", act, exp, pr))
 			}
 			return nil
 		}
@@ -1567,7 +1567,7 @@ func TestStoreResolveWriteIntent(t *testing.T) {
 		pArgs := putArgs(key, []byte("value"))
 		h := roachpb.Header{Txn: pushee}
 		assignSeqNumsForReqs(pushee, &pArgs)
-		if _, err := maybeWrapWithBeginTransaction(context.Background(), store.TestSender(), h, &pArgs); err != nil {
+		if _, err := client.SendWrappedWith(context.Background(), store.TestSender(), h, &pArgs); err != nil {
 			t.Fatal(err)
 		}
 
@@ -1586,13 +1586,12 @@ func TestStoreResolveWriteIntent(t *testing.T) {
 			}
 			txnKey := keys.TransactionKey(pushee.Key, pushee.ID)
 			var txn roachpb.Transaction
-			ok, err := engine.MVCCGetProto(context.Background(), store.Engine(), txnKey, hlc.Timestamp{},
-				&txn, engine.MVCCGetOptions{})
-			if !ok || err != nil {
-				t.Fatalf("not found or err: %s", err)
-			}
-			if txn.Status != roachpb.ABORTED {
-				t.Fatalf("expected pushee to be aborted; got %s", txn.Status)
+			if ok, err := engine.MVCCGetProto(
+				context.Background(), store.Engine(), txnKey, hlc.Timestamp{}, &txn, engine.MVCCGetOptions{},
+			); err != nil {
+				t.Fatal(err)
+			} else if ok {
+				t.Fatalf("expected transaction record; got %s", txn)
 			}
 		} else {
 			select {
@@ -1631,7 +1630,7 @@ func TestStoreResolveWriteIntentRollback(t *testing.T) {
 	args := incrementArgs(key, 1)
 	h := roachpb.Header{Txn: pushee}
 	assignSeqNumsForReqs(pushee, &args)
-	if _, pErr := maybeWrapWithBeginTransaction(context.Background(), store.TestSender(), h, &args); pErr != nil {
+	if _, pErr := client.SendWrappedWith(context.Background(), store.TestSender(), h, &args); pErr != nil {
 		t.Fatal(pErr)
 	}
 
@@ -1652,7 +1651,7 @@ func TestStoreResolveWriteIntentRollback(t *testing.T) {
 func TestStoreResolveWriteIntentPushOnRead(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	storeCfg := TestStoreConfig(nil)
-	storeCfg.DontRetryPushTxnFailures = true
+	storeCfg.TestingKnobs.DontRetryPushTxnFailures = true
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.TODO())
 	store := createTestStoreWithConfig(t, stopper, testStoreOpts{createSystemRanges: true}, &storeCfg)
@@ -1679,10 +1678,11 @@ func TestStoreResolveWriteIntentPushOnRead(t *testing.T) {
 
 		// Second, lay down intent using the pushee's txn.
 		{
-			_, btH := beginTxnArgs(key, pushee)
 			args := putArgs(key, []byte("value2"))
 			assignSeqNumsForReqs(pushee, &args)
-			if _, pErr := maybeWrapWithBeginTransaction(context.Background(), store.TestSender(), btH, &args); pErr != nil {
+			if _, pErr := client.SendWrappedWith(
+				context.Background(), store.TestSender(), roachpb.Header{Txn: pushee}, &args,
+			); pErr != nil {
 				t.Fatal(pErr)
 			}
 		}
@@ -1737,10 +1737,16 @@ func TestStoreResolveWriteIntentNoTxn(t *testing.T) {
 	key := roachpb.Key("a")
 	pushee := newTransaction("test", key, 1, store.cfg.Clock)
 
-	// First, lay down intent from pushee.
+	// First, write the pushee's txn via HeartbeatTxn request.
+	hb, hbH := heartbeatArgs(pushee, pushee.Timestamp)
+	if _, pErr := client.SendWrappedWith(context.Background(), store.TestSender(), hbH, &hb); pErr != nil {
+		t.Fatal(pErr)
+	}
+
+	// Next, lay down intent from pushee.
 	args := putArgs(key, []byte("value1"))
 	assignSeqNumsForReqs(pushee, &args)
-	if _, pErr := maybeWrapWithBeginTransaction(context.Background(), store.TestSender(), roachpb.Header{Txn: pushee}, &args); pErr != nil {
+	if _, pErr := client.SendWrappedWith(context.Background(), store.TestSender(), hbH, &args); pErr != nil {
 		t.Fatal(pErr)
 	}
 
@@ -1861,7 +1867,7 @@ func TestStoreReadInconsistent(t *testing.T) {
 				for _, txn := range []*roachpb.Transaction{txnA, txnB} {
 					args.Key = txn.Key
 					assignSeqNumsForReqs(txn, &args)
-					if _, pErr := maybeWrapWithBeginTransaction(context.Background(), store.TestSender(), roachpb.Header{Txn: txn}, &args); pErr != nil {
+					if _, pErr := client.SendWrappedWith(context.Background(), store.TestSender(), roachpb.Header{Txn: txn}, &args); pErr != nil {
 						t.Fatal(pErr)
 					}
 				}
@@ -2162,10 +2168,9 @@ func TestStoreScanIntents(t *testing.T) {
 			}
 			args := putArgs(key, []byte(fmt.Sprintf("value%02d", j)))
 			assignSeqNumsForReqs(txn, &args)
-			if _, pErr := maybeWrapWithBeginTransaction(context.Background(), store.TestSender(), roachpb.Header{Txn: txn}, &args); pErr != nil {
+			if _, pErr := client.SendWrappedWith(context.Background(), store.TestSender(), roachpb.Header{Txn: txn}, &args); pErr != nil {
 				t.Fatal(pErr)
 			}
-			txn.Writing = true
 		}
 
 		// Scan the range and verify count. Do this in a goroutine in case
@@ -2256,10 +2261,9 @@ func TestStoreScanInconsistentResolvesIntents(t *testing.T) {
 		keys = append(keys, key)
 		args := putArgs(key, []byte(fmt.Sprintf("value%02d", j)))
 		assignSeqNumsForReqs(txn, &args)
-		if _, pErr := maybeWrapWithBeginTransaction(context.Background(), store.TestSender(), roachpb.Header{Txn: txn}, &args); pErr != nil {
+		if _, pErr := client.SendWrappedWith(context.Background(), store.TestSender(), roachpb.Header{Txn: txn}, &args); pErr != nil {
 			t.Fatal(pErr)
 		}
-		txn.Writing = true
 	}
 
 	// Now, commit txn without resolving intents. If we hadn't disabled auto-gc
@@ -2303,19 +2307,17 @@ func TestStoreScanIntentsFromTwoTxns(t *testing.T) {
 	txn1 := newTransaction("test1", key1, 1, store.cfg.Clock)
 	args := putArgs(key1, []byte("value1"))
 	assignSeqNumsForReqs(txn1, &args)
-	if _, pErr := maybeWrapWithBeginTransaction(context.Background(), store.TestSender(), roachpb.Header{Txn: txn1}, &args); pErr != nil {
+	if _, pErr := client.SendWrappedWith(context.Background(), store.TestSender(), roachpb.Header{Txn: txn1}, &args); pErr != nil {
 		t.Fatal(pErr)
 	}
-	txn1.Writing = true
 
 	key2 := roachpb.Key("foo")
 	txn2 := newTransaction("test2", key2, 1, store.cfg.Clock)
 	args = putArgs(key2, []byte("value2"))
 	assignSeqNumsForReqs(txn2, &args)
-	if _, pErr := maybeWrapWithBeginTransaction(context.Background(), store.TestSender(), roachpb.Header{Txn: txn2}, &args); pErr != nil {
+	if _, pErr := client.SendWrappedWith(context.Background(), store.TestSender(), roachpb.Header{Txn: txn2}, &args); pErr != nil {
 		t.Fatal(pErr)
 	}
-	txn2.Writing = true
 
 	// Now, expire the transactions by moving the clock forward. This will
 	// result in the subsequent scan operation pushing both transactions
@@ -2357,7 +2359,6 @@ func TestStoreScanMultipleIntents(t *testing.T) {
 	key1 := roachpb.Key("key00")
 	key10 := roachpb.Key("key09")
 	txn := newTransaction("test", key1, 1, store.cfg.Clock)
-	txn.Writing = true
 	ba := roachpb.BatchRequest{}
 	for i := 0; i < 10; i++ {
 		pArgs := putArgs(roachpb.Key(fmt.Sprintf("key%02d", i)), []byte("value"))
@@ -2964,7 +2965,7 @@ type fakeStorePool struct {
 	failedThrottles   int
 }
 
-func (sp *fakeStorePool) throttle(reason throttleReason, toStoreID roachpb.StoreID) {
+func (sp *fakeStorePool) throttle(reason throttleReason, why string, toStoreID roachpb.StoreID) {
 	switch reason {
 	case throttleDeclined:
 		sp.declinedThrottles++

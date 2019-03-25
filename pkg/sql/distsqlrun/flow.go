@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -35,7 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 )
 
@@ -43,7 +44,10 @@ import (
 type FlowCtx struct {
 	log.AmbientContext
 
-	Settings *cluster.Settings
+	// TODO(radu): FlowCtx should store a pointer to the server's ServerConfig
+	// instead of having copies of most of its fields.
+	Settings     *cluster.Settings
+	RuntimeStats RuntimeStats
 
 	stopper *stop.Stopper
 
@@ -605,10 +609,11 @@ func (f *Flow) Run(ctx context.Context, doneFn func()) error {
 
 	// We'll take care of the last processor in particular.
 	var headProc Processor
-	if len(f.processors) > 0 {
-		headProc = f.processors[len(f.processors)-1]
-		f.processors = f.processors[:len(f.processors)-1]
+	if len(f.processors) == 0 {
+		return pgerror.NewAssertionErrorf("no processors in flow")
 	}
+	headProc = f.processors[len(f.processors)-1]
+	f.processors = f.processors[:len(f.processors)-1]
 
 	if err := f.startInternal(ctx, doneFn); err != nil {
 		// For sync flows, the error goes to the consumer.
@@ -619,9 +624,7 @@ func (f *Flow) Run(ctx context.Context, doneFn func()) error {
 		}
 		return err
 	}
-	if headProc != nil {
-		headProc.Run(ctx)
-	}
+	headProc.Run(ctx)
 	return nil
 }
 
@@ -695,22 +698,17 @@ func (f *Flow) cancel() {
 		return
 	}
 	f.flowRegistry.Lock()
-	defer f.flowRegistry.Unlock()
+	timedOutReceivers := f.flowRegistry.cancelPendingStreamsLocked(f.id)
+	f.flowRegistry.Unlock()
 
-	entry := f.flowRegistry.flows[f.id]
-	for streamID, is := range entry.inboundStreams {
-		// Connected, non-finished inbound streams will get an error
-		// returned in ProcessInboundStream(). Non-connected streams
-		// are handled below.
-		if !is.connected && !is.finished {
-			is.canceled = true
+	for _, receiver := range timedOutReceivers {
+		go func(receiver RowReceiver) {
 			// Stream has yet to be started; send an error to its
 			// receiver and prevent it from being connected.
-			is.receiver.Push(
+			receiver.Push(
 				nil, /* row */
 				&ProducerMetadata{Err: sqlbase.QueryCanceledError})
-			is.receiver.ProducerDone()
-			f.flowRegistry.finishInboundStreamLocked(f.id, streamID)
-		}
+			receiver.ProducerDone()
+		}(receiver)
 	}
 }

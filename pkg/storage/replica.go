@@ -197,7 +197,7 @@ type Replica struct {
 		// depending on which lock is being held.
 		stateLoader stateloader.StateLoader
 		// on-disk storage for sideloaded SSTables. nil when there's no ReplicaID.
-		sideloaded sideloadStorage
+		sideloaded SideloadStorage
 
 		// rangefeed is an instance of a rangefeed Processor that is capable of
 		// routing rangefeed events to a set of subscribers. Will be nil if no
@@ -250,11 +250,20 @@ type Replica struct {
 		// already finished snapshot "pending" for extended periods of time
 		// (preventing log truncation).
 		snapshotLogTruncationConstraints map[uuid.UUID]snapTruncationInfo
-		// raftLogSize is the approximate size in bytes of the persisted raft log.
-		// On server restart, this value is assumed to be zero to avoid costly scans
-		// of the raft log. This will be correct when all log entries predating this
-		// process have been truncated.
+		// raftLogSize is the approximate size in bytes of the persisted raft
+		// log, including sideloaded entries' payloads. The value itself is not
+		// persisted and is computed lazily, paced by the raft log truncation
+		// queue which will recompute the log size when it finds it
+		// uninitialized. This recomputation mechanism isn't relevant for ranges
+		// which see regular write activity (for those the log size will deviate
+		// from zero quickly, and so it won't be recomputed but will undercount
+		// until the first truncation is carried out), but it prevents a large
+		// dormant Raft log from sitting around forever, which has caused problems
+		// in the past.
 		raftLogSize int64
+		// If raftLogSizeTrusted is false, don't trust the above raftLogSize until
+		// it has been recomputed.
+		raftLogSizeTrusted bool
 		// raftLogLastCheckSize is the value of raftLogSize the last time the Raft
 		// log was checked for truncation or at the time of the last Raft log
 		// truncation.
@@ -307,6 +316,9 @@ type Replica struct {
 		// we know that the replica has caught up.
 		lastReplicaAdded     roachpb.ReplicaID
 		lastReplicaAddedTime time.Time
+		// initialMaxClosed is the initial maxClosed timestamp for the replica as known
+		// from its left-hand-side upon creation.
+		initialMaxClosed hlc.Timestamp
 
 		// The most recently updated time for each follower of this range. This is updated
 		// every time a Raft message is received from a peer.
@@ -858,6 +870,7 @@ func (r *Replica) State() storagepb.RangeInfo {
 	ri.LastIndex = r.mu.lastIndex
 	ri.NumPending = uint64(len(r.mu.proposals))
 	ri.RaftLogSize = r.mu.raftLogSize
+	ri.RaftLogSizeTrusted = r.mu.raftLogSizeTrusted
 	ri.NumDropped = uint64(r.mu.droppedMessages)
 	if r.mu.proposalQuota != nil {
 		ri.ApproximateProposalQuota = r.mu.proposalQuota.approximateQuota()
@@ -975,13 +988,11 @@ type endCmds struct {
 
 // done releases the latches acquired by the command and updates
 // the timestamp cache using the final timestamp of each command.
-func (ec *endCmds) done(
-	br *roachpb.BatchResponse, pErr *roachpb.Error, retry proposalReevaluationReason,
-) {
+func (ec *endCmds) done(br *roachpb.BatchResponse, pErr *roachpb.Error) {
 	// Update the timestamp cache if the request is not being re-evaluated. Each
 	// request is considered in turn; only those marked as affecting the cache are
 	// processed. Inconsistent reads are excluded.
-	if retry == proposalNoReevaluation && ec.ba.ReadConsistency == roachpb.CONSISTENT {
+	if ec.ba.ReadConsistency == roachpb.CONSISTENT {
 		ec.repl.updateTimestampCache(&ec.ba, br, pErr)
 	}
 
@@ -1366,29 +1377,32 @@ func (r *Replica) maybeWatchForMerge(ctx context.Context) error {
 			// roachpb.PUSH_TOUCH, though it might appear more semantically correct,
 			// returns immediately and causes us to spin hot, whereas
 			// roachpb.PUSH_ABORT efficiently blocks until the transaction completes.
-			res, pErr := client.SendWrapped(ctx, r.DB().NonTransactionalSender(), &roachpb.PushTxnRequest{
+			b := &client.Batch{}
+			b.Header.Timestamp = r.Clock().Now()
+			b.AddRawRequest(&roachpb.PushTxnRequest{
 				RequestHeader: roachpb.RequestHeader{Key: intent.Txn.Key},
 				PusherTxn: roachpb.Transaction{
 					TxnMeta: enginepb.TxnMeta{Priority: roachpb.MinTxnPriority},
 				},
-				PusheeTxn: intent.Txn,
-				Now:       r.Clock().Now(),
-				PushType:  roachpb.PUSH_ABORT,
+				PusheeTxn:       intent.Txn,
+				DeprecatedNow:   b.Header.Timestamp,
+				PushType:        roachpb.PUSH_ABORT,
+				InclusivePushTo: true,
 			})
-			if pErr != nil {
+			if err := r.DB().Run(ctx, b); err != nil {
 				select {
 				case <-r.store.stopper.ShouldQuiesce():
 					// The server is shutting down. The error while pushing the
 					// transaction was probably caused by the shutdown, so ignore it.
 					return
 				default:
-					log.Warningf(ctx, "error while watching for merge to complete: PushTxn: %s", pErr)
+					log.Warningf(ctx, "error while watching for merge to complete: PushTxn: %s", err)
 					// We can't safely unblock traffic until we can prove that the merge
 					// transaction is committed or aborted. Nothing to do but try again.
 					continue
 				}
 			}
-			pushTxnRes = res.(*roachpb.PushTxnResponse)
+			pushTxnRes = b.RawResponse().Responses[0].GetInner().(*roachpb.PushTxnResponse)
 			break
 		}
 

@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/sqlmigrations"
@@ -230,7 +231,7 @@ INSERT INTO t.kv VALUES ('c', 'e'), ('a', 'c'), ('b', 'd');
 
 	// Job still running, waiting for GC.
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
-	if err := jobutils.VerifyRunningSystemJob(t, sqlRun, 0, jobspb.TypeSchemaChange, jobs.RunningStatusWaitingGC, jobs.Record{
+	if err := jobutils.VerifyRunningSystemJob(t, sqlRun, 0, jobspb.TypeSchemaChange, sql.RunningStatusWaitingGC, jobs.Record{
 		Username:    security.RootUser,
 		Description: "DROP DATABASE t CASCADE",
 		DescriptorIDs: sqlbase.IDs{
@@ -374,7 +375,7 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 	tests.CheckKeyCount(t, kvDB, table2Span, 6)
 
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
-	if err := jobutils.VerifyRunningSystemJob(t, sqlRun, 0, jobspb.TypeSchemaChange, jobs.RunningStatusWaitingGC, jobs.Record{
+	if err := jobutils.VerifyRunningSystemJob(t, sqlRun, 0, jobspb.TypeSchemaChange, sql.RunningStatusWaitingGC, jobs.Record{
 		Username:    security.RootUser,
 		Description: "DROP DATABASE t CASCADE",
 		DescriptorIDs: sqlbase.IDs{
@@ -407,7 +408,7 @@ INSERT INTO t.kv2 VALUES ('c', 'd'), ('a', 'b'), ('e', 'a');
 		t.Fatal(err)
 	}
 
-	if err := jobutils.VerifyRunningSystemJob(t, sqlRun, 0, jobspb.TypeSchemaChange, jobs.RunningStatusWaitingGC, jobs.Record{
+	if err := jobutils.VerifyRunningSystemJob(t, sqlRun, 0, jobspb.TypeSchemaChange, sql.RunningStatusWaitingGC, jobs.Record{
 		Username:    security.RootUser,
 		Description: "DROP DATABASE t CASCADE",
 		DescriptorIDs: sqlbase.IDs{
@@ -544,7 +545,7 @@ func TestDropIndex(t *testing.T) {
 	tests.CheckKeyCount(t, kvDB, tableDesc.TableSpan(), 3*numRows)
 
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
-	if err := jobutils.VerifyRunningSystemJob(t, sqlRun, 1, jobspb.TypeSchemaChange, jobs.RunningStatusWaitingGC, jobs.Record{
+	if err := jobutils.VerifyRunningSystemJob(t, sqlRun, 1, jobspb.TypeSchemaChange, sql.RunningStatusWaitingGC, jobs.Record{
 		Username:    security.RootUser,
 		Description: `DROP INDEX t.public.kv@foo`,
 		DescriptorIDs: sqlbase.IDs{
@@ -639,7 +640,7 @@ func TestDropIndexWithZoneConfigOSS(t *testing.T) {
 
 	// Verify that dropping the index fails with a "CCL required" error.
 	_, err = sqlDBRaw.Exec(`DROP INDEX t.kv@foo`)
-	if pqErr, ok := err.(*pq.Error); !ok || pqErr.Code != sqlbase.CodeCCLRequired {
+	if pqErr, ok := err.(*pq.Error); !ok || string(pqErr.Code) != pgerror.CodeCCLRequired {
 		t.Fatalf("expected pq error with CCLRequired code, but got %v", err)
 	}
 
@@ -759,7 +760,7 @@ func TestDropTable(t *testing.T) {
 
 	// Job still running, waiting for GC.
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
-	if err := jobutils.VerifyRunningSystemJob(t, sqlRun, 1, jobspb.TypeSchemaChange, jobs.RunningStatusWaitingGC, jobs.Record{
+	if err := jobutils.VerifyRunningSystemJob(t, sqlRun, 1, jobspb.TypeSchemaChange, sql.RunningStatusWaitingGC, jobs.Record{
 		Username:    security.RootUser,
 		Description: `DROP TABLE t.public.kv`,
 		DescriptorIDs: sqlbase.IDs{
@@ -838,7 +839,7 @@ func TestDropTableDeleteData(t *testing.T) {
 		tableSpan := descs[i].TableSpan()
 		tests.CheckKeyCount(t, kvDB, tableSpan, numKeys)
 
-		if err := jobutils.VerifyRunningSystemJob(t, sqlRun, 2*i+1, jobspb.TypeSchemaChange, jobs.RunningStatusWaitingGC, jobs.Record{
+		if err := jobutils.VerifyRunningSystemJob(t, sqlRun, 2*i+1, jobspb.TypeSchemaChange, sql.RunningStatusWaitingGC, jobs.Record{
 			Username:    security.RootUser,
 			Description: fmt.Sprintf(`DROP TABLE t.public.%s`, descs[i].GetName()),
 			DescriptorIDs: sqlbase.IDs{
@@ -1110,7 +1111,7 @@ func TestDropDatabaseAfterDropTable(t *testing.T) {
 	// Job still running, waiting for draining names.
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
 	if err := jobutils.VerifyRunningSystemJob(
-		t, sqlRun, 1, jobspb.TypeSchemaChange, jobs.RunningStatusDrainingNames,
+		t, sqlRun, 1, jobspb.TypeSchemaChange, sql.RunningStatusDrainingNames,
 		jobs.Record{
 			Username:    security.RootUser,
 			Description: "DROP TABLE t.public.kv",

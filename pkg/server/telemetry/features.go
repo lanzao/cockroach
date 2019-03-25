@@ -20,6 +20,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
 
@@ -63,6 +64,18 @@ func Inc(c Counter) {
 	atomic.AddInt32(c, 1)
 }
 
+// GetCounterOnce returns a counter from the global registry,
+// and asserts it didn't exist previously.
+func GetCounterOnce(feature string) Counter {
+	counters.RLock()
+	_, ok := counters.m[feature]
+	counters.RUnlock()
+	if ok {
+		panic("counter already exists: " + feature)
+	}
+	return GetCounter(feature)
+}
+
 // GetCounter returns a counter from the global registry.
 func GetCounter(feature string) Counter {
 	counters.RLock()
@@ -79,11 +92,68 @@ func GetCounter(feature string) Counter {
 	return i
 }
 
+// CounterWithMetric combines a telemetry and a metrics counter.
+type CounterWithMetric struct {
+	telemetry Counter
+	metric    *metric.Counter
+}
+
+// Necessary for metric metadata registration.
+var _ metric.Iterable = CounterWithMetric{}
+
+// NewCounterWithMetric creates a CounterWithMetric.
+func NewCounterWithMetric(metadata metric.Metadata) CounterWithMetric {
+	return CounterWithMetric{
+		telemetry: GetCounter(metadata.Name),
+		metric:    metric.NewCounter(metadata),
+	}
+}
+
+// Inc increments both counters.
+func (c CounterWithMetric) Inc() {
+	Inc(c.telemetry)
+	c.metric.Inc(1)
+}
+
+// Forward the metric.Iterable interface to the metric counter. We
+// don't just embed the counter because our Inc() interface is a bit
+// different.
+
+// GetName implements metric.Iterable
+func (c CounterWithMetric) GetName() string {
+	return c.metric.GetName()
+}
+
+// GetHelp implements metric.Iterable
+func (c CounterWithMetric) GetHelp() string {
+	return c.metric.GetHelp()
+}
+
+// GetMeasurement implements metric.Iterable
+func (c CounterWithMetric) GetMeasurement() string {
+	return c.metric.GetMeasurement()
+}
+
+// GetUnit implements metric.Iterable
+func (c CounterWithMetric) GetUnit() metric.Unit {
+	return c.metric.GetUnit()
+}
+
+// GetMetadata implements metric.Iterable
+func (c CounterWithMetric) GetMetadata() metric.Metadata {
+	return c.metric.GetMetadata()
+}
+
+// Inspect implements metric.Iterable
+func (c CounterWithMetric) Inspect(f func(interface{})) {
+	c.metric.Inspect(f)
+}
+
 func init() {
 	counters.m = make(map[string]Counter, approxFeatureCount)
 }
 
-var approxFeatureCount = 100
+var approxFeatureCount = 1500
 
 // counters stores the registry of feature-usage counts.
 // TODO(dt): consider a lock-free map.
@@ -138,7 +208,7 @@ func RecordError(err error) {
 	if pgErr, ok := pgerror.GetPGCause(err); ok {
 		Count("errorcodes." + pgErr.Code)
 
-		if details := pgErr.InternalCommand; details != "" {
+		if details := pgErr.TelemetryKey; details != "" {
 			var prefix string
 			switch pgErr.Code {
 			case pgerror.CodeFeatureNotSupportedError:

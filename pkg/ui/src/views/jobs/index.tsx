@@ -64,6 +64,7 @@ const typeOptions = [
   { value: JobType.SCHEMA_CHANGE.toString(), label: "Schema Changes" },
   { value: JobType.CHANGEFEED.toString(), label: "Changefeed"},
   { value: JobType.CREATE_STATS.toString(), label: "Statistics Creation"},
+  { value: JobType.AUTO_CREATE_STATS.toString(), label: "Auto-Statistics Creation"},
 ];
 
 const typeSetting = new LocalSetting<AdminUIState, number>(
@@ -195,7 +196,13 @@ const jobsTableColumns: ColumnDescriptor<Job>[] = [
   },
   {
     title: "Description",
-    cell: job => <div className="jobs-table__cell--description">{job.description}</div>,
+    cell: job => {
+      // If a [SQL] job.statement exists, it means that job.description
+      // is a human-readable message. Otherwise job.description is a SQL
+      // statement.
+      const additionalStyle = (job.statement ? "" : " jobs-table__cell--sql");
+      return <div className={`jobs-table__cell--description${additionalStyle}`}>{job.description}</div>;
+    },
     sort: job => job.description,
   },
   {
@@ -237,8 +244,8 @@ interface JobsTableProps {
 const titleTooltip = (
   <span>
     Some jobs can be paused or canceled through SQL. For details, view the docs
-    on the <a href={docsURL.pauseJob} target="_blank"><code>PAUSE JOB</code></a>
-    and <a href={docsURL.cancelJob} target="_blank"><code>CANCEL JOB</code></a>
+    on the <a href={docsURL.pauseJob} target="_blank"><code>PAUSE JOB</code></a>{" "}
+    and <a href={docsURL.cancelJob} target="_blank"><code>CANCEL JOB</code></a>{" "}
     statements.
   </span>
 );
@@ -275,8 +282,8 @@ class JobsTable extends React.Component<JobsTableProps> {
   renderJobExpanded = (job: Job) => {
     return (
       <div>
-        <h3>Command</h3>
-        <pre className="job-detail">{job.description}</pre>
+        <h3>Statement</h3>
+        <pre className="job-detail">{job.statement || job.description}</pre>
 
         {job.status === "failed"
           ? [

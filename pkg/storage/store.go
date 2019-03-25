@@ -615,11 +615,6 @@ type StoreConfig struct {
 	// maintenance queue to dispatch individual maintenance tasks.
 	TimeSeriesDataStore TimeSeriesDataStore
 
-	// DontRetryPushTxnFailures will propagate a push txn failure immediately
-	// instead of utilizing the txn wait queue to wait for the transaction to
-	// finish or be pushed by a higher priority contender.
-	DontRetryPushTxnFailures bool
-
 	// CoalescedHeartbeatsInterval is the interval for which heartbeat messages
 	// are queued and then sent as a single coalesced heartbeat; it is a
 	// fraction of the RaftTickInterval so that heartbeats don't get delayed by
@@ -757,12 +752,14 @@ func (sc *StoreConfig) LeaseExpiration() int64 {
 }
 
 // NewStore returns a new instance of a store.
-func NewStore(cfg StoreConfig, eng engine.Engine, nodeDesc *roachpb.NodeDescriptor) *Store {
+func NewStore(
+	ctx context.Context, cfg StoreConfig, eng engine.Engine, nodeDesc *roachpb.NodeDescriptor,
+) *Store {
 	// TODO(tschottdorf): find better place to set these defaults.
 	cfg.SetDefaults()
 
 	if !cfg.Valid() {
-		log.Fatalf(context.Background(), "invalid store configuration: %+v", &cfg)
+		log.Fatalf(ctx, "invalid store configuration: %+v", &cfg)
 	}
 	s := &Store{
 		cfg:      cfg,
@@ -2074,10 +2071,24 @@ func splitPostApply(
 	}
 
 	// Finish initialization of the RHS.
+
+	// This initialMaxClosedValue is created here to ensure that follower reads
+	// do not regress following the split. After the split occurs there will be no
+	// information in the closedts subsystem about the newly minted RHS range from
+	// its leaseholder's store. Furthermore, the RHS will have a lease start time
+	// equal to that of the LHS which might be quite old. This means that
+	// timestamps which follow the least StartTime for the LHS part are below the
+	// current closed timestamp for the LHS would no longer be readable on the RHS
+	// after the split. It is critical that this call to maxClosed happen during
+	// the splitPostApply so that it refers to a LAI that is equal to the index at
+	// which this lease was applied. If it were to refer to a LAI after the split
+	// then the value of initialMaxClosed might be unsafe.
+	initialMaxClosed := r.maxClosed(ctx)
 	r.mu.Lock()
 	rightRng.mu.Lock()
 	// Copy the minLeaseProposedTS from the LHS.
 	rightRng.mu.minLeaseProposedTS = r.mu.minLeaseProposedTS
+	rightRng.mu.initialMaxClosed = initialMaxClosed
 	rightLease := *rightRng.mu.state.Lease
 	rightRng.mu.Unlock()
 	r.mu.Unlock()
@@ -2726,6 +2737,32 @@ func (s *Store) Send(
 		return nil, roachpb.NewError(err)
 	}
 
+	// In 2.1 it was possible for nodes to send PushTxn requests without
+	// properly reflecting the time that they wanted the push to happen
+	// in the batch's header timestamp. Ensure that this timestamp is
+	// sufficiently advanced to prevent lost timestamp cache updates.
+	// TODO(nvanbenschoten): Remove this all in 19.2.
+	if !s.cfg.Settings.Version.IsActive(cluster.VersionPushTxnToInclusive) {
+		for _, union := range ba.Requests {
+			if pushReq, ok := union.GetInner().(*roachpb.PushTxnRequest); ok {
+				ba.Timestamp.Forward(pushReq.DeprecatedNow)
+
+				// While here, correct the request's PushTo arg. Before
+				// VersionPushTxnToInclusive, pushers would provide _their_
+				// timestamp instead of one logical tick past their timestamp
+				// for the PushTo arg. Handle this by bumping the PushTo arg.
+				// We only do this if the InclusivePushTo arg is false, which
+				// allows us to distinguish between 2.1 nodes and 19.1. nodes.
+				// Since we only observe this field when the cluster version
+				// is not active, we don't need to send it or observe it in
+				// 19.2.
+				if !pushReq.InclusivePushTo {
+					pushReq.PushTo = pushReq.PushTo.Next()
+				}
+			}
+		}
+	}
+
 	if s.cfg.TestingKnobs.ClockBeforeSend != nil {
 		s.cfg.TestingKnobs.ClockBeforeSend(s.cfg.Clock, ba)
 	}
@@ -2760,18 +2797,13 @@ func (s *Store) Send(
 			// this node.
 			if pErr != nil {
 				pErr.OriginNode = ba.Replica.NodeID
-				if txn := pErr.GetTxn(); txn != nil {
-					// Clone the txn, as we'll modify it.
-					pErr.SetTxn(txn)
-				} else {
+				if txn := pErr.GetTxn(); txn == nil {
 					pErr.SetTxn(ba.Txn)
 				}
-				pErr.GetTxn().UpdateObservedTimestamp(ba.Replica.NodeID, now)
 			} else {
 				if br.Txn == nil {
 					br.Txn = ba.Txn
 				}
-				br.Txn.UpdateObservedTimestamp(ba.Replica.NodeID, now)
 				// Update our clock with the outgoing response txn timestamp
 				// (if timestamp has been forwarded).
 				if ba.Timestamp.Less(br.Txn.Timestamp) {
@@ -2885,7 +2917,7 @@ func (s *Store) Send(
 			// enqueue into the txnWaitQueue in order to await further updates to
 			// the unpushed txn's status. We check ShouldPushImmediately to avoid
 			// retrying non-queueable PushTxnRequests (see #18191).
-			dontRetry := s.cfg.DontRetryPushTxnFailures
+			dontRetry := s.cfg.TestingKnobs.DontRetryPushTxnFailures
 			if !dontRetry && ba.IsSinglePushTxnRequest() {
 				pushReq := ba.Requests[0].GetInner().(*roachpb.PushTxnRequest)
 				dontRetry = txnwait.ShouldPushImmediately(pushReq)
@@ -2894,7 +2926,8 @@ func (s *Store) Send(
 				// If we're not retrying on push txn failures return a txn retry error
 				// after the first failure to guarantee a retry.
 				if ba.Txn != nil {
-					err := roachpb.NewTransactionRetryError(roachpb.RETRY_REASON_UNKNOWN)
+					err := roachpb.NewTransactionRetryError(
+						roachpb.RETRY_REASON_UNKNOWN, "DontRetryPushTxnFailures testing knob")
 					return nil, roachpb.NewErrorWithTxn(err, ba.Txn)
 				}
 				return nil, pErr
@@ -3053,7 +3086,9 @@ func (s *Store) maybeWaitForPushee(
 		// request may have been waiting to push the txn. If we don't
 		// move the timestamp forward to the current time, we may fail
 		// to push a txn which has expired.
-		pushReqCopy.Now.Forward(s.Clock().Now())
+		now := s.Clock().Now()
+		ba.Timestamp.Forward(now)
+		pushReqCopy.DeprecatedNow.Forward(now)
 		ba.Requests = nil
 		ba.Add(&pushReqCopy)
 	} else if ba.IsSingleQueryTxnRequest() {
@@ -4101,6 +4136,13 @@ func (s *Store) ComputeMetrics(ctx context.Context, tick int) error {
 		return err
 	}
 	s.metrics.updateRocksDBStats(*stats)
+
+	// Get engine Env stats.
+	envStats, err := s.engine.GetEnvStats()
+	if err != nil {
+		return err
+	}
+	s.metrics.updateEnvStats(*envStats)
 
 	// If we're using RocksDB, log the sstable overview.
 	if rocksdb, ok := s.engine.(*engine.RocksDB); ok {

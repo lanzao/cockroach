@@ -33,9 +33,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
 	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/time/rate"
 )
 
 // Generator represents one or more sql query loads and associated initial data.
@@ -79,7 +81,7 @@ type Flagser interface {
 // to have been created and initialized before running these.
 type Opser interface {
 	Generator
-	Ops(urls []string, reg *HistogramRegistry) (QueryLoad, error)
+	Ops(urls []string, reg *histogram.Registry) (QueryLoad, error)
 }
 
 // Hookser returns any hooks associated with the generator.
@@ -118,9 +120,17 @@ type Meta struct {
 	Name string
 	// Description is a short description of this generator.
 	Description string
+	// Details optionally allows specifying longer, more in-depth usage details.
+	Details string
 	// Version is a semantic version for this generator. It should be bumped
 	// whenever InitialRowFn or InitialRowCount change for any of the tables.
 	Version string
+	// PublicFacing indicates that this workload is also intended for use by
+	// users doing their own testing and evaluations. This allows hiding workloads
+	// that are only expected to be used in CockroachDB's internal development to
+	// avoid confusion. Workloads setting this to true should pay added attention
+	// to their documentation and help-text.
+	PublicFacing bool
 	// New returns an unconfigured instance of this generator.
 	New func() Generator
 }
@@ -139,6 +149,9 @@ type Table struct {
 	// Splits is the initial splits that will be present in the table after
 	// setup is completed.
 	Splits BatchedTuples
+	// Stats is the pre-calculated set of statistics on this table. They can be
+	// injected using `ALTER TABLE <name> INJECT STATISTICS ...`.
+	Stats []JSONStatistic
 }
 
 // BatchedTuples is a generic generator of tuples (SQL rows, PKs to split at,
@@ -427,6 +440,8 @@ func Split(ctx context.Context, db *gosql.DB, table Table, concurrency int) erro
 
 	log.Infof(ctx, `starting %d splits`, len(splitPoints))
 	g := ctxgroup.WithContext(ctx)
+	// Rate limit splitting to prevent replica imbalance.
+	r := rate.NewLimiter(128, 1)
 	for i := 0; i < concurrency; i++ {
 		g.GoCtx(func(ctx context.Context) error {
 			var buf bytes.Buffer
@@ -436,7 +451,9 @@ func Split(ctx context.Context, db *gosql.DB, table Table, concurrency int) erro
 					if !ok {
 						return nil
 					}
-
+					if err := r.Wait(ctx); err != nil {
+						return err
+					}
 					m := (p.lo + p.hi) / 2
 					split := strings.Join(StringTuple(splitPoints[m]), `,`)
 

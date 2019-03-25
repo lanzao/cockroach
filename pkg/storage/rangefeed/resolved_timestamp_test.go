@@ -48,7 +48,7 @@ func TestUnresolvedIntentQueue(t *testing.T) {
 	require.Equal(t, 0, len(uiq.Before(hlc.Timestamp{WallTime: 0})))
 	require.Equal(t, 0, len(uiq.Before(hlc.Timestamp{WallTime: 1})))
 	require.Equal(t, 1, len(uiq.Before(hlc.Timestamp{WallTime: 2})))
-	require.NotPanics(t, func() { uiq.assertPositiveRefCounts() })
+	require.NotPanics(t, func() { uiq.assertOnlyPositiveRefCounts() })
 
 	// Decrement a non-existent txn.
 	txn2 := uuid.MakeV4()
@@ -60,7 +60,7 @@ func TestUnresolvedIntentQueue(t *testing.T) {
 	require.Equal(t, 0, len(uiq.Before(hlc.Timestamp{WallTime: 1})))
 	require.Equal(t, 1, len(uiq.Before(hlc.Timestamp{WallTime: 3})))
 	require.Equal(t, 2, len(uiq.Before(hlc.Timestamp{WallTime: 5})))
-	require.Panics(t, func() { uiq.assertPositiveRefCounts() })
+	require.Panics(t, func() { uiq.assertOnlyPositiveRefCounts() })
 
 	// Update a non-existent txn.
 	txn3 := uuid.MakeV4()
@@ -146,21 +146,30 @@ func TestUnresolvedIntentQueue(t *testing.T) {
 	require.Equal(t, 1, uiq.Len())
 	require.Equal(t, txn1, uiq.Oldest().txnID)
 	require.Equal(t, newTxn1TS, uiq.Oldest().timestamp)
-	require.NotPanics(t, func() { uiq.assertPositiveRefCounts() })
+	require.NotPanics(t, func() { uiq.assertOnlyPositiveRefCounts() })
 
 	// Decrease txn1's ref count. Should be empty again.
 	adv = uiq.DecrRef(txn1, hlc.Timestamp{})
 	require.True(t, adv)
 	require.Equal(t, 0, uiq.Len())
 
-	// Add new txn. Immediately delete. Should be empty again.
+	// Add new txn. Immediately decrement ref count. Should be empty again.
 	txn6 := uuid.MakeV4()
 	adv = uiq.IncRef(txn6, nil, hlc.Timestamp{WallTime: 20})
 	require.False(t, adv)
 	require.Equal(t, 1, uiq.Len())
 	require.Equal(t, txn6, uiq.Oldest().txnID)
-	adv = uiq.Del(txn6)
+	adv = uiq.DecrRef(txn6, hlc.Timestamp{})
 	require.True(t, adv)
+	require.Equal(t, 0, uiq.Len())
+
+	// Instruct the queue to disallow negative ref counts.
+	uiq.AllowNegRefCount(false)
+
+	// Decrease txn1's ref count. Should ignore because ref count
+	// would go negative.
+	adv = uiq.DecrRef(txn1, hlc.Timestamp{})
+	require.False(t, adv)
 	require.Equal(t, 0, uiq.Len())
 }
 
@@ -243,8 +252,11 @@ func TestResolvedTimestamp(t *testing.T) {
 
 	// First transaction aborted. Resolved timestamp moves to next earliest
 	// intent.
-	fwd = rts.ConsumeLogicalOp(abortIntentOp(txn1))
+	fwd = rts.ConsumeLogicalOp(abortTxnOp(txn1))
 	require.True(t, fwd)
+	require.Equal(t, hlc.Timestamp{WallTime: 24}, rts.Get())
+	fwd = rts.ConsumeLogicalOp(abortIntentOp(txn1))
+	require.False(t, fwd)
 	require.Equal(t, hlc.Timestamp{WallTime: 24}, rts.Get())
 
 	// Third transaction at higher timestamp. No effect.
@@ -257,6 +269,12 @@ func TestResolvedTimestamp(t *testing.T) {
 	require.Equal(t, hlc.Timestamp{WallTime: 24}, rts.Get())
 
 	// Third transaction aborted. No effect.
+	fwd = rts.ConsumeLogicalOp(abortTxnOp(txn3))
+	require.False(t, fwd)
+	require.Equal(t, hlc.Timestamp{WallTime: 24}, rts.Get())
+	fwd = rts.ConsumeLogicalOp(abortIntentOp(txn3))
+	require.False(t, fwd)
+	require.Equal(t, hlc.Timestamp{WallTime: 24}, rts.Get())
 	fwd = rts.ConsumeLogicalOp(abortIntentOp(txn3))
 	require.False(t, fwd)
 	require.Equal(t, hlc.Timestamp{WallTime: 24}, rts.Get())
@@ -309,7 +327,19 @@ func TestResolvedTimestamp(t *testing.T) {
 	require.True(t, fwd)
 	require.Equal(t, hlc.Timestamp{WallTime: 45}, rts.Get())
 
-	// Fifth transaction aborted. Resolved timestamp moves to closed timestamp.
+	// Fifth transaction bumps epoch and re-writes one of its intents. Resolved
+	// timestamp moves to the new transaction timestamp.
+	fwd = rts.ConsumeLogicalOp(updateIntentOp(txn5, hlc.Timestamp{WallTime: 47}))
+	require.True(t, fwd)
+	require.Equal(t, hlc.Timestamp{WallTime: 46}, rts.Get())
+
+	// Fifth transaction committed, but only one of its intents was written in
+	// its final epoch. Resolved timestamp moves forward after observing the
+	// first intent committing at a higher timestamp and moves to the closed
+	// timestamp after observing the second intent aborting.
+	fwd = rts.ConsumeLogicalOp(commitIntentOp(txn5, hlc.Timestamp{WallTime: 49}))
+	require.True(t, fwd)
+	require.Equal(t, hlc.Timestamp{WallTime: 48}, rts.Get())
 	fwd = rts.ConsumeLogicalOp(abortIntentOp(txn5))
 	require.True(t, fwd)
 	require.Equal(t, hlc.Timestamp{WallTime: 50}, rts.Get())
@@ -442,8 +472,13 @@ func TestResolvedTimestampInit(t *testing.T) {
 		require.False(t, fwd)
 		require.Equal(t, hlc.Timestamp{}, rts.Get())
 
+		// Abort that intent's transaction. Not initialized so no-op.
+		fwd = rts.ConsumeLogicalOp(abortTxnOp(txn1))
+		require.False(t, fwd)
+		require.Equal(t, hlc.Timestamp{}, rts.Get())
+
 		// Later, write an intent for the same transaction. This should cancel
-		// out with the out-of-order txn abort operation. If this abort hadn't
+		// out with the out-of-order intent abort operation. If this abort hadn't
 		// allowed the unresolvedTxn's ref count to drop below 0, this would
 		// have created a reference that would never be cleaned up.
 		fwd = rts.ConsumeLogicalOp(writeIntentOp(txn1, hlc.Timestamp{WallTime: 3}))
@@ -473,4 +508,58 @@ func TestResolvedTimestampInit(t *testing.T) {
 		// been called because an intent must not have been accounted for.
 		require.Panics(t, func() { rts.Init() })
 	})
+}
+
+func TestResolvedTimestampTxnAborted(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	rts := makeResolvedTimestamp()
+	rts.Init()
+
+	// Set a closed timestamp. Resolved timestamp advances.
+	fwd := rts.ForwardClosedTS(hlc.Timestamp{WallTime: 5})
+	require.True(t, fwd)
+	require.Equal(t, hlc.Timestamp{WallTime: 5}, rts.Get())
+
+	// Add an intent for a new transaction.
+	txn1 := uuid.MakeV4()
+	fwd = rts.ConsumeLogicalOp(writeIntentOp(txn1, hlc.Timestamp{WallTime: 10}))
+	require.False(t, fwd)
+	require.Equal(t, hlc.Timestamp{WallTime: 5}, rts.Get())
+
+	// Set a new closed timestamp. Resolved timestamp advances.
+	fwd = rts.ForwardClosedTS(hlc.Timestamp{WallTime: 15})
+	require.True(t, fwd)
+	require.Equal(t, hlc.Timestamp{WallTime: 9}, rts.Get())
+
+	// Abort txn1 after a periodic txn push. Resolved timestamp advances.
+	fwd = rts.ConsumeLogicalOp(abortTxnOp(txn1))
+	require.True(t, fwd)
+	require.Equal(t, hlc.Timestamp{WallTime: 15}, rts.Get())
+
+	// Update one of txn1's intents. Should be ignored.
+	fwd = rts.ConsumeLogicalOp(updateIntentOp(txn1, hlc.Timestamp{WallTime: 20}))
+	require.False(t, fwd)
+	require.Equal(t, hlc.Timestamp{WallTime: 15}, rts.Get())
+
+	// Abort one of txn1's intents. Should be ignored.
+	fwd = rts.ConsumeLogicalOp(abortIntentOp(txn1))
+	require.False(t, fwd)
+	require.Equal(t, hlc.Timestamp{WallTime: 15}, rts.Get())
+
+	// Write another intent as txn1. Should add txn1 back into queue.
+	// This will eventually require another txn push to evict.
+	fwd = rts.ConsumeLogicalOp(writeIntentOp(txn1, hlc.Timestamp{WallTime: 20}))
+	require.False(t, fwd)
+	require.Equal(t, hlc.Timestamp{WallTime: 15}, rts.Get())
+
+	// Set a new closed timestamp. Resolved timestamp advances, but only up to
+	// the timestamp of txn1's intent, which we fail remember is uncommittable.
+	fwd = rts.ForwardClosedTS(hlc.Timestamp{WallTime: 25})
+	require.True(t, fwd)
+	require.Equal(t, hlc.Timestamp{WallTime: 19}, rts.Get())
+
+	// Abort txn1 again after another periodic push. Resolved timestamp advances.
+	fwd = rts.ConsumeLogicalOp(abortTxnOp(txn1))
+	require.True(t, fwd)
+	require.Equal(t, hlc.Timestamp{WallTime: 25}, rts.Get())
 }

@@ -278,6 +278,9 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 		}
 
 	case *LookupJoinExpr:
+		if !t.Flags.Empty() {
+			tp.Childf("flags: %s", t.Flags.String())
+		}
 		idxCols := make(opt.ColList, len(t.KeyCols))
 		idx := md.Table(t.Table).Index(t.Index)
 		for i := range idxCols {
@@ -295,16 +298,19 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 			// FixedVals is always going to be a ScalarListExpr, containing tuples,
 			// containing one ScalarListExpr, containing ConstExprs.
 			for i := range t.LeftFixedCols {
-				leftVals[i] = t.FixedVals[0].Child(0).Child(i).(*ConstExpr).Value
+				leftVals[i] = ExtractConstDatum(t.FixedVals[0].Child(0).Child(i))
 			}
 			for i := range t.RightFixedCols {
-				rightVals[i] = t.FixedVals[1].Child(0).Child(i).(*ConstExpr).Value
+				rightVals[i] = ExtractConstDatum(t.FixedVals[1].Child(0).Child(i))
 			}
 			tp.Childf("left fixed columns: %v = %v", t.LeftFixedCols, leftVals)
 			tp.Childf("right fixed columns: %v = %v", t.RightFixedCols, rightVals)
 		}
 
 	case *MergeJoinExpr:
+		if !t.Flags.Empty() {
+			tp.Childf("flags: %s", t.Flags.String())
+		}
 		if !f.HasFlags(ExprFmtHideOrderings) {
 			tp.Childf("left ordering: %s", t.LeftEq)
 			tp.Childf("right ordering: %s", t.RightEq)
@@ -356,6 +362,30 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 
 	case *CreateTableExpr:
 		tp.Child(t.Syntax.String())
+
+	case *ExplainExpr:
+		// ExplainPlan is the default, don't show it.
+		m := ""
+		if t.Options.Mode != tree.ExplainPlan {
+			m, _ = tree.ExplainModeName(t.Options.Mode)
+		}
+		if t.Options.Flags.Contains(tree.ExplainFlagVerbose) {
+			if m != "" {
+				m += ", "
+			}
+			m += "verbose"
+		}
+		if m != "" {
+			tp.Childf("mode: %s", m)
+		}
+
+	default:
+		if opt.IsJoinOp(t) {
+			p := t.Private().(*JoinPrivate)
+			if !p.Flags.Empty() {
+				tp.Childf("flags: %s", p.Flags.String())
+			}
+		}
 	}
 
 	if !f.HasFlags(ExprFmtHideMiscProps) {
@@ -832,7 +862,7 @@ func FormatPrivate(f *ExprFmtCtx, private interface{}, physProps *physical.Requi
 		}
 
 	case *JoinPrivate:
-		// TODO(radu): add code here when we add fields to JoinPrivate.
+		// Nothing to show; flags are shown separately.
 
 	case *ExplainPrivate, *opt.ColSet, *opt.ColList, *SetPrivate, types.T:
 		// Don't show anything, because it's mostly redundant.

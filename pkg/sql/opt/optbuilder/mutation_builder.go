@@ -25,7 +25,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/pkg/errors"
 )
 
 // mutationBuilder is a helper struct that supports building Insert, Update,
@@ -216,7 +215,8 @@ func (mb *mutationBuilder) addTargetCol(ord int) {
 	// Ensure that the name list does not contain duplicates.
 	colID := mb.tabID.ColumnID(ord)
 	if mb.targetColSet.Contains(int(colID)) {
-		panic(builderError{fmt.Errorf("multiple assignments to the same column %q", tabCol.ColName())})
+		panic(pgerror.NewErrorf(pgerror.CodeSyntaxError,
+			"multiple assignments to the same column %q", tabCol.ColName()))
 	}
 	mb.targetColSet.Add(int(colID))
 
@@ -406,7 +406,12 @@ func (mb *mutationBuilder) addCheckConstraintCols() {
 func (mb *mutationBuilder) disambiguateColumns() {
 	for i, n := 0, mb.tab.DeletableColumnCount(); i < n; i++ {
 		colName := mb.tab.Column(i).ColName()
-		colID := mb.mapToReturnColID(i)
+		colID := mb.mapToInputColID(i)
+		if colID == 0 {
+			// Column not involved in the statement, so skip it (e.g. a delete-only
+			// column in an Insert statement).
+			continue
+		}
 		for i := range mb.outScope.cols {
 			col := &mb.outScope.cols[i]
 			if col.name == colName {
@@ -441,16 +446,20 @@ func (mb *mutationBuilder) makeMutationPrivate(needResults bool) *memo.MutationP
 		// can be non-zero.
 		private.ReturnCols = make(opt.ColList, mb.tab.DeletableColumnCount())
 		for i, n := 0, mb.tab.ColumnCount(); i < n; i++ {
-			private.ReturnCols[i] = mb.mapToReturnColID(i)
+			private.ReturnCols[i] = mb.mapToInputColID(i)
+			if private.ReturnCols[i] == 0 {
+				panic(fmt.Sprintf("column %d is not available in the mutation input", i))
+			}
 		}
 	}
 
 	return private
 }
 
-// mapToReturnColID returns the ID of the input column that will provide the
-// value for the corresponding return column. Columns take priority in this
-// order:
+// mapToInputColID returns the ID of the input column that provides the final
+// value for the column at the given ordinal position in the table. This value
+// might mutate the column, or it might be returned by the mutation statement,
+// or it might not be used at all. Columns take priority in this order:
 //
 //   upsert, update, fetch, insert
 //
@@ -459,7 +468,11 @@ func (mb *mutationBuilder) makeMutationPrivate(needResults bool) *memo.MutationP
 // available, then it overrides any fetch value. Finally, the relative priority
 // of fetch and insert columns doesn't matter, since they're only used together
 // in the upsert case where an upsert column would be available.
-func (mb *mutationBuilder) mapToReturnColID(ord int) opt.ColumnID {
+//
+// If the column is never referenced by the statement, then mapToInputColID
+// returns 0. This would be the case for delete-only columns in an Insert
+// statement, because they're neither fetched nor mutated.
+func (mb *mutationBuilder) mapToInputColID(ord int) opt.ColumnID {
 	switch {
 	case mb.upsertColList != nil && mb.upsertColList[ord] != 0:
 		return mb.upsertColList[ord]
@@ -474,7 +487,8 @@ func (mb *mutationBuilder) mapToReturnColID(ord int) opt.ColumnID {
 		return mb.insertColList[ord]
 
 	default:
-		panic("could not find return column")
+		// Column is never referenced by the statement.
+		return 0
 	}
 }
 
@@ -533,9 +547,9 @@ func (mb *mutationBuilder) checkNumCols(expected, actual int) {
 		} else {
 			kw = "UPSERT"
 		}
-		panic(builderError{pgerror.NewErrorf(pgerror.CodeSyntaxError,
+		panic(pgerror.NewErrorf(pgerror.CodeSyntaxError,
 			"%s has more %s than %s, %d expressions for %d targets",
-			kw, more, less, actual, expected)})
+			kw, more, less, actual, expected))
 	}
 }
 
@@ -583,7 +597,7 @@ func findNotNullIndexCol(index cat.Index) int {
 			return indexCol.Ordinal
 		}
 	}
-	panic("should have found not null column in index")
+	panic(pgerror.NewAssertionErrorf("should have found not null column in index"))
 }
 
 // resultsNeeded determines whether a statement that might have a RETURNING
@@ -595,7 +609,7 @@ func resultsNeeded(r tree.ReturningClause) bool {
 	case *tree.ReturningNothing, *tree.NoReturningClause:
 		return false
 	default:
-		panic(errors.Errorf("unexpected ReturningClause type: %T", t))
+		panic(pgerror.NewAssertionErrorf("unexpected ReturningClause type: %T", t))
 	}
 }
 
@@ -618,9 +632,9 @@ func getAliasedTableName(n tree.TableExpr) (*tree.TableName, *tree.TableName) {
 	}
 	tn, ok := n.(*tree.TableName)
 	if !ok {
-		panic(builderError{pgerror.Unimplemented(
+		panic(pgerror.Unimplemented(
 			"complex table expression in UPDATE/DELETE",
-			"cannot use a complex table name with DELETE/UPDATE")})
+			"cannot use a complex table name with DELETE/UPDATE"))
 	}
 	return tn, alias
 }
@@ -638,7 +652,7 @@ func checkDatumTypeFitsColumnType(col cat.Column, typ types.T) {
 	}
 
 	colName := string(col.ColName())
-	panic(builderError{pgerror.NewErrorf(pgerror.CodeDatatypeMismatchError,
+	panic(pgerror.NewErrorf(pgerror.CodeDatatypeMismatchError,
 		"value type %s doesn't match type %s of column %q",
-		typ, col.ColTypeStr(), tree.ErrNameString(&colName))})
+		typ, col.ColTypeStr(), tree.ErrNameString(colName)))
 }

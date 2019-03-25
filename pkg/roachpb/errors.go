@@ -22,13 +22,28 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/pkg/errors"
 )
+
+// ClientVisibleRetryError is to be implemented by errors visible by
+// layers above and that can be handled by retrying the transaction.
+type ClientVisibleRetryError interface {
+	ClientVisibleRetryError()
+}
+
+// ClientVisibleAmbiguousError is to be implemented by errors visible
+// by layers above and that indicate uncertainty.
+type ClientVisibleAmbiguousError interface {
+	ClientVisibleAmbiguousError()
+}
 
 func (e *UnhandledRetryableError) Error() string {
 	return e.PErr.Message
 }
 
+// ClientVisibleRetryError implements the ClientVisibleRetryError interface.
+func (e *UnhandledRetryableError) ClientVisibleRetryError() {}
+
+var _ ClientVisibleRetryError = &UnhandledRetryableError{}
 var _ error = &UnhandledRetryableError{}
 
 // ErrorUnexpectedlySet creates a string to panic with when a response (typically
@@ -151,7 +166,6 @@ func (e *Error) GoError() error {
 
 // SetTxn sets the txn and resets the error message. txn is cloned before being
 // stored in the Error.
-// TODO(kaneda): Unexpose this method and make callers use NewErrorWithTxn.
 func (e *Error) SetTxn(txn *Transaction) {
 	e.UnexposedTxn = txn
 	if txn != nil {
@@ -172,9 +186,9 @@ func (e *Error) GetTxn() *Transaction {
 	return e.UnexposedTxn
 }
 
-// UpdateTxn updates the txn.
+// UpdateTxn updates the error transaction.
 func (e *Error) UpdateTxn(o *Transaction) {
-	if e == nil {
+	if o == nil {
 		return
 	}
 	if e.UnexposedTxn == nil {
@@ -308,7 +322,11 @@ func (e *AmbiguousResultError) message(_ *Error) string {
 	return fmt.Sprintf("result is ambiguous (%s)", e.Message)
 }
 
+// ClientVisibleAmbiguousError implements the ClientVisibleAmbiguousError interface.
+func (e *AmbiguousResultError) ClientVisibleAmbiguousError() {}
+
 var _ ErrorDetailInterface = &AmbiguousResultError{}
+var _ ClientVisibleAmbiguousError = &AmbiguousResultError{}
 
 func (e *TransactionAbortedError) Error() string {
 	return fmt.Sprintf("TransactionAbortedError(%s)", e.Reason)
@@ -325,6 +343,9 @@ func (*TransactionAbortedError) canRestartTransaction() TransactionRestart {
 var _ ErrorDetailInterface = &TransactionAbortedError{}
 var _ transactionRestartError = &TransactionAbortedError{}
 
+// ClientVisibleRetryError implements the ClientVisibleRetryError interface.
+func (e *TransactionRetryWithProtoRefreshError) ClientVisibleRetryError() {}
+
 func (e *TransactionRetryWithProtoRefreshError) Error() string {
 	return e.message(nil)
 }
@@ -333,6 +354,7 @@ func (e *TransactionRetryWithProtoRefreshError) message(_ *Error) string {
 	return fmt.Sprintf("TransactionRetryWithProtoRefreshError: %s", e.Msg)
 }
 
+var _ ClientVisibleRetryError = &TransactionRetryWithProtoRefreshError{}
 var _ ErrorDetailInterface = &TransactionRetryWithProtoRefreshError{}
 
 // NewTransactionAbortedError initializes a new TransactionAbortedError.
@@ -391,9 +413,12 @@ func (*TransactionPushError) canRestartTransaction() TransactionRestart {
 }
 
 // NewTransactionRetryError initializes a new TransactionRetryError.
-func NewTransactionRetryError(reason TransactionRetryReason) *TransactionRetryError {
+func NewTransactionRetryError(
+	reason TransactionRetryReason, extraMsg string,
+) *TransactionRetryError {
 	return &TransactionRetryError{
-		Reason: reason,
+		Reason:   reason,
+		ExtraMsg: extraMsg,
 	}
 }
 
@@ -436,18 +461,6 @@ func (e *TransactionStatusError) Error() string {
 
 func (e *TransactionStatusError) message(pErr *Error) string {
 	return fmt.Sprintf("%s: %s", e.Error(), pErr.GetTxn())
-}
-
-// CheckTxnDeadlineExceededErr returns an error if deadlineErr is not a
-// transaction deadline exceeded roachpb.TransactionStatusError.
-func CheckTxnDeadlineExceededErr(deadlineErr error) error {
-	if statusError, ok := deadlineErr.(*TransactionStatusError); !ok {
-		return errors.Errorf("expected TransactionStatusError but got %T: %s",
-			deadlineErr, deadlineErr)
-	} else if e := "transaction deadline exceeded"; !strings.Contains(statusError.Msg, e) {
-		return errors.Errorf("expected %s, got %s", e, statusError.Msg)
-	}
-	return nil
 }
 
 var _ ErrorDetailInterface = &TransactionStatusError{}
@@ -693,8 +706,9 @@ func (e *BatchTimestampBeforeGCError) message(_ *Error) string {
 var _ ErrorDetailInterface = &BatchTimestampBeforeGCError{}
 
 // NewIntentMissingError creates a new IntentMissingError.
-func NewIntentMissingError(wrongIntent *Intent) *IntentMissingError {
+func NewIntentMissingError(key Key, wrongIntent *Intent) *IntentMissingError {
 	return &IntentMissingError{
+		Key:         key,
 		WrongIntent: wrongIntent,
 	}
 }

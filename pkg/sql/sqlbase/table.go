@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/pkg/errors"
 )
 
@@ -271,7 +272,8 @@ func (desc *TableDescriptor) collectConstraintInfo(
 	for _, index := range indexes {
 		if index.ID == desc.PrimaryIndex.ID {
 			if _, ok := info[index.Name]; ok {
-				return nil, errors.Errorf("duplicate constraint name: %q", index.Name)
+				return nil, pgerror.NewErrorf(pgerror.CodeDuplicateObjectError,
+					"duplicate constraint name: %q", index.Name)
 			}
 			colHiddenMap := make(map[ColumnID]bool, len(desc.Columns))
 			for i, column := range desc.Columns {
@@ -291,26 +293,24 @@ func (desc *TableDescriptor) collectConstraintInfo(
 				continue
 			}
 			detail := ConstraintDetail{Kind: ConstraintTypePK}
-			if tableLookup != nil {
-				detail.Columns = index.ColumnNames
-				detail.Index = index
-			}
+			detail.Columns = index.ColumnNames
+			detail.Index = index
 			info[index.Name] = detail
 		} else if index.Unique {
 			if _, ok := info[index.Name]; ok {
-				return nil, errors.Errorf("duplicate constraint name: %q", index.Name)
+				return nil, pgerror.NewErrorf(pgerror.CodeDuplicateObjectError,
+					"duplicate constraint name: %q", index.Name)
 			}
 			detail := ConstraintDetail{Kind: ConstraintTypeUnique}
-			if tableLookup != nil {
-				detail.Columns = index.ColumnNames
-				detail.Index = index
-			}
+			detail.Columns = index.ColumnNames
+			detail.Index = index
 			info[index.Name] = detail
 		}
 
 		if index.ForeignKey.IsSet() {
 			if _, ok := info[index.ForeignKey.Name]; ok {
-				return nil, errors.Errorf("duplicate constraint name: %q", index.ForeignKey.Name)
+				return nil, pgerror.NewErrorf(pgerror.CodeDuplicateObjectError,
+					"duplicate constraint name: %q", index.ForeignKey.Name)
 			}
 			detail := ConstraintDetail{Kind: ConstraintTypeFK}
 			detail.Unvalidated = index.ForeignKey.Validity == ConstraintValidity_Unvalidated
@@ -320,20 +320,22 @@ func (desc *TableDescriptor) collectConstraintInfo(
 			}
 			detail.Columns = index.ColumnNames[:numCols]
 			detail.Index = index
+			detail.FK = &index.ForeignKey
 
 			if tableLookup != nil {
 				other, err := tableLookup(index.ForeignKey.Table)
 				if err != nil {
-					return nil, errors.Wrapf(err, "error resolving table %d referenced in foreign key",
-						index.ForeignKey.Table)
+					return nil, pgerror.NewAssertionErrorWithWrappedErrf(err,
+						"error resolving table %d referenced in foreign key",
+						log.Safe(index.ForeignKey.Table))
 				}
 				otherIdx, err := other.FindIndexByID(index.ForeignKey.Index)
 				if err != nil {
-					return nil, errors.Wrapf(err, "error resolving index %d in table %s referenced "+
-						"in foreign key", index.ForeignKey.Index, other.Name)
+					return nil, pgerror.NewAssertionErrorWithWrappedErrf(err,
+						"error resolving index %d in table %s referenced in foreign key",
+						log.Safe(index.ForeignKey.Index), other.Name)
 				}
 				detail.Details = fmt.Sprintf("%s.%v", other.Name, otherIdx.ColumnNames)
-				detail.FK = &index.ForeignKey
 				detail.ReferencedTable = other
 				detail.ReferencedIndex = otherIdx
 			}
@@ -341,25 +343,26 @@ func (desc *TableDescriptor) collectConstraintInfo(
 		}
 	}
 
-	for _, c := range desc.Checks {
+	for _, c := range desc.AllActiveAndInactiveChecks() {
 		if _, ok := info[c.Name]; ok {
 			return nil, errors.Errorf("duplicate constraint name: %q", c.Name)
 		}
 		detail := ConstraintDetail{Kind: ConstraintTypeCheck}
 		// Constraints in the Validating state are considered Unvalidated for this purpose
 		detail.Unvalidated = c.Validity != ConstraintValidity_Validated
+		detail.CheckConstraint = c
+		detail.Details = c.Expr
 		if tableLookup != nil {
-			detail.Details = c.Expr
-			detail.CheckConstraint = c
-
 			colsUsed, err := c.ColumnsUsed(desc)
 			if err != nil {
-				return nil, errors.Wrapf(err, "error computing columns used in check constraint %q", c.Name)
+				return nil, pgerror.NewAssertionErrorWithWrappedErrf(err,
+					"error computing columns used in check constraint %q", c.Name)
 			}
 			for _, colID := range colsUsed {
 				col, err := desc.FindColumnByID(colID)
 				if err != nil {
-					return nil, errors.Wrapf(err, "error finding column %d in table %s", colID, desc.Name)
+					return nil, pgerror.NewAssertionErrorWithWrappedErrf(err,
+						"error finding column %d in table %s", log.Safe(colID), desc.Name)
 				}
 				detail.Columns = append(detail.Columns, col.Name)
 			}

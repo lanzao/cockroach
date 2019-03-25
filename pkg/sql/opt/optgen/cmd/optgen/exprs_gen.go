@@ -37,7 +37,6 @@ func (g *exprsGen) generate(compiled *lang.CompiledExpr, w io.Writer) {
 	fmt.Fprintf(g.w, "package memo\n\n")
 
 	fmt.Fprintf(g.w, "import (\n")
-	fmt.Fprintf(g.w, "  \"fmt\"\n")
 	fmt.Fprintf(g.w, "  \"unsafe\"\n")
 	fmt.Fprintf(g.w, "\n")
 	fmt.Fprintf(g.w, "  \"github.com/cockroachdb/cockroach/pkg/sql/coltypes\"\n")
@@ -45,6 +44,7 @@ func (g *exprsGen) generate(compiled *lang.CompiledExpr, w io.Writer) {
 	fmt.Fprintf(g.w, "  \"github.com/cockroachdb/cockroach/pkg/sql/opt\"\n")
 	fmt.Fprintf(g.w, "  \"github.com/cockroachdb/cockroach/pkg/sql/opt/props\"\n")
 	fmt.Fprintf(g.w, "  \"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical\"\n")
+	fmt.Fprintf(g.w, "  \"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror\"\n")
 	fmt.Fprintf(g.w, "  \"github.com/cockroachdb/cockroach/pkg/sql/sem/tree\"\n")
 	fmt.Fprintf(g.w, "  \"github.com/cockroachdb/cockroach/pkg/sql/sem/types\"\n")
 	fmt.Fprintf(g.w, ")\n\n")
@@ -156,7 +156,12 @@ func (g *exprsGen) genPrivateStruct(define *lang.DefineExpr) {
 			generateComments(g.w, field.Comments, string(field.Name), string(field.Name))
 		}
 
-		fmt.Fprintf(g.w, "  %s %s\n", field.Name, g.md.typeOf(field).name)
+		// If field's name is "_", then use Go embedding syntax.
+		if isEmbeddedField(field) {
+			fmt.Fprintf(g.w, "  %s\n", g.md.typeOf(field).name)
+		} else {
+			fmt.Fprintf(g.w, "  %s %s\n", field.Name, g.md.typeOf(field).name)
+		}
 	}
 	fmt.Fprintf(g.w, "}\n\n")
 }
@@ -258,7 +263,7 @@ func (g *exprsGen) genExprFuncs(define *lang.DefineExpr) {
 		}
 		fmt.Fprintf(g.w, "  }\n")
 	}
-	fmt.Fprintf(g.w, "  panic(\"child index out of range\")\n")
+	fmt.Fprintf(g.w, "  panic(pgerror.NewAssertionErrorf(\"child index out of range\"))\n")
 	fmt.Fprintf(g.w, "}\n\n")
 
 	// Generate the Private method.
@@ -307,7 +312,7 @@ func (g *exprsGen) genExprFuncs(define *lang.DefineExpr) {
 		}
 		fmt.Fprintf(g.w, "  }\n")
 	}
-	fmt.Fprintf(g.w, "  panic(\"child index out of range\")\n")
+	fmt.Fprintf(g.w, "  panic(pgerror.NewAssertionErrorf(\"child index out of range\"))\n")
 	fmt.Fprintf(g.w, "}\n\n")
 
 	if define.Tags.Contains("Scalar") {
@@ -379,7 +384,7 @@ func (g *exprsGen) genExprFuncs(define *lang.DefineExpr) {
 		// Generate the setNext method.
 		fmt.Fprintf(g.w, "func (e *%s) setNext(member RelExpr) {\n", opTyp.name)
 		fmt.Fprintf(g.w, "  if e.next != nil {\n")
-		fmt.Fprintf(g.w, "    panic(fmt.Sprintf(\"expression already has its next defined: %%s\", e))\n")
+		fmt.Fprintf(g.w, "    panic(pgerror.NewAssertionErrorf(\"expression already has its next defined: %%s\", e))\n")
 		fmt.Fprintf(g.w, "  }\n")
 		fmt.Fprintf(g.w, "  e.next = member\n")
 		fmt.Fprintf(g.w, "}\n\n")
@@ -387,7 +392,7 @@ func (g *exprsGen) genExprFuncs(define *lang.DefineExpr) {
 		// Generate the setGroup method.
 		fmt.Fprintf(g.w, "func (e *%s) setGroup(member RelExpr) {\n", opTyp.name)
 		fmt.Fprintf(g.w, "  if e.grp != nil {\n")
-		fmt.Fprintf(g.w, "    panic(fmt.Sprintf(\"expression is already in a group: %%s\", e))\n")
+		fmt.Fprintf(g.w, "    panic(pgerror.NewAssertionErrorf(\"expression is already in a group: %%s\", e))\n")
 		fmt.Fprintf(g.w, "  }\n")
 		fmt.Fprintf(g.w, "  e.grp = member.group()\n")
 		fmt.Fprintf(g.w, "  LastGroupMember(member).setNext(e)\n")
@@ -415,7 +420,7 @@ func (g *exprsGen) genEnforcerFuncs(define *lang.DefineExpr) {
 	fmt.Fprintf(g.w, "  if nth == 0 {\n")
 	fmt.Fprintf(g.w, "    return e.Input\n")
 	fmt.Fprintf(g.w, "  }\n")
-	fmt.Fprintf(g.w, "  panic(\"child index out of range\")\n")
+	fmt.Fprintf(g.w, "  panic(pgerror.NewAssertionErrorf(\"child index out of range\"))\n")
 	fmt.Fprintf(g.w, "}\n\n")
 
 	// Generate the Private method.
@@ -436,7 +441,7 @@ func (g *exprsGen) genEnforcerFuncs(define *lang.DefineExpr) {
 	fmt.Fprintf(g.w, "    e.Input = child.(RelExpr)\n")
 	fmt.Fprintf(g.w, "    return\n")
 	fmt.Fprintf(g.w, "  }\n")
-	fmt.Fprintf(g.w, "  panic(\"child index out of range\")\n")
+	fmt.Fprintf(g.w, "  panic(pgerror.NewAssertionErrorf(\"child index out of range\"))\n")
 	fmt.Fprintf(g.w, "}\n\n")
 
 	// Generate the Memo method.
@@ -486,12 +491,12 @@ func (g *exprsGen) genEnforcerFuncs(define *lang.DefineExpr) {
 
 	// Generate the setNext method.
 	fmt.Fprintf(g.w, "func (e *%s) setNext(member RelExpr) {\n", opTyp.name)
-	fmt.Fprintf(g.w, "  panic(\"setNext cannot be called on enforcers\")\n")
+	fmt.Fprintf(g.w, "  panic(pgerror.NewAssertionErrorf(\"setNext cannot be called on enforcers\"))\n")
 	fmt.Fprintf(g.w, "}\n\n")
 
 	// Generate the setGroup method.
 	fmt.Fprintf(g.w, "func (e *%s) setGroup(member exprGroup) {\n", opTyp.name)
-	fmt.Fprintf(g.w, "  panic(\"setGroup cannot be called on enforcers\")\n")
+	fmt.Fprintf(g.w, "  panic(pgerror.NewAssertionErrorf(\"setGroup cannot be called on enforcers\"))\n")
 	fmt.Fprintf(g.w, "}\n\n")
 }
 
@@ -507,7 +512,7 @@ func (g *exprsGen) genListExprFuncs(define *lang.DefineExpr) {
 
 	// Generate the ID method.
 	fmt.Fprintf(g.w, "func (e *%s) ID() opt.ScalarID {\n", opTyp.name)
-	fmt.Fprintf(g.w, "  panic(\"lists have no id\")")
+	fmt.Fprintf(g.w, "  panic(pgerror.NewAssertionErrorf(\"lists have no id\"))")
 	fmt.Fprintf(g.w, "}\n\n")
 
 	// Generate the Op method.
@@ -648,6 +653,33 @@ func (g *exprsGen) genAddToGroupFuncs() {
 	for _, define := range defines {
 		opTyp := g.md.typeOf(define)
 
+		// The Add...ToGroup functions add a (possibly non-normalized) expression
+		// to a memo group. They operate like this:
+		//
+		// Attempt to intern the expression. This will either give back the
+		// original expression, meaning we had not previously interned it, or it
+		// will give back a previously interned version.
+		//
+		// If we hadn't ever seen the expression before, then add it to the group
+		// and move on.
+		//
+		// If we *had* seen it before, check if it is in the same group as the one
+		// we're attempting to add it to. If it's in the same group, then this is
+		// fine, move along. This happens, for example, if we try to apply
+		// CommuteJoin twice.
+		//
+		// If it's in a different group, then we've learned something interesting:
+		// two groups which we previously thought were distinct are actually
+		// equivalent. One approach here would be to merge the two groups into a
+		// single group, since we've proven that they're equivalent. We do
+		// something simpler right now, which is to just bail on trying to add the
+		// new expression, leaving the existing instance of it unchanged in its old
+		// group. This can result in some expressions not getting fully explored,
+		// but we do our best to make this outcome as much of an edge-case as
+		// possible, so hopefully this is fine in almost every case.
+		// TODO(justin): add telemetry for when group collisions happen. If this is
+		// ever happening frequently than that is a bug.
+
 		fmt.Fprintf(g.w, "func (m *Memo) Add%sToGroup(e *%s, grp RelExpr) *%s {\n",
 			define.Name, opTyp.name, opTyp.name)
 		fmt.Fprintf(g.w, "  const size = int64(unsafe.Sizeof(%s{}))\n", opTyp.name)
@@ -657,7 +689,8 @@ func (g *exprsGen) genAddToGroupFuncs() {
 		fmt.Fprintf(g.w, "    m.memEstimate += size\n")
 		fmt.Fprintf(g.w, "    m.checkExpr(e)\n")
 		fmt.Fprintf(g.w, "  } else if interned.group() != grp.group() {\n")
-		fmt.Fprintf(g.w, "    panic(fmt.Sprintf(\"%%s expression cannot be added to multiple groups: %%s\", e.Op(), interned))\n")
+		fmt.Fprintf(g.w, "    // This is a group collision, do nothing.\n")
+		fmt.Fprintf(g.w, "    return nil\n")
 		fmt.Fprintf(g.w, "  }\n")
 		fmt.Fprintf(g.w, "  return interned\n")
 		fmt.Fprintf(g.w, "}\n\n")
@@ -674,7 +707,7 @@ func (g *exprsGen) genInternFuncs() {
 		fmt.Fprintf(g.w, "    return in.Intern%s(t)\n", define.Name)
 	}
 	fmt.Fprintf(g.w, "  default:\n")
-	fmt.Fprintf(g.w, "    panic(fmt.Sprintf(\"unhandled op: %%s\", e.Op()))\n")
+	fmt.Fprintf(g.w, "    panic(pgerror.NewAssertionErrorf(\"unhandled op: %%s\", e.Op()))\n")
 	fmt.Fprintf(g.w, "  }\n")
 	fmt.Fprintf(g.w, "}\n\n")
 
@@ -772,7 +805,7 @@ func (g *exprsGen) genBuildPropsFunc() {
 		fmt.Fprintf(g.w, "    b.build%sProps(t, rel)\n", define.Name)
 	}
 	fmt.Fprintf(g.w, "  default:\n")
-	fmt.Fprintf(g.w, "    panic(fmt.Sprintf(\"unhandled type: %%s\", t.Op()))\n")
+	fmt.Fprintf(g.w, "    panic(pgerror.NewAssertionErrorf(\"unhandled type: %%s\", t.Op()))\n")
 
 	fmt.Fprintf(g.w, "  }\n")
 	fmt.Fprintf(g.w, "}\n\n")

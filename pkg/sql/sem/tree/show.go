@@ -143,12 +143,16 @@ func (node *ShowIndex) Format(ctx *FmtCtx) {
 
 // ShowQueries represents a SHOW QUERIES statement
 type ShowQueries struct {
+	All     bool
 	Cluster bool
 }
 
 // Format implements the NodeFormatter interface.
 func (node *ShowQueries) Format(ctx *FmtCtx) {
 	ctx.WriteString("SHOW ")
+	if node.All {
+		ctx.WriteString("ALL ")
+	}
 	if node.Cluster {
 		ctx.WriteString("CLUSTER QUERIES")
 	} else {
@@ -167,12 +171,16 @@ func (node *ShowJobs) Format(ctx *FmtCtx) {
 
 // ShowSessions represents a SHOW SESSIONS statement
 type ShowSessions struct {
+	All     bool
 	Cluster bool
 }
 
 // Format implements the NodeFormatter interface.
 func (node *ShowSessions) Format(ctx *FmtCtx) {
 	ctx.WriteString("SHOW ")
+	if node.All {
+		ctx.WriteString("ALL ")
+	}
 	if node.Cluster {
 		ctx.WriteString("CLUSTER SESSIONS")
 	} else {
@@ -188,6 +196,20 @@ type ShowSchemas struct {
 // Format implements the NodeFormatter interface.
 func (node *ShowSchemas) Format(ctx *FmtCtx) {
 	ctx.WriteString("SHOW SCHEMAS")
+	if node.Database != "" {
+		ctx.WriteString(" FROM ")
+		ctx.FormatNode(&node.Database)
+	}
+}
+
+// ShowSequences represents a SHOW SEQUENCES statement.
+type ShowSequences struct {
+	Database Name
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ShowSequences) Format(ctx *FmtCtx) {
+	ctx.WriteString("SHOW SEQUENCES")
 	if node.Database != "" {
 		ctx.WriteString(" FROM ")
 		ctx.FormatNode(&node.Database)

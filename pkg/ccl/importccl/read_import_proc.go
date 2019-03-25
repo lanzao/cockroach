@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
@@ -35,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -138,7 +140,7 @@ func readInputFiles(
 			}
 
 			if err := fileFunc(ctx, src, dataFileIndex, dataFile, wrappedProgressFn); err != nil {
-				return errors.Wrap(err, dataFile)
+				return pgerror.Wrap(err, pgerror.CodeDataExceptionError, dataFile)
 			}
 			if updateFromFiles {
 				if err := progressFn(float32(currentFile) / float32(len(dataFiles))); err != nil {
@@ -232,7 +234,7 @@ func newRowConverter(
 	ri, err := row.MakeInserter(nil /* txn */, immutDesc, nil, /* fkTables */
 		immutDesc.Columns, false /* checkFKs */, &sqlbase.DatumAlloc{})
 	if err != nil {
-		return nil, errors.Wrap(err, "make row inserter")
+		return nil, pgerror.Wrap(err, pgerror.CodeDataExceptionError, "make row inserter")
 	}
 	c.ri = ri
 
@@ -242,7 +244,7 @@ func newRowConverter(
 	// allows those expressions to run.
 	cols, defaultExprs, err := sqlbase.ProcessDefaultColumns(immutDesc.Columns, immutDesc, &txCtx, c.evalCtx)
 	if err != nil {
-		return nil, errors.Wrap(err, "process default columns")
+		return nil, pgerror.Wrap(err, pgerror.CodeDataExceptionError, "process default columns")
 	}
 	c.cols = cols
 	c.defaultExprs = defaultExprs
@@ -305,7 +307,8 @@ func (c *rowConverter) row(ctx context.Context, fileIndex int32, rowIndex int64)
 	insertRow, err := sql.GenerateInsertRow(
 		c.defaultExprs, computeExprs, c.cols, computedCols, *c.evalCtx, c.tableDesc, c.datums, &c.computedIVarContainer)
 	if err != nil {
-		return errors.Wrapf(err, "generate insert row")
+		return pgerror.Wrap(err, pgerror.CodeDataExceptionError,
+			"generate insert row")
 	}
 	if err := c.ri.InsertRow(
 		ctx,
@@ -318,7 +321,7 @@ func (c *rowConverter) row(ctx context.Context, fileIndex int32, rowIndex int64)
 		row.SkipFKs,
 		false, /* traceKV */
 	); err != nil {
-		return errors.Wrapf(err, "insert row")
+		return pgerror.Wrap(err, pgerror.CodeDataExceptionError, "insert row")
 	}
 	// If our batch is full, flush it and start a new one.
 	if len(c.kvBatch) >= kvBatchSize {
@@ -612,22 +615,43 @@ func (s sampleRate) sample(kv roachpb.KeyValue) bool {
 	return prob > s.rnd.Float64()
 }
 
-func makeRowErr(file string, row int64, format string, args ...interface{}) error {
-	return errors.Errorf("%q: row %d: "+format, append([]interface{}{file, row}, args...)...)
+func makeRowErr(file string, row int64, code, format string, args ...interface{}) error {
+	return pgerror.NewErrorWithDepthf(1, code,
+		"%q: row %d: "+format, append([]interface{}{file, row}, args...)...)
+}
+
+func wrapRowErr(err error, file string, row int64, code, format string, args ...interface{}) error {
+	newFormat := "%q: row %d"
+	if format != "" {
+		newFormat = newFormat + ": " + format
+	}
+	return pgerror.WrapWithDepthf(1, err, code,
+		newFormat, append([]interface{}{file, row}, args...)...)
 }
 
 // ingestKvs drains kvs from the channel until it closes, ingesting them using
 // the BulkAdder. It handles the required buffering/sorting/etc.
 func ingestKvs(ctx context.Context, adder storagebase.BulkAdder, kvCh <-chan kvBatch) error {
-	// TODO(dt): allow configuring these.
-	const sortBatchSize = 1000000
-	// TODO(dt): track byte size as well as key count to trigger flushes.
+	const sortBatchSize = 48 << 20 // 48MB
 
 	// TODO(dt): buffer to disk instead of all in-mem.
 
-	buf := make(roachpb.KeyValueByKey, 0, sortBatchSize)
+	// Batching all kvs together leads to worst case overlap behavior in the
+	// resulting AddSSTable calls, leading to compactions and potentially L0
+	// stalls. Instead maintain a separate buffer for each table's primary data.
+	// This optimizes for the case when the data arriving to IMPORT is already
+	// sorted by primary key, leading to no overlapping AddSSTable requests. Given
+	// that many workloads (and actual imported data) will be sorted by primary
+	// key, it makes sense to try to exploit this.
+	//
+	// TODO(dan): This was merged because it stabilized direct ingest IMPORT, but
+	// we may be able to do something simpler (such as chunking along index
+	// boundaries in flush) or more general (such as chunking based on the common
+	// prefix of the last N kvs).
+	kvsByTableIDIndexID := make(map[string]roachpb.KeyValueByKey)
+	sizeByTableIDIndexID := make(map[string]int64)
 
-	flushBuf := func(ctx context.Context) error {
+	flush := func(ctx context.Context, buf roachpb.KeyValueByKey) error {
 		if len(buf) == 0 {
 			return nil
 		}
@@ -635,7 +659,8 @@ func ingestKvs(ctx context.Context, adder storagebase.BulkAdder, kvCh <-chan kvB
 		for i := range buf {
 			if err := adder.Add(ctx, buf[i].Key, buf[i].Value.RawBytes); err != nil {
 				if i > 0 && bytes.Equal(buf[i].Key, buf[i-1].Key) {
-					return errors.Wrapf(err, errSSTCreationMaybeDuplicateTemplate, buf[i].Key)
+					return pgerror.Wrapf(err, pgerror.CodeDataExceptionError,
+						errSSTCreationMaybeDuplicateTemplate, buf[i].Key)
 				}
 				return err
 			}
@@ -643,25 +668,41 @@ func ingestKvs(ctx context.Context, adder storagebase.BulkAdder, kvCh <-chan kvB
 		if err := adder.Flush(ctx); err != nil {
 			return err
 		}
-		buf = buf[:0]
-		return nil
+		return adder.Reset()
 	}
 
 	for kvBatch := range kvCh {
-		// TODO(dt): consider checking if we want to flush an almost-full buffer
-		// to make room for a large batch.
-		buf = append(buf, kvBatch...)
-
-		if len(buf) > sortBatchSize {
-			if err := flushBuf(ctx); err != nil {
+		for _, kv := range kvBatch {
+			tableLen, err := encoding.PeekLength(kv.Key)
+			if err != nil {
 				return err
 			}
-			if err := adder.Reset(); err != nil {
+			indexLen, err := encoding.PeekLength(kv.Key[tableLen:])
+			if err != nil {
 				return err
+			}
+			bufKey := kv.Key[:tableLen+indexLen]
+			kvsByTableIDIndexID[string(bufKey)] = append(kvsByTableIDIndexID[string(bufKey)], kv)
+			sizeByTableIDIndexID[string(bufKey)] += int64(len(kv.Key) + len(kv.Value.RawBytes))
+
+			// TODO(dan): Prevent unbounded memory usage by flushing the largest
+			// buffer when the total size of all buffers exceeds some threshold.
+			if s := sizeByTableIDIndexID[string(bufKey)]; s > sortBatchSize {
+				buf := kvsByTableIDIndexID[string(bufKey)]
+				if err := flush(ctx, buf); err != nil {
+					return err
+				}
+				kvsByTableIDIndexID[string(bufKey)] = buf[:0]
+				sizeByTableIDIndexID[string(bufKey)] = 0
 			}
 		}
 	}
-	return flushBuf(ctx)
+	for _, buf := range kvsByTableIDIndexID {
+		if err := flush(ctx, buf); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func init() {

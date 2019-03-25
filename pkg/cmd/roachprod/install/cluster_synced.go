@@ -76,6 +76,8 @@ type SyncedCluster struct {
 	Impl        ClusterImpl
 	UseTreeDist bool
 	Quiet       bool
+	// AuthorizedKeys is used by SetupSSH to add additional authorized keys.
+	AuthorizedKeys []byte
 }
 
 func (c *SyncedCluster) host(index int) string {
@@ -386,7 +388,7 @@ func (c *SyncedCluster) Run(stdout, stderr io.Writer, nodes []int, title, cmd st
 		//
 		// That command should return immediately. And a "roachprod status" should
 		// reveal that the sleep command is running on the cluster.
-		nodeCmd := fmt.Sprintf(`export ROACHPROD=%d%s && bash -c %s`,
+		nodeCmd := fmt.Sprintf(`export ROACHPROD=%d%s GOTRACEBACK=crash && bash -c %s`,
 			nodes[i], c.Tag, ssh.Escape1(expandedCmd))
 		if c.IsLocal() {
 			nodeCmd = fmt.Sprintf("cd ${HOME}/local/%d ; %s", nodes[i], nodeCmd)
@@ -579,6 +581,23 @@ exit 1
 		}
 		return nil, nil
 	})
+
+	if len(c.AuthorizedKeys) > 0 {
+		c.Parallel("adding additional authorized keys", len(c.Nodes), 0, func(i int) ([]byte, error) {
+			sess, err := c.newSession(c.Nodes[i])
+			if err != nil {
+				return nil, err
+			}
+			defer sess.Close()
+
+			sess.SetStdin(bytes.NewReader(c.AuthorizedKeys))
+			cmd := `cat >> ~/.ssh/authorized_keys`
+			if out, err := sess.CombinedOutput(cmd); err != nil {
+				return nil, errors.Wrapf(err, "~ %s\n%s", cmd, out)
+			}
+			return nil, nil
+		})
+	}
 
 	return nil
 }

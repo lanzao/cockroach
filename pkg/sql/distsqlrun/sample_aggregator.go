@@ -21,8 +21,8 @@ import (
 	"github.com/axiomhq/hyperloglog"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
@@ -60,7 +60,7 @@ const sampleAggregatorProcName = "sample aggregator"
 
 // SampleAggregatorProgressInterval is the frequency at which the
 // SampleAggregator processor will report progress. It is mutable for testing.
-var SampleAggregatorProgressInterval = time.Second
+var SampleAggregatorProgressInterval = 5 * time.Second
 
 func newSampleAggregator(
 	flowCtx *FlowCtx,
@@ -85,7 +85,7 @@ func newSampleAggregator(
 		}
 	}
 
-	rankCol := len(spec.SampledColumnIDs)
+	rankCol := len(input.OutputTypes()) - 5
 	s := &sampleAggregator{
 		spec:         spec,
 		input:        input,
@@ -152,32 +152,44 @@ func (s *sampleAggregator) mainLoop(ctx context.Context) (earlyExit bool, err er
 		}
 	}
 
-	progFn := func(pct float32) error {
+	lastReportedFractionCompleted := float32(-1)
+	// Report progress (0 to 1).
+	progFn := func(fractionCompleted float32) error {
 		if jobID == 0 {
 			return nil
 		}
-		return job.FractionProgressed(ctx, func(ctx context.Context, _ jobspb.ProgressDetails) float32 {
-			// Float addition can round such that the sum is > 1.
-			if pct > 1 {
-				pct = 1
-			}
-			return pct
-		})
+		// If it changed by less than 1%, just check for cancellation (which is more
+		// efficient).
+		if fractionCompleted < 1.0 && fractionCompleted < lastReportedFractionCompleted+0.01 {
+			return job.CheckStatus(ctx)
+		}
+		lastReportedFractionCompleted = fractionCompleted
+		return job.FractionProgressed(ctx, jobs.FractionUpdater(fractionCompleted))
 	}
 
-	fractionCompleted := float32(0)
+	var rowsProcessed uint64
 	progressUpdates := util.Every(SampleAggregatorProgressInterval)
 	var da sqlbase.DatumAlloc
 	var tmpSketch hyperloglog.Sketch
 	for {
 		row, meta := s.input.Next()
 		if meta != nil {
-			if meta.Progress != nil {
-				inputProg := meta.Progress.Progress.(*jobspb.Progress_FractionCompleted).FractionCompleted
-				fractionCompleted += inputProg / float32(s.spec.InputProcCnt)
+			if meta.SamplerProgress != nil {
+				rowsProcessed += meta.SamplerProgress.RowsProcessed
 				if progressUpdates.ShouldProcess(timeutil.Now()) {
 					// Periodically report fraction progressed and check that the job has
 					// not been paused or canceled.
+					var fractionCompleted float32
+					if s.spec.RowsExpected > 0 {
+						fractionCompleted = float32(float64(rowsProcessed) / float64(s.spec.RowsExpected))
+						const maxProgress = 0.99
+						if fractionCompleted > maxProgress {
+							// Since the total number of rows expected is just an estimate,
+							// don't report more than 99% completion until the very end.
+							fractionCompleted = maxProgress
+						}
+					}
+
 					if err := progFn(fractionCompleted); err != nil {
 						return false, err
 					}
@@ -200,7 +212,7 @@ func (s *sampleAggregator) mainLoop(ctx context.Context) (earlyExit bool, err er
 			// This must be a sampled row.
 			rank, err := row[s.rankCol].GetInt()
 			if err != nil {
-				return false, errors.Wrapf(err, "decoding rank column")
+				return false, pgerror.NewAssertionErrorWithWrappedErrf(err, "decoding rank column")
 			}
 			// Retain the rows with the top ranks.
 			if err := s.sr.SampleRow(row[:s.rankCol], uint64(rank)); err != nil {
@@ -235,13 +247,13 @@ func (s *sampleAggregator) mainLoop(ctx context.Context) (earlyExit bool, err er
 		}
 		d := row[s.sketchCol].Datum
 		if d == tree.DNull {
-			return false, errors.Errorf("NULL sketch data")
+			return false, pgerror.NewAssertionErrorf("NULL sketch data")
 		}
 		if err := tmpSketch.UnmarshalBinary([]byte(*d.(*tree.DBytes))); err != nil {
 			return false, err
 		}
 		if err := s.sketches[sketchIdx].sketch.Merge(&tmpSketch); err != nil {
-			return false, errors.Wrapf(err, "merging sketch data")
+			return false, pgerror.NewAssertionErrorWithWrappedErrf(err, "merging sketch data")
 		}
 	}
 	// Report progress one last time so we don't write results if the job was

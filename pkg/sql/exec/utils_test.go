@@ -21,6 +21,7 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/exec/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/exec/types"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/pkg/errors"
@@ -58,6 +59,24 @@ func runTests(t *testing.T, tups []tuples, test func(t *testing.T, inputs []Oper
 	}
 }
 
+// runTestsWithFixedSel is a helper that (with a given fixed selection vector)
+// automatically runs your tests with varied batch sizes. Provide a test
+// function that takes a list of input Operators, which will give back the
+// tuples provided in batches.
+func runTestsWithFixedSel(
+	t *testing.T, tups []tuples, sel []uint16, test func(t *testing.T, inputs []Operator),
+) {
+	for _, batchSize := range []uint16{1, 2, 3, 16, 1024} {
+		t.Run(fmt.Sprintf("batchSize=%d/fixedSel", batchSize), func(t *testing.T) {
+			inputSources := make([]Operator, len(tups))
+			for i, tup := range tups {
+				inputSources[i] = newOpFixedSelTestInput(sel, batchSize, tup)
+			}
+			test(t, inputSources)
+		})
+	}
+}
+
 // opTestInput is an Operator that columnarizes test input in the form of tuples
 // of arbitrary Go types. It's meant to be used in Operator unit tests in
 // conjunction with opTestOutput like the following:
@@ -77,7 +96,7 @@ type opTestInput struct {
 
 	batchSize uint16
 	tuples    tuples
-	batch     ColBatch
+	batch     coldata.Batch
 	useSel    bool
 	rng       *rand.Rand
 	selection []uint16
@@ -125,15 +144,15 @@ func (s *opTestInput) Init() {
 	}
 
 	s.typs = typs
-	s.batch = NewMemBatch(typs)
+	s.batch = coldata.NewMemBatch(typs)
 
-	s.selection = make([]uint16, ColBatchSize)
+	s.selection = make([]uint16, coldata.BatchSize)
 	for i := range s.selection {
 		s.selection[i] = uint16(i)
 	}
 }
 
-func (s *opTestInput) Next() ColBatch {
+func (s *opTestInput) Next() coldata.Batch {
 	if len(s.tuples) == 0 {
 		s.batch.SetLength(0)
 		return s.batch
@@ -201,6 +220,127 @@ func (s *opTestInput) Next() ColBatch {
 	return s.batch
 }
 
+type opFixedSelTestInput struct {
+	typs []types.T
+
+	batchSize uint16
+	tuples    tuples
+	batch     coldata.Batch
+	sel       []uint16
+	// idx is the index of the tuple to be emitted next. We need to maintain it
+	// in case the provided selection vector or provided tuples (if sel is nil)
+	// is longer than requested batch size.
+	idx uint16
+}
+
+var _ Operator = &opFixedSelTestInput{}
+
+// newOpFixedSelTestInput returns a new opFixedSelTestInput with the given
+// input tuples and selection vector. The input tuples are translated into
+// types automatically, using simple rules (e.g. integers always become Int64).
+func newOpFixedSelTestInput(sel []uint16, batchSize uint16, tuples tuples) *opFixedSelTestInput {
+	ret := &opFixedSelTestInput{
+		batchSize: batchSize,
+		sel:       sel,
+		tuples:    tuples,
+	}
+	return ret
+}
+
+func (s *opFixedSelTestInput) Init() {
+	if len(s.tuples) == 0 {
+		panic("empty tuple source")
+	}
+
+	typs := make([]types.T, len(s.tuples[0]))
+	for i := range typs {
+		// Default type for test cases is Int64 in case the entire column is null
+		// and the type is indeterminate.
+		typs[i] = types.Int64
+		for _, tup := range s.tuples {
+			if tup[i] != nil {
+				typs[i] = types.FromGoType(tup[i])
+				break
+			}
+		}
+	}
+
+	s.typs = typs
+	s.batch = coldata.NewMemBatch(typs)
+	tupleLen := len(s.tuples[0])
+	for _, i := range s.sel {
+		if len(s.tuples[i]) != tupleLen {
+			panic(fmt.Sprintf("mismatched tuple lens: found %+v expected %d vals",
+				s.tuples[i], tupleLen))
+		}
+	}
+
+	if s.sel != nil {
+		s.batch.SetSelection(true)
+		// When non-nil selection vector is given, we convert all tuples into the
+		// Go values at once, and we'll be copying an appropriate chunk of the
+		// selection vector later in Next().
+		for i := range s.typs {
+			vec := s.batch.ColVec(i)
+			vec.UnsetNulls()
+			// Automatically convert the Go values into exec.Type slice elements using
+			// reflection. This is slow, but acceptable for tests.
+			col := reflect.ValueOf(vec.Col())
+			for j := 0; j < len(s.tuples); j++ {
+				if s.tuples[j][i] == nil {
+					vec.SetNull(uint16(j))
+				} else {
+					col.Index(j).Set(
+						reflect.ValueOf(s.tuples[j][i]).Convert(reflect.TypeOf(vec.Col()).Elem()))
+				}
+			}
+		}
+	}
+
+}
+
+func (s *opFixedSelTestInput) Next() coldata.Batch {
+	var batchSize uint16
+	if s.sel == nil {
+		batchSize = s.batchSize
+		if uint16(len(s.tuples))-s.idx < batchSize {
+			batchSize = uint16(len(s.tuples)) - s.idx
+		}
+		// When nil selection vector is given, we convert only the tuples that fit
+		// into the current batch (keeping the s.idx in mind).
+		for i := range s.typs {
+			vec := s.batch.ColVec(i)
+			vec.UnsetNulls()
+			// Automatically convert the Go values into exec.Type slice elements using
+			// reflection. This is slow, but acceptable for tests.
+			col := reflect.ValueOf(vec.Col())
+			for j := uint16(0); j < batchSize; j++ {
+				if s.tuples[s.idx+j][i] == nil {
+					vec.SetNull(j)
+				} else {
+					col.Index(int(j)).Set(
+						reflect.ValueOf(s.tuples[s.idx+j][i]).Convert(reflect.TypeOf(vec.Col()).Elem()))
+				}
+			}
+		}
+	} else {
+		if s.idx == uint16(len(s.sel)) {
+			s.batch.SetLength(0)
+			return s.batch
+		}
+		batchSize = s.batchSize
+		if uint16(len(s.sel))-s.idx < batchSize {
+			batchSize = uint16(len(s.sel)) - s.idx
+		}
+		// All tuples have already been converted to the Go values, so we only need
+		// to set the right selection vector for s.batch.
+		copy(s.batch.Selection(), s.sel[s.idx:s.idx+batchSize])
+	}
+	s.batch.SetLength(batchSize)
+	s.idx += batchSize
+	return s.batch
+}
+
 // opTestOutput is a test verification struct that ensures its input batches
 // match some expected output tuples.
 type opTestOutput struct {
@@ -209,7 +349,7 @@ type opTestOutput struct {
 	expected tuples
 
 	curIdx uint16
-	batch  ColBatch
+	batch  coldata.Batch
 }
 
 // newOpTestOutput returns a new opTestOutput, initialized with the given input
@@ -347,8 +487,10 @@ func assertTuplesOrderedEqual(expected tuples, actual tuples) error {
 
 // repeatableBatchSource is an Operator that returns the same batch forever.
 type repeatableBatchSource struct {
-	internalBatch ColBatch
+	internalBatch coldata.Batch
 	batchLen      uint16
+	// sel specifies the desired selection vector for the batch.
+	sel []uint16
 
 	batchesToReturn int
 	batchesReturned int
@@ -356,22 +498,33 @@ type repeatableBatchSource struct {
 
 var _ Operator = &repeatableBatchSource{}
 
-// newRepeatableBatchSource returns a new Operator initialized to return
-// its input batch forever.
-func newRepeatableBatchSource(batch ColBatch) *repeatableBatchSource {
-	return &repeatableBatchSource{
+// newRepeatableBatchSource returns a new Operator initialized to return its
+// input batch forever (including the selection vector if batch comes with it).
+func newRepeatableBatchSource(batch coldata.Batch) *repeatableBatchSource {
+	src := &repeatableBatchSource{
 		internalBatch: batch,
 		batchLen:      batch.Length(),
 	}
+	if batch.Selection() != nil {
+		src.sel = make([]uint16, batch.Length())
+		copy(src.sel, batch.Selection())
+	}
+	return src
 }
 
-func (s *repeatableBatchSource) Next() ColBatch {
-	s.internalBatch.SetSelection(false)
+func (s *repeatableBatchSource) Next() coldata.Batch {
+	s.internalBatch.SetSelection(s.sel != nil)
 	s.batchesReturned++
 	if s.batchesToReturn != 0 && s.batchesReturned > s.batchesToReturn {
 		s.internalBatch.SetLength(0)
 	} else {
 		s.internalBatch.SetLength(s.batchLen)
+	}
+	if s.sel != nil {
+		// Since selection vectors are mutable, to make sure that we return the
+		// batch with the given selection vector, we need to reset
+		// s.internalBatch.Selection() to s.sel on every iteration.
+		copy(s.internalBatch.Selection(), s.sel)
 	}
 	return s.internalBatch
 }
@@ -395,7 +548,7 @@ var _ Operator = &finiteBatchSource{}
 
 // newFiniteBatchSource returns a new Operator initialized to return its input
 // batch a specified number of times.
-func newFiniteBatchSource(batch ColBatch, usableCount int) *finiteBatchSource {
+func newFiniteBatchSource(batch coldata.Batch, usableCount int) *finiteBatchSource {
 	return &finiteBatchSource{
 		repeatableBatch: newRepeatableBatchSource(batch),
 		usableCount:     usableCount,
@@ -406,26 +559,26 @@ func (f *finiteBatchSource) Init() {
 	f.repeatableBatch.Init()
 }
 
-func (f *finiteBatchSource) Next() ColBatch {
+func (f *finiteBatchSource) Next() coldata.Batch {
 	if f.usableCount > 0 {
 		f.usableCount--
 		return f.repeatableBatch.Next()
 	}
-	return NewMemBatch([]types.T{})
+	return coldata.NewMemBatch([]types.T{})
 }
 
 // randomLengthBatchSource is an Operator that forever returns the same batch at
 // a different length each time.
 type randomLengthBatchSource struct {
-	internalBatch ColBatch
+	internalBatch coldata.Batch
 	rng           *rand.Rand
 }
 
 var _ Operator = &randomLengthBatchSource{}
 
 // newRandomLengthBatchSource returns a new Operator initialized to return a
-// batch of random length between [1, ColBatchSize) forever.
-func newRandomLengthBatchSource(batch ColBatch) *randomLengthBatchSource {
+// batch of random length between [1, col.BatchSize) forever.
+func newRandomLengthBatchSource(batch coldata.Batch) *randomLengthBatchSource {
 	return &randomLengthBatchSource{
 		internalBatch: batch,
 	}
@@ -435,9 +588,63 @@ func (r *randomLengthBatchSource) Init() {
 	r.rng, _ = randutil.NewPseudoRand()
 }
 
-func (r *randomLengthBatchSource) Next() ColBatch {
-	r.internalBatch.SetLength(uint16(randutil.RandIntInRange(r.rng, 1, int(ColBatchSize))))
+func (r *randomLengthBatchSource) Next() coldata.Batch {
+	r.internalBatch.SetLength(uint16(randutil.RandIntInRange(r.rng, 1, int(coldata.BatchSize))))
 	return r.internalBatch
+}
+
+// finiteChunksSource is an Operator that returns a batch specified number of
+// times. The first matchLen columns of the batch are incremented every time
+// (except for the first) the batch is returned to emulate source that is
+// already ordered on matchLen columns.
+type finiteChunksSource struct {
+	repeatableBatch *repeatableBatchSource
+
+	usableCount int
+	matchLen    int
+	adjustment  []int64
+}
+
+var _ Operator = &finiteBatchSource{}
+
+func newFiniteChunksSource(batch coldata.Batch, usableCount int, matchLen int) *finiteChunksSource {
+	return &finiteChunksSource{
+		repeatableBatch: newRepeatableBatchSource(batch),
+		usableCount:     usableCount,
+		matchLen:        matchLen,
+	}
+}
+
+func (f *finiteChunksSource) Init() {
+	f.repeatableBatch.Init()
+	f.adjustment = make([]int64, f.matchLen)
+}
+
+func (f *finiteChunksSource) Next() coldata.Batch {
+	if f.usableCount > 0 {
+		f.usableCount--
+		batch := f.repeatableBatch.Next()
+		if f.adjustment[0] == 0 {
+			// We need to calculate the difference between the first and the last
+			// tuples in batch in first matchLen columns so that in the following
+			// calls to Next() the batch is adjusted such that tuples in consecutive
+			// batches are ordered on the first matchLen columns.
+			for col := 0; col < f.matchLen; col++ {
+				firstValue := batch.ColVec(col).Int64()[0]
+				lastValue := batch.ColVec(col).Int64()[batch.Length()-1]
+				f.adjustment[col] = lastValue - firstValue
+			}
+		} else {
+			for i := 0; i < f.matchLen; i++ {
+				int64Vec := batch.ColVec(i).Int64()
+				for j := range int64Vec {
+					int64Vec[j] += f.adjustment[i]
+				}
+			}
+		}
+		return batch
+	}
+	return coldata.NewMemBatch([]types.T{})
 }
 
 func TestOpTestInputOutput(t *testing.T) {
@@ -459,7 +666,7 @@ func TestOpTestInputOutput(t *testing.T) {
 }
 
 func TestRepeatableBatchSource(t *testing.T) {
-	batch := NewMemBatch([]types.T{types.Int64})
+	batch := coldata.NewMemBatch([]types.T{types.Int64})
 	batchLen := uint16(10)
 	batch.SetLength(batchLen)
 	input := newRepeatableBatchSource(batch)
@@ -475,4 +682,122 @@ func TestRepeatableBatchSource(t *testing.T) {
 	if b.Selection() != nil {
 		t.Fatalf("expected repeatableBatchSource to reset selection vector, found %+v", b.Selection())
 	}
+}
+
+func TestRepeatableBatchSourceWithFixedSel(t *testing.T) {
+	batch := coldata.NewMemBatch([]types.T{types.Int64})
+	sel, batchLen := generateSelectionVector(10 /* batchSize */, 0 /* probOfOmitting */)
+	batch.SetLength(batchLen)
+	batch.SetSelection(true)
+	copy(batch.Selection(), sel)
+	input := newRepeatableBatchSource(batch)
+	b := input.Next()
+
+	b.SetLength(0)
+	b.SetSelection(false)
+	b = input.Next()
+	if b.Length() != batchLen {
+		t.Fatalf("expected repeatableBatchSource to reset batch length to %d, found %d", batchLen, b.Length())
+	}
+	if b.Selection() == nil {
+		t.Fatalf("expected repeatableBatchSource to reset selection vector, expected %v but found %+v", sel, b.Selection())
+	} else {
+		for i := uint16(0); i < batchLen; i++ {
+			if b.Selection()[i] != sel[i] {
+				t.Fatalf("expected repeatableBatchSource to reset selection vector, expected %v but found %+v", sel, b.Selection())
+			}
+		}
+	}
+
+	newSel, newBatchLen := generateSelectionVector(10 /* batchSize */, 0.2 /* probOfOmitting */)
+	b.SetLength(newBatchLen)
+	b.SetSelection(true)
+	copy(b.Selection(), newSel)
+	b = input.Next()
+	if b.Length() != batchLen {
+		t.Fatalf("expected repeatableBatchSource to reset batch length to %d, found %d", batchLen, b.Length())
+	}
+	if b.Selection() == nil {
+		t.Fatalf("expected repeatableBatchSource to reset selection vector, expected %v but found %+v", sel, b.Selection())
+	} else {
+		for i := uint16(0); i < batchLen; i++ {
+			if b.Selection()[i] != sel[i] {
+				t.Fatalf("expected repeatableBatchSource to reset selection vector, expected %v but found %+v", sel, b.Selection())
+			}
+		}
+	}
+}
+
+// generateSelectionVector creates a selection vector for a given batchSize
+// and returns the selection vector and its length (which will be equal to
+// batchSize if probOfOmitting is 0). probOfOmitting specifies the probability
+// that a row should be omitted from the batch (i.e. whether it should be
+// selected out).
+func generateSelectionVector(batchSize uint16, probOfOmitting float64) ([]uint16, uint16) {
+	if probOfOmitting < 0 || probOfOmitting > 1 {
+		panic(fmt.Sprintf("probability of omitting a row is %f - outside of [0, 1] range", probOfOmitting))
+	}
+	sel := make([]uint16, batchSize)
+	used := make([]bool, batchSize)
+	rng, _ := randutil.NewPseudoRand()
+	for i := uint16(0); i < batchSize; i++ {
+		if rng.Float64() < probOfOmitting {
+			batchSize--
+			i--
+			continue
+		}
+		for {
+			j := uint16(rng.Intn(int(batchSize)))
+			if !used[j] {
+				used[j] = true
+				sel[i] = j
+				break
+			}
+		}
+	}
+	return sel, batchSize
+}
+
+// chunkingBatchSource is a batch source that takes unlimited-size columns and
+// chunks them into BatchSize-sized chunks when Nexted.
+type chunkingBatchSource struct {
+	typs []types.T
+	cols []coldata.Vec
+	len  uint64
+
+	curIdx uint64
+	batch  coldata.Batch
+}
+
+// newChunkingBatchSource returns a new chunkingBatchSource with the given
+// column types, columns, and length.
+func newChunkingBatchSource(typs []types.T, cols []coldata.Vec, len uint64) *chunkingBatchSource {
+	return &chunkingBatchSource{
+		typs: typs,
+		cols: cols,
+		len:  len,
+	}
+}
+
+func (c *chunkingBatchSource) Init() {
+	c.batch = coldata.NewMemBatch(c.typs)
+	for i := range c.cols {
+		c.batch.ColVec(i).SetCol(c.cols[i].Col())
+	}
+}
+
+func (c *chunkingBatchSource) Next() coldata.Batch {
+	if c.curIdx >= c.len {
+		c.batch.SetLength(0)
+	}
+	lastIdx := c.curIdx + coldata.BatchSize
+	if lastIdx > c.len {
+		lastIdx = c.len
+	}
+	for i, vec := range c.batch.ColVecs() {
+		vec.SetCol(c.cols[i].Slice(c.typs[i], c.curIdx, lastIdx).Col())
+	}
+	c.batch.SetLength(uint16(lastIdx - c.curIdx))
+	c.curIdx = lastIdx
+	return c.batch
 }

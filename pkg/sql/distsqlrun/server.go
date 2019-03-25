@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -45,7 +46,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/opentracing/opentracing-go"
+	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 )
 
@@ -112,7 +113,8 @@ var noteworthyMemoryUsageBytes = envutil.EnvOrDefaultInt64("COCKROACH_NOTEWORTHY
 type ServerConfig struct {
 	log.AmbientContext
 
-	Settings *cluster.Settings
+	Settings     *cluster.Settings
+	RuntimeStats RuntimeStats
 
 	// DB is a handle to the cluster.
 	DB *client.DB
@@ -169,6 +171,14 @@ type ServerConfig struct {
 	// executors. The idea is that a higher-layer binds some of the arguments
 	// required, so that users of ServerConfig don't have to care about them.
 	SessionBoundInternalExecutorFactory sqlutil.SessionBoundInternalExecutorFactory
+}
+
+// RuntimeStats is an interface through which the distsqlrun layer can get
+// information about runtime statistics.
+type RuntimeStats interface {
+	// GetCPUCombinedPercentNorm returns the recent user+system cpu usage,
+	// normalized to 0-1 by number of cores.
+	GetCPUCombinedPercentNorm() float64
 }
 
 // ServerImpl implements the server for the distributed SQL APIs.
@@ -298,7 +308,7 @@ func (ds *ServerImpl) setupFlow(
 	}
 	nodeID := ds.ServerConfig.NodeID.Get()
 	if nodeID == 0 {
-		return nil, nil, errors.Errorf("setupFlow called before the NodeID was resolved")
+		return nil, nil, pgerror.NewAssertionErrorf("setupFlow called before the NodeID was resolved")
 	}
 
 	const opName = "flow"
@@ -371,8 +381,8 @@ func (ds *ServerImpl) setupFlow(
 		case distsqlpb.BytesEncodeFormat_BASE64:
 			be = sessiondata.BytesEncodeBase64
 		default:
-			return nil, nil, errors.Errorf("unknown byte encode format: %s",
-				req.EvalContext.BytesEncodeFormat.String())
+			return nil, nil, pgerror.NewAssertionErrorf("unknown byte encode format: %s",
+				log.Safe(req.EvalContext.BytesEncodeFormat))
 		}
 		sd := &sessiondata.SessionData{
 			ApplicationName: req.EvalContext.ApplicationName,
@@ -398,8 +408,6 @@ func (ds *ServerImpl) setupFlow(
 			},
 		}
 
-		evalPlanner := &sqlbase.DummyEvalPlanner{}
-		sequence := &sqlbase.DummySequenceOperators{}
 		evalCtx = &tree.EvalContext{
 			Settings:    ds.ServerConfig.Settings,
 			SessionData: sd,
@@ -411,8 +419,9 @@ func (ds *ServerImpl) setupFlow(
 			// own context.
 			Context:          ctx,
 			Txn:              txn,
-			Planner:          evalPlanner,
-			Sequence:         sequence,
+			Planner:          &sqlbase.DummyEvalPlanner{},
+			SessionAccessor:  &sqlbase.DummySessionAccessor{},
+			Sequence:         &sqlbase.DummySequenceOperators{},
 			InternalExecutor: ie,
 		}
 		evalCtx.SetStmtTimestamp(timeutil.Unix(0 /* sec */, req.EvalContext.StmtTimestampNanos))
@@ -430,6 +439,7 @@ func (ds *ServerImpl) setupFlow(
 	// TODO(radu): we should sanity check some of these fields.
 	flowCtx := FlowCtx{
 		Settings:       ds.Settings,
+		RuntimeStats:   ds.RuntimeStats,
 		AmbientContext: ds.AmbientContext,
 		stopper:        ds.Stopper,
 		id:             req.Flow.FlowID,
@@ -439,13 +449,13 @@ func (ds *ServerImpl) setupFlow(
 		txn:            txn,
 		ClientDB:       ds.DB,
 		executor:       ds.Executor,
-		LeaseManager:   ds.ServerConfig.LeaseManager,
+		LeaseManager:   ds.LeaseManager,
 		testingKnobs:   ds.TestingKnobs,
 		nodeID:         nodeID,
 		TempStorage:    ds.TempStorage,
 		BulkAdder:      ds.BulkAdder,
 		diskMonitor:    ds.DiskMonitor,
-		JobRegistry:    ds.ServerConfig.JobRegistry,
+		JobRegistry:    ds.JobRegistry,
 		traceKV:        req.TraceKV,
 		local:          localState.IsLocal,
 	}
@@ -518,7 +528,7 @@ func (ds *ServerImpl) RunSyncFlow(stream distsqlpb.DistSQL_RunSyncFlowServer) er
 		return err
 	}
 	if firstMsg.SetupFlowRequest == nil {
-		return errors.Errorf("first message in RunSyncFlow doesn't contain SetupFlowRequest")
+		return pgerror.NewAssertionErrorf("first message in RunSyncFlow doesn't contain SetupFlowRequest")
 	}
 	req := firstMsg.SetupFlowRequest
 	ctx, f, err := ds.SetupSyncFlow(stream.Context(), &ds.memMonitor, req, mbox)
@@ -548,6 +558,7 @@ func (ds *ServerImpl) RunSyncFlow(stream distsqlpb.DistSQL_RunSyncFlowServer) er
 func (ds *ServerImpl) SetupFlow(
 	ctx context.Context, req *distsqlpb.SetupFlowRequest,
 ) (*distsqlpb.SimpleResponse, error) {
+	log.VEventf(ctx, 1, "received SetupFlow request from n%v for flow %v", req.Flow.Gateway, req.Flow.FlowID)
 	parentSpan := opentracing.SpanFromContext(ctx)
 
 	// Note: the passed context will be canceled when this RPC completes, so we
@@ -573,12 +584,12 @@ func (ds *ServerImpl) flowStreamInt(
 	msg, err := stream.Recv()
 	if err != nil {
 		if err == io.EOF {
-			return errors.Errorf("missing header message")
+			return pgerror.NewAssertionErrorf("missing header message")
 		}
 		return err
 	}
 	if msg.Header == nil {
-		return errors.Errorf("no header in first message")
+		return pgerror.NewAssertionErrorf("no header in first message")
 	}
 	flowID := msg.Header.FlowID
 	streamID := msg.Header.StreamID

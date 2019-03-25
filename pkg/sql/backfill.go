@@ -22,6 +22,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -35,7 +36,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
 )
 
 const (
@@ -125,13 +125,49 @@ func (sc *SchemaChanger) runBackfill(
 	var droppedIndexDescs []sqlbase.IndexDescriptor
 	var addedIndexDescs []sqlbase.IndexDescriptor
 
-	var checksToValidate []sqlbase.ConstraintToValidate
+	var addedChecks []*sqlbase.TableDescriptor_CheckConstraint
+	var checksToValidate []sqlbase.ConstraintToUpdate
 
 	var tableDesc *sqlbase.TableDescriptor
 	if err := sc.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
 		var err error
 		tableDesc, err = sqlbase.GetTableDescFromID(ctx, txn, sc.tableID)
-		return err
+		if err != nil {
+			return err
+		}
+		// Update running status of job.
+		updateJobRunningProgress := false
+		for _, mutation := range tableDesc.Mutations {
+			if mutation.MutationID != sc.mutationID {
+				// Mutations are applied in a FIFO order. Only apply the first set of
+				// mutations if they have the mutation ID we're looking for.
+				break
+			}
+
+			switch mutation.Direction {
+			case sqlbase.DescriptorMutation_ADD:
+				switch mutation.State {
+				case sqlbase.DescriptorMutation_DELETE_AND_WRITE_ONLY:
+					updateJobRunningProgress = true
+				}
+
+			case sqlbase.DescriptorMutation_DROP:
+				switch mutation.State {
+				case sqlbase.DescriptorMutation_DELETE_ONLY:
+					updateJobRunningProgress = true
+				}
+			}
+		}
+		if updateJobRunningProgress && !tableDesc.Dropped() {
+			if err := sc.job.WithTxn(txn).RunningStatus(ctx, func(
+				ctx context.Context, details jobspb.Details) (jobs.RunningStatus, error) {
+				return RunningStatusBackfill, nil
+			}); err != nil {
+				return pgerror.NewAssertionErrorWithWrappedErrf(err,
+					"failed to update running status of job %d", log.Safe(*sc.job.ID()))
+			}
+		}
+		return nil
 	}); err != nil {
 		return err
 	}
@@ -160,13 +196,16 @@ func (sc *SchemaChanger) runBackfill(
 				addedIndexDescs = append(addedIndexDescs, *t.Index)
 			case *sqlbase.DescriptorMutation_Constraint:
 				switch t.Constraint.ConstraintType {
-				case sqlbase.ConstraintToValidate_CHECK:
+				case sqlbase.ConstraintToUpdate_CHECK:
+					addedChecks = append(addedChecks, &t.Constraint.Check)
 					checksToValidate = append(checksToValidate, *t.Constraint)
 				default:
-					return errors.Errorf("unsupported constraint type: %d", t.Constraint.ConstraintType)
+					return pgerror.NewAssertionErrorf(
+						"unsupported constraint type: %d", log.Safe(t.Constraint.ConstraintType))
 				}
 			default:
-				return errors.Errorf("unsupported mutation: %+v", m)
+				return pgerror.NewAssertionErrorf(
+					"unsupported mutation: %+v", m)
 			}
 
 		case sqlbase.DescriptorMutation_DROP:
@@ -178,14 +217,20 @@ func (sc *SchemaChanger) runBackfill(
 					droppedIndexDescs = append(droppedIndexDescs, *t.Index)
 				}
 			case *sqlbase.DescriptorMutation_Constraint:
+				// Only possible during a rollback
+				if !m.Rollback {
+					return pgerror.NewAssertionErrorf(
+						"trying to drop constraint through schema changer outside of a rollback: %+v", t)
+				}
 				// no-op
 			default:
-				return errors.Errorf("unsupported mutation: %+v", m)
+				return pgerror.NewAssertionErrorf(
+					"unsupported mutation: %+v", m)
 			}
 		}
 	}
 
-	// First drop indexes, then add/drop columns, and only then add indexes.
+	// First drop indexes, then add/drop columns, and only then add indexes and constraints.
 
 	// Drop indexes not to be removed by `ClearRange`.
 	if len(droppedIndexDescs) > 0 {
@@ -209,6 +254,21 @@ func (sc *SchemaChanger) runBackfill(
 		}
 	}
 
+	// Add check constraints, publish the new version of the table descriptor,
+	// and wait until the entire cluster is on the new version. This is basically
+	// a state transition for the schema change, which must happen after the
+	// columns are backfilled and before constraint validation begins. This
+	// ensures that 1) all columns are writable and backfilled when the constraint
+	// starts being enforced on insert/update (which is relevant in the case where
+	// a constraint references both public and non-public columns), and 2) the
+	// validation occurs only when the entire cluster is already enforcing the
+	// constraint on insert/update.
+	if len(addedChecks) > 0 {
+		if err := sc.addChecks(ctx, addedChecks); err != nil {
+			return err
+		}
+	}
+
 	// Validate check constraints.
 	if len(checksToValidate) > 0 {
 		if err := sc.validateChecks(ctx, evalCtx, lease, checksToValidate); err != nil {
@@ -218,11 +278,46 @@ func (sc *SchemaChanger) runBackfill(
 	return nil
 }
 
+// addChecks publishes a new version of the given table descriptor with the
+// given check constraint added to it, and waits until the entire cluster is on
+// the new version of the table descriptor.
+func (sc *SchemaChanger) addChecks(
+	ctx context.Context, addedChecks []*sqlbase.TableDescriptor_CheckConstraint,
+) error {
+	_, err := sc.leaseMgr.Publish(ctx, sc.tableID,
+		func(desc *sqlbase.MutableTableDescriptor) error {
+			for i, added := range addedChecks {
+				found := false
+				for _, c := range desc.Checks {
+					if c.Name == added.Name {
+						log.VEventf(
+							ctx, 2,
+							"backfiller tried to add constraint %+v but found existing constraint %+v, presumably due to a retry",
+							added, c,
+						)
+						found = true
+						break
+					}
+				}
+				if !found {
+					desc.Checks = append(desc.Checks, addedChecks[i])
+				}
+			}
+			return nil
+		},
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+	return sc.waitToUpdateLeases(ctx, sc.tableID)
+}
+
 func (sc *SchemaChanger) validateChecks(
 	ctx context.Context,
 	evalCtx *extendedEvalContext,
 	lease *sqlbase.TableDescriptor_SchemaChangeLease,
-	checks []sqlbase.ConstraintToValidate,
+	checks []sqlbase.ConstraintToUpdate,
 ) error {
 	if testDisableTableLeases {
 		return nil
@@ -244,7 +339,8 @@ func (sc *SchemaChanger) validateChecks(
 		// Notify when validation is finished (or has returned an error) for a check.
 		countDone := make(chan struct{}, len(checks))
 
-		for _, c := range checks {
+		for i := range checks {
+			c := checks[i]
 			grp.GoCtx(func(ctx context.Context) error {
 				defer func() { countDone <- struct{}{} }()
 
@@ -407,7 +503,8 @@ func getJobIDForMutationWithDescriptor(
 		}
 	}
 
-	return 0, errors.Errorf("job not found for table id %d, mutation %d", tableDesc.ID, mutationID)
+	return 0, pgerror.NewAssertionErrorf(
+		"job not found for table id %d, mutation %d", tableDesc.ID, mutationID)
 }
 
 // nRanges returns the number of ranges that cover a set of spans.
@@ -711,8 +808,9 @@ func (sc *SchemaChanger) validateInvertedIndexes(
 					// JSON columns cannot have unique indexes, so if the expected and
 					// actual counts do not match, it's always a bug rather than a
 					// uniqueness violation.
-					return errors.Errorf("validation of index %s failed: expected %d rows, found %d",
-						idx.Name, expectedCount[i], idxLen)
+					return pgerror.NewAssertionErrorf(
+						"validation of index %s failed: expected %d rows, found %d",
+						idx.Name, log.Safe(expectedCount[i]), log.Safe(idxLen))
 				}
 			case <-ctx.Done():
 				return ctx.Err()
@@ -795,13 +893,14 @@ func (sc *SchemaChanger) validateForwardIndexes(
 			}()
 
 			row, err := newEvalCtx.InternalExecutor.QueryRow(ctx, "verify-idx-count", txn,
-				fmt.Sprintf(`SELECT count(*) FROM [%d AS t]@[%d]`, tableDesc.ID, idx.ID))
+				fmt.Sprintf(`SELECT count(1) FROM [%d AS t]@[%d] AS OF SYSTEM TIME %s`,
+					tableDesc.ID, idx.ID, readAsOf.AsOfSystemTime()))
 			if err != nil {
 				return err
 			}
 			idxLen := int64(tree.MustBeDInt(row[0]))
 
-			log.Infof(ctx, "index %s/%s row count = %d, took %s",
+			log.Infof(ctx, "validation: index %s/%s row count = %d, took %s",
 				tableDesc.Name, idx.Name, idxLen, timeutil.Since(start))
 
 			select {
@@ -829,13 +928,14 @@ func (sc *SchemaChanger) validateForwardIndexes(
 		start := timeutil.Now()
 		// Count the number of rows in the table.
 		cnt, err := evalCtx.InternalExecutor.QueryRow(ctx, "VERIFY INDEX", txn,
-			fmt.Sprintf(`SELECT count(1) FROM [%d AS t]`, tableDesc.ID))
+			fmt.Sprintf(`SELECT count(1) FROM [%d AS t] AS OF SYSTEM TIME %s`,
+				tableDesc.ID, readAsOf.AsOfSystemTime()))
 		if err != nil {
 			return err
 		}
 		tableRowCount = int64(tree.MustBeDInt(cnt[0]))
 		tableRowCountTime = timeutil.Since(start)
-		log.Infof(ctx, "table %s row count = %d, took %s",
+		log.Infof(ctx, "validation: table %s row count = %d, took %s",
 			tableDesc.Name, tableRowCount, tableRowCountTime)
 		return nil
 	})
@@ -915,7 +1015,7 @@ func runSchemaChangesInTxn(
 	// all column mutations.
 	doneColumnBackfill := false
 	// Checks are validated after all other mutations have been applied.
-	var checksToValidate []sqlbase.ConstraintToValidate
+	var checksToValidate []sqlbase.ConstraintToUpdate
 
 	for _, m := range tableDesc.Mutations {
 		immutDesc := sqlbase.NewImmutableTableDescriptor(*tableDesc.TableDesc())
@@ -938,14 +1038,17 @@ func runSchemaChangesInTxn(
 
 			case *sqlbase.DescriptorMutation_Constraint:
 				switch t.Constraint.ConstraintType {
-				case sqlbase.ConstraintToValidate_CHECK:
+				case sqlbase.ConstraintToUpdate_CHECK:
+					tableDesc.Checks = append(tableDesc.Checks, &t.Constraint.Check)
 					checksToValidate = append(checksToValidate, *t.Constraint)
 				default:
-					return errors.Errorf("unsupported constraint type: %d", t.Constraint.ConstraintType)
+					return pgerror.NewAssertionErrorf(
+						"unsupported constraint type: %d", log.Safe(t.Constraint.ConstraintType))
 				}
 
 			default:
-				return errors.Errorf("unsupported mutation: %+v", m)
+				return pgerror.NewAssertionErrorf(
+					"unsupported mutation: %+v", m)
 			}
 
 		case sqlbase.DescriptorMutation_DROP:
@@ -966,10 +1069,11 @@ func runSchemaChangesInTxn(
 				}
 
 			case *sqlbase.DescriptorMutation_Constraint:
-				return errors.Errorf("constraint validation mutation cannot be in the DROP state within the same transaction: %+v", m)
+				return pgerror.NewAssertionErrorf(
+					"constraint validation mutation cannot be in the DROP state within the same transaction: %+v", m)
 
 			default:
-				return errors.Errorf("unsupported mutation: %+v", m)
+				return pgerror.NewAssertionErrorf("unsupported mutation: %+v", m)
 			}
 
 		}
@@ -1057,7 +1161,7 @@ func columnBackfillInTxn(
 	for k := range fkTables {
 		t := tc.getUncommittedTableByID(k)
 		if (uncommittedTable{}) == t || !t.IsNewTable() {
-			return errors.Errorf(
+			return pgerror.NewAssertionErrorf(
 				"table %s not created in the same transaction as id = %d", tableDesc.Name, k)
 		}
 		otherTableDescs = append(otherTableDescs, t.ImmutableTableDescriptor)

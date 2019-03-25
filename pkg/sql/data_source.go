@@ -141,7 +141,7 @@ func (p *planner) getDataSource(
 		if err != nil {
 			return right, err
 		}
-		return p.makeJoin(ctx, sqlbase.JoinTypeFromAstString(t.Join), left, right, t.Cond)
+		return p.makeJoin(ctx, sqlbase.JoinTypeFromAstString(t.JoinType), left, right, t.Cond)
 
 	case *tree.StatementSource:
 		plan, err := p.newPlan(ctx, t.Statement, nil /* desiredTypes */)
@@ -150,7 +150,7 @@ func (p *planner) getDataSource(
 		}
 		cols := planColumns(plan)
 		if len(cols) == 0 {
-			return planDataSource{}, pgerror.NewErrorf(pgerror.CodeFeatureNotSupportedError,
+			return planDataSource{}, pgerror.NewErrorf(pgerror.CodeUndefinedColumnError,
 				"statement source \"%v\" does not return any columns", t.Statement)
 		}
 		return planDataSource{
@@ -202,7 +202,8 @@ func (p *planner) getTableScanByRef(
 	}}
 	desc, err := p.Tables().getTableVersionByID(ctx, p.txn, sqlbase.ID(tref.TableID), flags)
 	if err != nil {
-		return planDataSource{}, errors.Wrapf(err, "%s", tree.ErrString(tref))
+		return planDataSource{}, pgerror.Wrapf(err, pgerror.CodeSyntaxError,
+			"%s", tree.ErrString(tref))
 	}
 
 	if tref.Columns != nil && len(tref.Columns) == 0 {
@@ -344,7 +345,8 @@ func (p *planner) getViewPlan(
 ) (planDataSource, error) {
 	stmt, err := parser.ParseOne(desc.ViewQuery)
 	if err != nil {
-		return planDataSource{}, errors.Wrapf(err, "failed to parse underlying query from view %q", tn)
+		return planDataSource{}, pgerror.Wrapf(err, pgerror.CodeSyntaxError,
+			"failed to parse underlying query from view %q", tn)
 	}
 	sel, ok := stmt.AST.(*tree.Select)
 	if !ok {

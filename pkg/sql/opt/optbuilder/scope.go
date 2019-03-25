@@ -135,27 +135,36 @@ func (s *scope) replace() *scope {
 }
 
 // appendColumnsFromScope adds newly bound variables to this scope.
-// The groups in the new columns are reset to 0.
+// The expressions in the new columns are reset to nil.
 func (s *scope) appendColumnsFromScope(src *scope) {
 	l := len(s.cols)
 	s.cols = append(s.cols, src.cols...)
-	// We want to reset the groups, as these become pass-through columns in the
-	// new scope.
+	// We want to reset the expressions, as these become pass-through columns in
+	// the new scope.
 	for i := l; i < len(s.cols); i++ {
 		s.cols[i].scalar = nil
 	}
 }
 
 // appendColumns adds newly bound variables to this scope.
-// The groups in the new columns are reset to 0.
+// The expressions in the new columns are reset to nil.
 func (s *scope) appendColumns(cols []scopeColumn) {
 	l := len(s.cols)
 	s.cols = append(s.cols, cols...)
-	// We want to reset the groups, as these become pass-through columns in the
-	// new scope.
+	// We want to reset the expressions, as these become pass-through columns in
+	// the new scope.
 	for i := l; i < len(s.cols); i++ {
 		s.cols[i].scalar = nil
 	}
+}
+
+// appendColumn adds a newly bound variable to this scope.
+// The expression in the new column is reset to nil.
+func (s *scope) appendColumn(col *scopeColumn) {
+	s.cols = append(s.cols, *col)
+	// We want to reset the expression, as this becomes a pass-through column in
+	// the new scope.
+	s.cols[len(s.cols)-1].scalar = nil
 }
 
 // addExtraColumns adds the given columns as extra columns, ignoring any
@@ -519,7 +528,7 @@ func (s *scope) startAggFunc() *scope {
 // are only used in a groupings scope.
 func (s *scope) endAggFunc(cols opt.ColSet) (aggInScope, aggOutScope *scope) {
 	if !s.groupby.inAgg {
-		panic(fmt.Errorf("mismatched calls to start/end aggFunc"))
+		panic(pgerror.NewAssertionErrorf("mismatched calls to start/end aggFunc"))
 	}
 	s.groupby.inAgg = false
 
@@ -535,7 +544,7 @@ func (s *scope) endAggFunc(cols opt.ColSet) (aggInScope, aggOutScope *scope) {
 		}
 	}
 
-	panic(fmt.Errorf("aggregate function is not allowed in this context"))
+	panic(pgerror.NewAssertionErrorf("aggregate function is not allowed in this context"))
 }
 
 // startBuildingGroupingCols is called when the builder starts building the
@@ -556,7 +565,7 @@ func (s *scope) startBuildingGroupingCols() {
 // to ensure that a grouping error is not called prematurely.
 func (s *scope) endBuildingGroupingCols() {
 	if !s.groupby.buildingGroupingCols {
-		panic(fmt.Errorf("mismatched calls to start/end groupings"))
+		panic(pgerror.NewAssertionErrorf("mismatched calls to start/end groupings"))
 	}
 	s.groupby.buildingGroupingCols = false
 }
@@ -807,7 +816,7 @@ func (s *scope) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Expr) {
 
 	case *tree.FuncExpr:
 		if t.WindowDef != nil {
-			panic(unimplementedf("window functions are not supported"))
+			panic(unimplementedWithIssueDetailf(34251, "", "window functions are not supported"))
 		}
 
 		def, err := t.Func.Resolve(s.builder.semaCtx.SearchPath)
@@ -1100,11 +1109,11 @@ func (s *scope) replaceSubquery(
 		n := len(outScope.cols)
 		switch desiredColumns {
 		case 1:
-			panic(builderError{pgerror.NewErrorf(pgerror.CodeSyntaxError,
-				"subquery must return only one column, found %d", n)})
+			panic(pgerror.NewErrorf(pgerror.CodeSyntaxError,
+				"subquery must return only one column, found %d", n))
 		default:
-			panic(builderError{pgerror.NewErrorf(pgerror.CodeSyntaxError,
-				"subquery must return %d columns, found %d", desiredColumns, n)})
+			panic(pgerror.NewErrorf(pgerror.CodeSyntaxError,
+				"subquery must return %d columns, found %d", desiredColumns, n))
 		}
 	}
 
@@ -1134,25 +1143,25 @@ var _ tree.IndexedVarContainer = &scope{}
 
 // IndexedVarEval is part of the IndexedVarContainer interface.
 func (s *scope) IndexedVarEval(idx int, ctx *tree.EvalContext) (tree.Datum, error) {
-	panic("unimplemented: scope.IndexedVarEval")
+	panic(pgerror.NewAssertionErrorf("unimplemented: scope.IndexedVarEval"))
 }
 
 // IndexedVarResolvedType is part of the IndexedVarContainer interface.
 func (s *scope) IndexedVarResolvedType(idx int) types.T {
 	if idx >= len(s.cols) {
 		if len(s.cols) == 0 {
-			panic(builderError{pgerror.NewErrorf(pgerror.CodeUndefinedColumnError,
-				"column reference @%d not allowed in this context", idx+1)})
+			panic(pgerror.NewErrorf(pgerror.CodeUndefinedColumnError,
+				"column reference @%d not allowed in this context", idx+1))
 		}
-		panic(builderError{pgerror.NewErrorf(pgerror.CodeUndefinedColumnError,
-			"invalid column ordinal: @%d", idx+1)})
+		panic(pgerror.NewErrorf(pgerror.CodeUndefinedColumnError,
+			"invalid column ordinal: @%d", idx+1))
 	}
 	return s.cols[idx].typ
 }
 
 // IndexedVarNodeFormatter is part of the IndexedVarContainer interface.
 func (s *scope) IndexedVarNodeFormatter(idx int) tree.NodeFormatter {
-	panic("unimplemented: scope.IndexedVarNodeFormatter")
+	panic(pgerror.NewAssertionErrorf("unimplemented: scope.IndexedVarNodeFormatter"))
 }
 
 // newAmbiguousColumnError returns an error with a helpful error message to be

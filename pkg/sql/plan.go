@@ -26,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/pkg/errors"
 )
 
 type planMaker interface {
@@ -306,6 +305,10 @@ type planTop struct {
 	// savedPlanForStats is conditionally populated at the end of
 	// statement execution, for registration in statement statistics.
 	savedPlanForStats *roachpb.ExplainTreePlanNode
+
+	// avoidBuffering, when set, causes the execution to avoid buffering
+	// results.
+	avoidBuffering bool
 }
 
 // makePlan implements the Planner interface. It populates the
@@ -314,8 +317,8 @@ type planTop struct {
 // The caller is responsible for populating the placeholders
 // beforehand (currently in semaCtx.Placeholders).
 //
-// After makePlan(), the caller should be careful to also call
-// p.curPlan.Close().
+// If no error is returned, the caller must call p.curPlan.Close() once the plan
+// is no longer needed.
 func (p *planner) makePlan(ctx context.Context) error {
 	// Reinitialize.
 	stmt := p.stmt
@@ -502,9 +505,12 @@ func (p *planner) maybePlanHook(ctx context.Context, stmt tree.Statement) (planN
 	// upcoming IR work will provide unique numeric type tags, which will
 	// elegantly solve this.
 	for _, planHook := range planHooks {
-		if fn, header, subplans, err := planHook(ctx, stmt, p); err != nil {
+		if fn, header, subplans, avoidBuffering, err := planHook(ctx, stmt, p); err != nil {
 			return nil, err
 		} else if fn != nil {
+			if avoidBuffering {
+				p.curPlan.avoidBuffering = true
+			}
 			return &hookFnNode{f: fn, header: header, subplans: subplans}, nil
 		}
 	}
@@ -590,8 +596,8 @@ func (p *planner) newPlan(
 	canModifySchema := tree.CanModifySchema(stmt)
 	if canModifySchema {
 		if err := p.txn.SetSystemConfigTrigger(); err != nil {
-			return nil, errors.Wrap(err,
-				"schema change statement cannot follow a statement that has written in the same transaction")
+			return nil, pgerror.UnimplementedWithIssueErrorf(26508,
+				"schema change statement cannot follow a statement that has written in the same transaction: %v", err)
 		}
 	}
 
@@ -734,6 +740,8 @@ func (p *planner) newPlan(
 		return p.ShowTables(ctx, n)
 	case *tree.ShowSchemas:
 		return p.ShowSchemas(ctx, n)
+	case *tree.ShowSequences:
+		return p.ShowSequences(ctx, n)
 	case *tree.ShowTraceForSession:
 		return p.ShowTrace(ctx, n)
 	case *tree.ShowTransactionStatus:
@@ -758,8 +766,11 @@ func (p *planner) newPlan(
 		return p.Values(ctx, n, desiredTypes)
 	case *tree.ValuesClauseWithNames:
 		return p.Values(ctx, n, desiredTypes)
+	case tree.CCLOnlyStatement:
+		return nil, pgerror.NewErrorf(pgerror.CodeCCLRequired,
+			"a CCL binary is required to use this statement type: %T", stmt)
 	default:
-		return nil, errors.Errorf("unknown statement type: %T", stmt)
+		return nil, pgerror.NewAssertionErrorf("unknown statement type: %T", stmt)
 	}
 }
 
@@ -854,6 +865,8 @@ func (p *planner) doPrepare(ctx context.Context, stmt tree.Statement) (planNode,
 		return p.ShowTables(ctx, n)
 	case *tree.ShowSchemas:
 		return p.ShowSchemas(ctx, n)
+	case *tree.ShowSequences:
+		return p.ShowSequences(ctx, n)
 	case *tree.ShowTraceForSession:
 		return p.ShowTrace(ctx, n)
 	case *tree.ShowUsers:
@@ -897,6 +910,10 @@ type planFlags uint32
 const (
 	// planFlagOptUsed is set if the optimizer was used to create the plan.
 	planFlagOptUsed planFlags = (1 << iota)
+
+	// planFlagIsCorrelated is set if the plan contained a correlated subquery.
+	// This is used to enhance the error fallback and for telemetry.
+	planFlagOptIsCorrelated
 
 	// planFlagOptFallback is set if the optimizer was enabled but did not support the
 	// statement.

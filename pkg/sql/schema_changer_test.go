@@ -39,6 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/sqlmigrations"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -530,7 +531,10 @@ func runSchemaChangeWithOperations(
 		t.Fatal(err)
 	}
 	if err := sqlutils.RunScrub(sqlDB, "t", "test"); err != nil {
-		t.Fatal(err)
+		// TODO(dt,lucy-zhang): #35160. Fix scrub's plan assertions.
+		if !strings.Contains(err.Error(), "could not find MergeJoinerSpec in plan") {
+			t.Fatal(err)
+		}
 	}
 
 	// Delete the rows inserted.
@@ -644,13 +648,13 @@ CREATE UNIQUE INDEX vidx ON t.test (v);
 
 	// Run some schema changes with operations.
 
-	// Add column.
+	// Add column with a check constraint.
 	runSchemaChangeWithOperations(
 		t,
 		sqlDB,
 		kvDB,
 		jobRegistry,
-		"ALTER TABLE t.test ADD COLUMN x DECIMAL DEFAULT (DECIMAL '1.4')",
+		"ALTER TABLE t.test ADD COLUMN x DECIMAL DEFAULT (DECIMAL '1.4') CHECK (x >= 0)",
 		maxValue,
 		2,
 		initBackfillNotification(),
@@ -677,6 +681,18 @@ CREATE UNIQUE INDEX vidx ON t.test (v);
 		"CREATE UNIQUE INDEX foo ON t.test (v)",
 		maxValue,
 		3,
+		initBackfillNotification(),
+		&execCfg)
+
+	// Add STORING index (that will have non-nil values).
+	runSchemaChangeWithOperations(
+		t,
+		sqlDB,
+		kvDB,
+		jobRegistry,
+		"CREATE INDEX bar ON t.test(k) STORING (v)",
+		maxValue,
+		4,
 		initBackfillNotification(),
 		&execCfg)
 
@@ -1042,7 +1058,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 		// number of keys representing a table row.
 		expectedNumKeysPerRow int
 	}{
-		{"ALTER TABLE t.test ADD COLUMN x DECIMAL DEFAULT (DECIMAL '1.4')", 1},
+		{"ALTER TABLE t.test ADD COLUMN x DECIMAL DEFAULT (DECIMAL '1.4') CHECK (x >= 0)", 1},
 		{"ALTER TABLE t.test DROP x", 1},
 		{"CREATE UNIQUE INDEX foo ON t.test (v)", 2},
 	}
@@ -1158,11 +1174,11 @@ func addIndexSchemaChange(
 	}
 }
 
-// Add a column and check that it succeeds.
+// Add a column with a check constraint and check that it succeeds.
 func addColumnSchemaChange(
 	t *testing.T, sqlDB *gosql.DB, kvDB *client.DB, maxValue int, numKeysPerRow int,
 ) {
-	if _, err := sqlDB.Exec("ALTER TABLE t.test ADD COLUMN x DECIMAL DEFAULT (DECIMAL '1.4')"); err != nil {
+	if _, err := sqlDB.Exec("ALTER TABLE t.test ADD COLUMN x DECIMAL DEFAULT (DECIMAL '1.4') CHECK (x >= 0)"); err != nil {
 		t.Fatal(err)
 	}
 	rows, err := sqlDB.Query(`SELECT x from t.test`)
@@ -1664,7 +1680,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	}
 
 	// A schema change that fails.
-	if _, err := sqlDB.Exec(`ALTER TABLE t.test ADD column d INT DEFAULT 0 CREATE FAMILY F3`); !testutils.IsError(err, `permanent failure`) {
+	if _, err := sqlDB.Exec(`ALTER TABLE t.test ADD column d INT DEFAULT 0 CREATE FAMILY F3, ADD CHECK (d >= 0)`); !testutils.IsError(err, `permanent failure`) {
 		t.Fatalf("err = %s", err)
 	}
 
@@ -1677,7 +1693,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	// column is backfilled and the index backfill fails requiring the column
 	// backfill to be rolled back.
 	if _, err := sqlDB.Exec(
-		`ALTER TABLE t.test ADD column e INT DEFAULT 0 UNIQUE CREATE FAMILY F4`,
+		`ALTER TABLE t.test ADD column e INT DEFAULT 0 UNIQUE CREATE FAMILY F4, ADD CHECK (e >= 0)`,
 	); !testutils.IsError(err, ` violates unique constraint`) {
 		t.Fatalf("err = %s", err)
 	}
@@ -1685,6 +1701,12 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	// No garbage left behind.
 	if err := checkTableKeyCount(context.TODO(), kvDB, 1, maxValue); err != nil {
 		t.Fatal(err)
+	}
+
+	// Check that constraints are cleaned up.
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	if checks := tableDesc.AllActiveAndInactiveChecks(); len(checks) > 0 {
+		t.Fatalf("found checks %+v", checks)
 	}
 }
 
@@ -3005,7 +3027,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL DEFAULT (DECIMAL '3.14
 
 	// Job still running, waiting for GC.
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
-	if err := jobutils.VerifyRunningSystemJob(t, sqlRun, 0, jobspb.TypeSchemaChange, jobs.RunningStatusWaitingGC, jobs.Record{
+	if err := jobutils.VerifyRunningSystemJob(t, sqlRun, 0, jobspb.TypeSchemaChange, sql.RunningStatusWaitingGC, jobs.Record{
 		Username:    security.RootUser,
 		Description: "TRUNCATE TABLE t.public.test",
 		DescriptorIDs: sqlbase.IDs{
@@ -3205,7 +3227,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 
 	notify := backfillNotification
 
-	const add_column = `ALTER TABLE t.public.test ADD COLUMN x DECIMAL NOT NULL DEFAULT 1.4::DECIMAL`
+	const add_column = `ALTER TABLE t.public.test ADD COLUMN x DECIMAL NOT NULL DEFAULT 1.4::DECIMAL, ADD CHECK (x >= 0)`
 	if _, err := sqlDB.Exec(add_column); err != nil {
 		t.Fatal(err)
 	}
@@ -3218,7 +3240,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	// Check that an outstanding schema change exists.
 	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
 	oldID := tableDesc.ID
-	if lenMutations := len(tableDesc.Mutations); lenMutations != 2 {
+	if lenMutations := len(tableDesc.Mutations); lenMutations != 3 {
 		t.Fatalf("%d outstanding schema change", lenMutations)
 	}
 
@@ -3253,6 +3275,9 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	}
 	if k, x := tableDesc.Columns[0].Name, tableDesc.Columns[1].Name; k != "k" && x != "x" {
 		t.Fatalf("columns %q, %q in descriptor", k, x)
+	}
+	if checks := tableDesc.AllActiveAndInactiveChecks(); len(checks) != 1 {
+		t.Fatalf("expected 1 check, found %d", len(checks))
 	}
 
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
@@ -3304,7 +3329,7 @@ INSERT INTO t.test (k, v) VALUES (1, 99), (2, 99);
 	}
 
 	if err := tx.Commit(); !testutils.IsError(
-		err, `pq: duplicate key value`,
+		err, `duplicate key value`,
 	) {
 		t.Fatal(err)
 	}
@@ -3611,11 +3636,11 @@ func TestCancelSchemaChange(t *testing.T) {
 		// Set to true if the rollback returns in a running, waiting status.
 		isGC bool
 	}{
-		{`ALTER TABLE t.public.test ADD COLUMN x DECIMAL DEFAULT 1.4::DECIMAL CREATE FAMILY f2`,
+		{`ALTER TABLE t.public.test ADD COLUMN x DECIMAL DEFAULT 1.4::DECIMAL CREATE FAMILY f2, ADD CHECK (x >= 0)`,
 			true, false},
 		{`CREATE INDEX foo ON t.public.test (v)`,
 			true, true},
-		{`ALTER TABLE t.public.test ADD COLUMN x DECIMAL DEFAULT 1.2::DECIMAL CREATE FAMILY f3`,
+		{`ALTER TABLE t.public.test ADD COLUMN x DECIMAL DEFAULT 1.2::DECIMAL CREATE FAMILY f3, ADD CHECK (x >= 0)`,
 			false, false},
 		{`CREATE INDEX foo ON t.public.test (v)`,
 			false, true},
@@ -3648,7 +3673,7 @@ func TestCancelSchemaChange(t *testing.T) {
 			}
 			var err error
 			if tc.isGC {
-				err = jobutils.VerifyRunningSystemJob(t, sqlDB, idx, jobspb.TypeSchemaChange, jobs.RunningStatusWaitingGC, jobRecord)
+				err = jobutils.VerifyRunningSystemJob(t, sqlDB, idx, jobspb.TypeSchemaChange, sql.RunningStatusWaitingGC, jobRecord)
 			} else {
 				err = jobutils.VerifySystemJob(t, sqlDB, idx, jobspb.TypeSchemaChange, jobs.StatusSucceeded, jobRecord)
 			}
@@ -3709,6 +3734,12 @@ func TestCancelSchemaChange(t *testing.T) {
 	testutils.SucceedsSoon(t, func() error {
 		return checkTableKeyCount(ctx, kvDB, 3, maxValue)
 	})
+
+	// Check that constraints are cleaned up.
+	tableDesc = sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	if checks := tableDesc.AllActiveAndInactiveChecks(); len(checks) != 1 {
+		t.Fatalf("expected 1 check, found %+v", checks)
+	}
 }
 
 // This test checks that when a transaction containing schema changes
@@ -3735,9 +3766,16 @@ func TestSchemaChangeRetryError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The timestamp of the transaction is initialized.
 	tx, err := sqlDB.Begin()
 	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The timestamp of the transaction is guaranteed to be fixed after
+	// this statement.
+	if _, err := tx.Exec(`
+		CREATE TABLE t.another (k INT PRIMARY KEY, v INT, pi DECIMAL DEFAULT (DECIMAL '3.14'));
+		`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3749,12 +3787,6 @@ func TestSchemaChangeRetryError(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows.Close()
-
-	if _, err := tx.Exec(`
-		CREATE TABLE t.another (k INT PRIMARY KEY, v INT, pi DECIMAL DEFAULT (DECIMAL '3.14'));
-		`); err != nil {
-		t.Fatal(err)
-	}
 
 	if _, err := tx.Exec(`
 		CREATE UNIQUE INDEX vidx ON t.test (v);
@@ -4183,4 +4215,359 @@ CREATE TABLE t.test (a INT, b INT, c JSON, d JSON);
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestCreateStatsAfterSchemaChange(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	defer func(oldRefreshInterval, oldAsOf time.Duration) {
+		stats.DefaultRefreshInterval = oldRefreshInterval
+		stats.DefaultAsOfTime = oldAsOf
+	}(stats.DefaultRefreshInterval, stats.DefaultAsOfTime)
+	stats.DefaultRefreshInterval = time.Millisecond
+	stats.DefaultAsOfTime = time.Microsecond
+
+	server, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer server.Stopper().Stop(context.TODO())
+	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
+
+	sqlRun.Exec(t, `
+		CREATE DATABASE t;
+		CREATE TABLE t.test (k INT PRIMARY KEY, v CHAR, w CHAR);`)
+
+	sqlRun.Exec(t, `SET CLUSTER SETTING sql.stats.automatic_collection.enabled=true`)
+
+	// Add an index.
+	sqlRun.Exec(t, `CREATE INDEX foo ON t.test (w)`)
+
+	// Verify that statistics have been created for the new index (note that
+	// column w is ordered before column v, since index columns are added first).
+	sqlRun.CheckQueryResultsRetry(t,
+		`SELECT statistics_name, column_names, row_count, distinct_count, null_count
+	  FROM [SHOW STATISTICS FOR TABLE t.test]`,
+		[][]string{
+			{"__auto__", "{k}", "0", "0", "0"},
+			{"__auto__", "{w}", "0", "0", "0"},
+			{"__auto__", "{v}", "0", "0", "0"},
+		})
+
+	// Add a column.
+	sqlRun.Exec(t, `ALTER TABLE t.test ADD COLUMN x INT`)
+
+	// Verify that statistics have been created for the new column.
+	sqlRun.CheckQueryResultsRetry(t,
+		`SELECT statistics_name, column_names, row_count, distinct_count, null_count
+	  FROM [SHOW STATISTICS FOR TABLE t.test] ORDER BY column_names::STRING`,
+		[][]string{
+			{"__auto__", "{k}", "0", "0", "0"},
+			{"__auto__", "{k}", "0", "0", "0"},
+			{"__auto__", "{v}", "0", "0", "0"},
+			{"__auto__", "{v}", "0", "0", "0"},
+			{"__auto__", "{w}", "0", "0", "0"},
+			{"__auto__", "{w}", "0", "0", "0"},
+			{"__auto__", "{x}", "0", "0", "0"},
+		})
+}
+
+// TestWritesWithChecksBeforeDefaultColumnBackfill tests that when a check on a
+// column being added references a different public column, writes to the public
+// column ignore the constraint before the backfill for the non-public column
+// begins. See #35258.
+func TestWritesWithChecksBeforeDefaultColumnBackfill(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	params, _ := tests.CreateTestServerParams()
+
+	publishWriteNotification := make(chan struct{})
+	continuePublishWriteNotification := make(chan struct{})
+
+	backfillNotification := make(chan struct{})
+	continueBackfillNotification := make(chan struct{})
+
+	params.Knobs = base.TestingKnobs{
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+			RunBeforePublishWriteAndDelete: func() {
+				if publishWriteNotification != nil {
+					// Notify before the delete and write only state is published.
+					close(publishWriteNotification)
+					publishWriteNotification = nil
+					<-continuePublishWriteNotification
+				}
+			},
+			RunBeforeBackfill: func() error {
+				if backfillNotification != nil {
+					// Notify before the backfill begins.
+					close(backfillNotification)
+					backfillNotification = nil
+					<-continueBackfillNotification
+				}
+				return nil
+			},
+		},
+		// Disable backfill migrations, we still need the jobs table migration.
+		SQLMigrationManager: &sqlmigrations.MigrationManagerTestingKnobs{
+			DisableBackfillMigrations: true,
+		},
+	}
+
+	server, sqlDB, _ := serverutils.StartServer(t, params)
+	defer server.Stopper().Stop(context.TODO())
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.test (
+    k INT PRIMARY KEY NOT NULL,
+    v INT NOT NULL
+);
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := bulkInsertIntoTable(sqlDB, 1000); err != nil {
+		t.Fatal(err)
+	}
+
+	n1 := publishWriteNotification
+	n2 := backfillNotification
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		_, err := sqlDB.Exec(`ALTER TABLE t.test ADD COLUMN a INT DEFAULT 0, ADD CHECK (a < v AND a IS NOT NULL)`)
+		if !testutils.IsError(err, `validation of CHECK "\(a < v\) AND \(a IS NOT NULL\)" failed on row: k=1003, v=-1003, a=0`) {
+			t.Error(err)
+		}
+		wg.Done()
+	}()
+
+	<-n1
+	if _, err := sqlDB.Exec(`INSERT INTO t.test VALUES (1001, 1001)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.Exec(`UPDATE t.test SET v = 100 WHERE v < 100`); err != nil {
+		t.Fatal(err)
+	}
+	close(continuePublishWriteNotification)
+
+	<-n2
+	if _, err := sqlDB.Exec(`INSERT INTO t.test VALUES (1002, 1002)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.Exec(`UPDATE t.test SET v = 200 WHERE v < 200`); err != nil {
+		t.Fatal(err)
+	}
+	// Final insert violates the constraint
+	if _, err := sqlDB.Exec(`INSERT INTO t.test VALUES (1003, -1003)`); err != nil {
+		t.Fatal(err)
+	}
+	close(continueBackfillNotification)
+
+	wg.Wait()
+
+	if err := sqlutils.RunScrub(sqlDB, "t", "test"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestWritesWithChecksBeforeComputedColumnBackfill tests that when a check on a
+// column being added references a different public column, writes to the public
+// column ignore the constraint before the backfill for the non-public column
+// begins. See #35258.
+func TestWritesWithChecksBeforeComputedColumnBackfill(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	params, _ := tests.CreateTestServerParams()
+
+	publishWriteNotification := make(chan struct{})
+	continuePublishWriteNotification := make(chan struct{})
+
+	backfillNotification := make(chan struct{})
+	continueBackfillNotification := make(chan struct{})
+
+	params.Knobs = base.TestingKnobs{
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+			RunBeforePublishWriteAndDelete: func() {
+				if publishWriteNotification != nil {
+					// Notify before the delete and write only state is published.
+					close(publishWriteNotification)
+					publishWriteNotification = nil
+					<-continuePublishWriteNotification
+				}
+			},
+			RunBeforeBackfill: func() error {
+				if backfillNotification != nil {
+					// Notify before the backfill begins.
+					close(backfillNotification)
+					backfillNotification = nil
+					<-continueBackfillNotification
+				}
+				return nil
+			},
+		},
+		// Disable backfill migrations, we still need the jobs table migration.
+		SQLMigrationManager: &sqlmigrations.MigrationManagerTestingKnobs{
+			DisableBackfillMigrations: true,
+		},
+	}
+
+	server, sqlDB, _ := serverutils.StartServer(t, params)
+	defer server.Stopper().Stop(context.TODO())
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.test (
+    k INT PRIMARY KEY NOT NULL,
+    v INT NOT NULL
+);
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := bulkInsertIntoTable(sqlDB, 1000); err != nil {
+		t.Fatal(err)
+	}
+
+	n1 := publishWriteNotification
+	n2 := backfillNotification
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		_, err := sqlDB.Exec(`ALTER TABLE t.test ADD COLUMN a INT AS (v - 1) STORED, ADD CHECK (a < v AND a > -1000 AND a IS NOT NULL)`)
+		if !testutils.IsError(err, `validation of CHECK "\(\(a < v\) AND \(a > -1000\)\) AND \(a IS NOT NULL\)" failed on row: k=1003, v=-1003, a=-1004`) {
+			t.Error(err)
+		}
+		wg.Done()
+	}()
+
+	<-n1
+	if _, err := sqlDB.Exec(`INSERT INTO t.test VALUES (1001, 1001)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.Exec(`UPDATE t.test SET v = 100 WHERE v < 100`); err != nil {
+		t.Fatal(err)
+	}
+	close(continuePublishWriteNotification)
+
+	<-n2
+	if _, err := sqlDB.Exec(`INSERT INTO t.test VALUES (1002, 1002)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.Exec(`UPDATE t.test SET v = 200 WHERE v < 200`); err != nil {
+		t.Fatal(err)
+	}
+	// Final insert violates the constraint
+	if _, err := sqlDB.Exec(`INSERT INTO t.test VALUES (1003, -1003)`); err != nil {
+		t.Fatal(err)
+	}
+	close(continueBackfillNotification)
+
+	wg.Wait()
+
+	if err := sqlutils.RunScrub(sqlDB, "t", "test"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSchemaChangeJobRunningStatus(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	params, _ := tests.CreateTestServerParams()
+	var scNotification chan struct{}
+	var runBeforeBackfill func() error
+	var runBeforeBackfillChunk func() error
+	params.Knobs = base.TestingKnobs{
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+			SyncFilter: func(_ sql.TestingSchemaChangerCollection) {
+				if scNotification != nil {
+					notify := scNotification
+					scNotification = nil
+					// Notify that the schema change is about to run and
+					// so the job has been created in the jobs table.
+					close(notify)
+				}
+			},
+			RunBeforeBackfill: func() error {
+				return runBeforeBackfill()
+			},
+		},
+		DistSQL: &distsqlrun.TestingKnobs{
+			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
+				return runBeforeBackfillChunk()
+			},
+		},
+		// Disable backfill migrations, we still need the jobs table migration.
+		SQLMigrationManager: &sqlmigrations.MigrationManagerTestingKnobs{
+			DisableBackfillMigrations: true,
+		},
+	}
+	s, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.TODO())
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
+INSERT INTO t.test (k, v) VALUES (1, 99), (2, 100);
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+
+	tx, err := sqlDB.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Acquire a lease on the table to block the schema changer.
+	if _, err := tx.Exec("SELECT count(*) FROM t.test"); err != nil {
+		t.Fatal(err)
+	}
+
+	scNotification = make(chan struct{})
+	notify := scNotification
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if _, err := sqlDB.Exec("CREATE INDEX idx_v ON t.test(v)"); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	<-notify
+
+	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
+	testutils.SucceedsSoon(t, func() error {
+		return jobutils.VerifyRunningSystemJob(t, sqlRun, 0, jobspb.TypeSchemaChange, sql.RunningStatusDeleteOnly, jobs.Record{
+			Username:    security.RootUser,
+			Description: "CREATE INDEX idx_v ON t.public.test (v)",
+			DescriptorIDs: sqlbase.IDs{
+				tableDesc.ID,
+			},
+		})
+	})
+
+	runBeforeBackfill = func() error {
+		return jobutils.VerifyRunningSystemJob(t, sqlRun, 0, jobspb.TypeSchemaChange, sql.RunningStatusDeleteAndWriteOnly, jobs.Record{
+			Username:    security.RootUser,
+			Description: "CREATE INDEX idx_v ON t.public.test (v)",
+			DescriptorIDs: sqlbase.IDs{
+				tableDesc.ID,
+			},
+		})
+	}
+
+	runBeforeBackfillChunk = func() error {
+		return jobutils.VerifyRunningSystemJob(t, sqlRun, 0, jobspb.TypeSchemaChange, sql.RunningStatusBackfill, jobs.Record{
+			Username:    security.RootUser,
+			Description: "CREATE INDEX idx_v ON t.public.test (v)",
+			DescriptorIDs: sqlbase.IDs{
+				tableDesc.ID,
+			},
+		})
+	}
+
+	// release the lease on the table to allow the schema change to move forward.
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	wg.Wait()
 }

@@ -193,7 +193,7 @@ func TestAsOfTime(t *testing.T) {
 	// Subqueries do work of the timestamps are consistent.
 	_, err = db.Query(
 		fmt.Sprintf("SELECT (SELECT a FROM d.t AS OF SYSTEM TIME %s) FROM (SELECT 1) AS OF SYSTEM TIME '1980-01-01'", tsVal1))
-	if !testutils.IsError(err, "pq: cannot specify AS OF SYSTEM TIME with different timestamps") {
+	if !testutils.IsError(err, "cannot specify AS OF SYSTEM TIME with different timestamps") {
 		t.Fatalf("expected inconsistent statements, got: %v", err)
 	}
 	if err := db.QueryRow(
@@ -301,7 +301,8 @@ func TestAsOfRetry(t *testing.T) {
 					}
 					if count > 0 && bytes.Contains(req.Key, []byte(key)) {
 						magicVals.restartCounts[key]--
-						err := roachpb.NewTransactionRetryError(roachpb.RETRY_REASON_UNKNOWN)
+						err := roachpb.NewTransactionRetryError(
+							roachpb.RETRY_REASON_UNKNOWN, "filter err")
 						magicVals.failedValues[string(req.Key)] =
 							failureRecord{err, args.Hdr.Txn}
 						txn := args.Hdr.Txn.Clone()

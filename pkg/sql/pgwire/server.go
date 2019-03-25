@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
@@ -471,14 +472,14 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn) error {
 
 	sendErr := func(err error) error {
 		msgBuilder := newWriteBuffer(s.metrics.BytesOutCount)
-		_ /* err */ = writeErr(err, msgBuilder, conn)
+		_ /* err */ = writeErr(ctx, &s.execCfg.Settings.SV, err, msgBuilder, conn)
 		_ = conn.Close()
 		return err
 	}
 
 	if version != version30 {
 		if version == versionCancel {
-			telemetry.Count("pgwire.unimplemented.cancel_request")
+			telemetry.Inc(sqltelemetry.CancelRequestCounter)
 			_ = conn.Close()
 			return nil
 		}
@@ -563,7 +564,8 @@ func parseOptions(ctx context.Context, data []byte) (sql.SessionArgs, error) {
 			} else {
 				if !exists {
 					if _, ok := sql.UnsupportedVars[key]; ok {
-						telemetry.Count("unimplemented.pgwire.parameter." + key)
+						counter := sqltelemetry.UnimplementedClientStatusParameterCounter(key)
+						telemetry.Inc(counter)
 					}
 					log.Warningf(ctx, "unknown configuration parameter: %q", key)
 				} else {

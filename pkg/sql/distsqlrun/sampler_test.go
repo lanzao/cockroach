@@ -54,7 +54,9 @@ func runSampler(t *testing.T, numRows, numSamples int) []int {
 	}
 
 	spec := &distsqlpb.SamplerSpec{SampleSize: uint32(numSamples)}
-	p, err := newSamplerProcessor(&flowCtx, 0 /* processorID */, spec, in, &distsqlpb.PostProcessSpec{}, out)
+	p, err := newSamplerProcessor(
+		&flowCtx, 0 /* processorID */, spec, in, &distsqlpb.PostProcessSpec{}, out,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +69,7 @@ func runSampler(t *testing.T, numRows, numSamples int) []int {
 	for {
 		row, meta := out.Next()
 		if meta != nil {
-			if meta.Progress == nil {
+			if meta.SamplerProgress == nil {
 				t.Fatalf("unexpected metadata: %v", meta)
 			}
 			continue
@@ -199,7 +201,7 @@ func TestSamplerSketch(t *testing.T) {
 	for {
 		row, meta := out.Next()
 		if meta != nil {
-			if meta.Progress == nil {
+			if meta.SamplerProgress == nil {
 				t.Fatalf("unexpected metadata: %v", meta)
 			}
 			continue

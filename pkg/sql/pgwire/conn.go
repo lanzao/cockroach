@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"runtime/debug"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -30,6 +29,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
@@ -40,6 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logtags"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -96,6 +97,8 @@ type conn struct {
 
 	readBuf    pgwirebase.ReadBuffer
 	msgBuilder writeBuffer
+
+	sv *settings.Values
 }
 
 // serveConn creates a conn that will serve the netConn. It returns once the
@@ -155,7 +158,7 @@ func serveConn(
 		log.Infof(ctx, "new connection with options: %+v", sArgs)
 	}
 
-	c := newConn(netConn, sArgs, metrics)
+	c := newConn(netConn, sArgs, metrics, &sqlServer.GetExecutorConfig().Settings.SV)
 
 	if err := c.handleAuthentication(ctx, insecure, ie, auth, sqlServer.GetExecutorConfig()); err != nil {
 		_ = c.conn.Close()
@@ -168,12 +171,15 @@ func serveConn(
 	return readingErr
 }
 
-func newConn(netConn net.Conn, sArgs sql.SessionArgs, metrics *ServerMetrics) *conn {
+func newConn(
+	netConn net.Conn, sArgs sql.SessionArgs, metrics *ServerMetrics, sv *settings.Values,
+) *conn {
 	c := &conn{
 		conn:        netConn,
 		sessionArgs: sArgs,
 		metrics:     metrics,
 		rd:          *bufio.NewReader(netConn),
+		sv:          sv,
 	}
 	c.stmtBuf.Init()
 	c.writerState.fi.buf = &c.writerState.buf
@@ -235,7 +241,8 @@ func (c *conn) serveImpl(
 		connHandler, err = sqlServer.SetupConn(
 			ctx, c.sessionArgs, &c.stmtBuf, c, c.metrics.SQLMemMetrics)
 		if err != nil {
-			_ /* err */ = writeErr(err, &c.msgBuilder, c.conn)
+			_ /* err */ = writeErr(ctx, &sqlServer.GetExecutorConfig().Settings.SV,
+				err, &c.msgBuilder, c.conn)
 			return err
 		}
 
@@ -316,9 +323,9 @@ func (c *conn) serveImpl(
 				if sqlServer.GetExecutorConfig().TestingKnobs.CatchPanics {
 					if r := recover(); r != nil {
 						// Catch the panic and return it to the client as an error.
-						err := pgerror.NewErrorf(pgerror.CodeCrashShutdownError, "caught fatal error: %v", r)
-						err.Detail = string(debug.Stack())
-						_ = writeErr(err, &c.msgBuilder, &c.writerState.buf)
+						err := pgerror.NewAssertionErrorf("caught fatal error: %v", r)
+						_ = writeErr(ctx, &sqlServer.GetExecutorConfig().Settings.SV,
+							err, &c.msgBuilder, &c.writerState.buf)
 						_ /* n */, _ /* err */ = c.writerState.buf.WriteTo(c.conn)
 						c.stmtBuf.Close()
 						// Send a ready for query to make sure the client can react.
@@ -436,7 +443,7 @@ Loop:
 	// If we're draining, let the client know by piling on an AdminShutdownError
 	// and flushing the buffer.
 	if ctxCanceled || draining() {
-		_ /* err */ = writeErr(
+		_ /* err */ = writeErr(ctx, &sqlServer.GetExecutorConfig().Settings.SV,
 			newAdminShutdownErr(err), &c.msgBuilder, &c.writerState.buf)
 		_ /* n */, _ /* err */ = c.writerState.buf.WriteTo(c.conn)
 
@@ -857,14 +864,19 @@ func convertToErrWithPGCode(err error) error {
 	if err == nil {
 		return nil
 	}
-	switch tErr := err.(type) {
+
+	// If the error was wrapped, get to the cause. Otherwise the cast
+	// below will not see what's really happening.
+	wrappedErr := errors.Cause(err)
+
+	switch wrappedErr.(type) {
 	case *roachpb.TransactionRetryWithProtoRefreshError:
 		return sqlbase.NewRetryError(err)
 	case *roachpb.AmbiguousResultError:
 		// TODO(andrei): Once DistSQL starts executing writes, we'll need a
 		// different mechanism to marshal AmbiguousResultErrors from the executing
 		// nodes.
-		return sqlbase.NewStatementCompletionUnknownError(tErr)
+		return sqlbase.NewStatementCompletionUnknownError(err)
 	default:
 		return err
 	}
@@ -977,10 +989,14 @@ func (c *conn) bufferCommandComplete(tag []byte) {
 }
 
 func (c *conn) bufferErr(err error) {
-	if err := writeErr(err, &c.msgBuilder, &c.writerState.buf); err != nil {
+	// TODO(andrei,knz): This would benefit from a context with the
+	// current connection log tags.
+	if err := writeErr(context.Background(), c.sv,
+		err, &c.msgBuilder, &c.writerState.buf); err != nil {
 		panic(fmt.Sprintf("unexpected err from buffer: %s", err))
 	}
 }
+
 func (c *conn) bufferEmptyQueryResponse() {
 	c.msgBuilder.initMsg(pgwirebase.ServerMsgEmptyQuery)
 	if err := c.msgBuilder.finishMsg(&c.writerState.buf); err != nil {
@@ -988,7 +1004,10 @@ func (c *conn) bufferEmptyQueryResponse() {
 	}
 }
 
-func writeErr(err error, msgBuilder *writeBuffer, w io.Writer) error {
+func writeErr(
+	ctx context.Context, sv *settings.Values, err error, msgBuilder *writeBuffer, w io.Writer,
+) error {
+	sqltelemetry.RecordError(ctx, err, sv)
 	msgBuilder.initMsg(pgwirebase.ServerMsgErrorResponse)
 
 	msgBuilder.putErrFieldMsg(pgwirebase.ServerErrFieldSeverity)
@@ -999,7 +1018,17 @@ func writeErr(err error, msgBuilder *writeBuffer, w io.Writer) error {
 	if ok {
 		code = pgErr.Code
 	} else {
-		code = pgerror.CodeInternalError
+		// The error was not decorated as an pgerror.Error. We don't know
+		// its code, in fact we don't know pretty much anything about it.
+		// We're going to let it flow to the user as a XXUUU error.
+		// We don't use CodeInternalError here (XX000) because internal
+		// errors have gain special status "please tell us about it
+		// ASAP" in CockroachDB.
+		code = pgerror.CodeUncategorizedError
+		// However, we'll keep track of the number of occurrences in
+		// telemetry. Over time, we'll want this count to go down
+		// (i.e. more errors becoming qualified).
+		telemetry.Inc(sqltelemetry.UncategorizedErrorCounter)
 	}
 
 	msgBuilder.putErrFieldMsg(pgwirebase.ServerErrFieldSQLState)
@@ -1306,7 +1335,7 @@ func (c *conn) handleAuthentication(
 	execCfg *sql.ExecutorConfig,
 ) error {
 	sendError := func(err error) error {
-		_ /* err */ = writeErr(err, &c.msgBuilder, c.conn)
+		_ /* err */ = writeErr(ctx, &execCfg.Settings.SV, err, &c.msgBuilder, c.conn)
 		return err
 	}
 

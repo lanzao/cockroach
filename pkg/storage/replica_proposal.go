@@ -110,7 +110,7 @@ type ProposalData struct {
 // counted on to invoke endCmds itself.)
 func (proposal *ProposalData) finishApplication(pr proposalResult) {
 	if proposal.endCmds != nil {
-		proposal.endCmds.done(pr.Reply, pr.Err, pr.ProposalRetry)
+		proposal.endCmds.done(pr.Reply, pr.Err)
 		proposal.endCmds = nil
 	}
 	if proposal.sp != nil {
@@ -371,7 +371,7 @@ func addSSTablePreApply(
 	ctx context.Context,
 	st *cluster.Settings,
 	eng engine.Engine,
-	sideloaded sideloadStorage,
+	sideloaded SideloadStorage,
 	term, index uint64,
 	sst storagepb.ReplicatedEvalResult_AddSSTable,
 	limiter *rate.Limiter,
@@ -537,7 +537,7 @@ func (r *Replica) handleReplicatedEvalResult(
 			// could rot.
 			{
 				log.Eventf(ctx, "truncating sideloaded storage up to (and including) index %d", newTruncState.Index)
-				if size, err := r.raftMu.sideloaded.TruncateTo(ctx, newTruncState.Index+1); err != nil {
+				if size, _, err := r.raftMu.sideloaded.TruncateTo(ctx, newTruncState.Index+1); err != nil {
 					// We don't *have* to remove these entries for correctness. Log a
 					// loud error, but keep humming along.
 					log.Errorf(ctx, "while removing sideloaded files during log truncation: %s", err)
@@ -808,14 +808,12 @@ func (r *Replica) handleEvalResultRaftMuLocked(
 }
 
 // proposalResult indicates the result of a proposal. Exactly one of
-// Reply, Err and ProposalRetry is set, and it represents the result of
-// the proposal.
+// Reply and Err is set, and it represents the result of the proposal.
 type proposalResult struct {
-	Reply         *roachpb.BatchResponse
-	Err           *roachpb.Error
-	ProposalRetry proposalReevaluationReason
-	Intents       []result.IntentsWithArg
-	EndTxns       []result.EndTxnIntents
+	Reply   *roachpb.BatchResponse
+	Err     *roachpb.Error
+	Intents []result.IntentsWithArg
+	EndTxns []result.EndTxnIntents
 }
 
 // evaluateProposal generates a Result from the given request by

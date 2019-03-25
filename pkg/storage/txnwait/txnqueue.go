@@ -60,7 +60,7 @@ func ShouldPushImmediately(req *roachpb.PushTxnRequest) bool {
 // for transactions with pushed timestamps.
 func isPushed(req *roachpb.PushTxnRequest, txn *roachpb.Transaction) bool {
 	return (txn.Status != roachpb.PENDING ||
-		(req.PushType == roachpb.PUSH_TIMESTAMP && req.PushTo.Less(txn.Timestamp)))
+		(req.PushType == roachpb.PUSH_TIMESTAMP && !txn.Timestamp.Less(req.PushTo)))
 }
 
 // TxnExpiration computes the timestamp after which the transaction will be
@@ -441,10 +441,8 @@ func (q *Queue) MaybeWaitForPush(
 	var queryPusherErrCh <-chan *roachpb.Error    // accepts errors querying the pusher txn
 	var readyCh chan struct{}                     // signaled when pusher txn should be queried
 
-	// Query the pusher if it's a valid transaction which already [may]
-	// have a transaction record (note that key being non-nil does not
-	// guarantee a txn record has been successfully written yet).
-	if req.PusherTxn.ID != uuid.Nil && req.PusherTxn.Key != nil {
+	// Query the pusher if it's a valid read-write transaction.
+	if req.PusherTxn.ID != uuid.Nil && req.PusherTxn.IsWriting() {
 		// Create a context which will be canceled once this call completes.
 		// This ensures that the goroutine created to query the pusher txn
 		// is properly cleaned up.

@@ -20,12 +20,14 @@ import (
 	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/opentracing/opentracing-go"
+	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 )
 
@@ -207,7 +209,8 @@ func newSorter(
 		// LIMIT and OFFSET should each never be greater than math.MaxInt64, the
 		// parser ensures this.
 		if post.Limit > math.MaxInt64 || post.Offset > math.MaxInt64 {
-			return nil, errors.Errorf("error creating sorter: limit %d offset %d too large", post.Limit, post.Offset)
+			return nil, pgerror.NewAssertionErrorf(
+				"error creating sorter: limit %d offset %d too large", log.Safe(post.Limit), log.Safe(post.Offset))
 		}
 		count = post.Limit + post.Offset
 	}
@@ -375,7 +378,8 @@ func newSortTopKProcessor(
 	k uint64,
 ) (Processor, error) {
 	if k == 0 {
-		return nil, errors.Wrap(errSortTopKZeroK, "error creating top k sorter")
+		return nil, pgerror.NewAssertionErrorWithWrappedErrf(errSortTopKZeroK,
+			"error creating top k sorter")
 	}
 	ordering := distsqlpb.ConvertToColumnOrdering(spec.OutputOrdering)
 	proc := &sortTopKProcessor{k: k}

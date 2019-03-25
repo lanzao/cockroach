@@ -23,11 +23,13 @@ import (
 	"net/http/pprof"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/server/debug/goroutineui"
 	"github.com/cockroachdb/cockroach/pkg/server/debug/pprofui"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/pkg/errors"
 	"github.com/rcrowley/go-metrics"
 	"github.com/rcrowley/go-metrics/exp"
@@ -118,8 +120,36 @@ func NewServer(st *cluster.Settings) *Server {
 	}
 	mux.HandleFunc("/debug/logspy", spy.handleDebugLogSpy)
 
-	ps := pprofui.NewServer(pprofui.NewMemStorage(1, 0))
+	ps := pprofui.NewServer(pprofui.NewMemStorage(1, 0), func(profile string, labels bool, do func()) {
+		tBegin := timeutil.Now()
+
+		extra := ""
+		if profile == "profile" && labels {
+			extra = " (enabling profiler labels)"
+			st.SetCPUProfiling(true)
+			defer st.SetCPUProfiling(false)
+		}
+		log.Infof(context.Background(), "pprofui: recording %s%s", profile, extra)
+
+		do()
+
+		log.Infof(context.Background(), "pprofui: recorded %s in %.2fs", profile, timeutil.Since(tBegin).Seconds())
+	})
 	mux.Handle("/debug/pprof/ui/", http.StripPrefix("/debug/pprof/ui", ps))
+
+	mux.HandleFunc("/debug/pprof/goroutineui/", func(w http.ResponseWriter, req *http.Request) {
+		dump := goroutineui.NewDump(timeutil.Now())
+
+		_ = req.ParseForm()
+		switch req.Form.Get("sort") {
+		case "count":
+			dump.SortCountDesc()
+		case "wait":
+			dump.SortWaitDesc()
+		default:
+		}
+		_ = dump.HTML(w)
+	})
 
 	return &Server{
 		st:  st,

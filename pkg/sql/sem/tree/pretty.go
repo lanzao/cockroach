@@ -15,10 +15,11 @@
 package tree
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/pretty"
 )
 
@@ -729,7 +730,7 @@ func (node *WindowFrameBound) doc(p *PrettyCfg) pretty.Doc {
 	case UnboundedFollowing:
 		return pretty.Keyword("UNBOUNDED FOLLOWING")
 	default:
-		panic(fmt.Sprintf("unexpected type %d", node.BoundType))
+		panic(pgerror.NewAssertionErrorf("unexpected type %d", log.Safe(node.BoundType)))
 	}
 }
 
@@ -775,19 +776,31 @@ func (node *AliasClause) doc(p *PrettyCfg) pretty.Doc {
 func (node *JoinTableExpr) doc(p *PrettyCfg) pretty.Doc {
 	d := []pretty.Doc{p.Doc(node.Left)}
 	if _, isNatural := node.Cond.(NaturalJoinCond); isNatural {
-		// Natural joins have a different syntax: "<a> NATURAL <join_type> <b>"
-		d = append(d,
-			p.nestUnder(
-				pretty.ConcatSpace(p.Doc(node.Cond), pretty.Text(node.Join)),
-				p.Doc(node.Right)),
-		)
-	} else {
-		// General syntax: "<a> <join_type> <b> <condition>"
-		operand := []pretty.Doc{
-			p.nestUnder(
-				pretty.Text(node.Join),
-				p.Doc(node.Right)),
+		// Natural joins have a different syntax:
+		//   "<a> NATURAL <join_type> [<join_hint>] <b>"
+		j := p.Doc(node.Cond)
+		if node.JoinType != "" {
+			j = pretty.ConcatSpace(j, pretty.Text(node.JoinType))
+			if node.Hint != "" {
+				j = pretty.ConcatSpace(j, pretty.Text(node.Hint))
+			}
 		}
+		j = pretty.ConcatSpace(j, pretty.Text("JOIN"))
+		d = append(d, p.nestUnder(j, p.Doc(node.Right)))
+	} else {
+		// General syntax: "<a> <join_type> [<join_hint>] JOIN <b> <condition>"
+		var j pretty.Doc
+		if node.JoinType != "" {
+			j = pretty.Text(node.JoinType)
+			if node.Hint != "" {
+				j = pretty.ConcatSpace(j, pretty.Text(node.Hint))
+			}
+			j = pretty.ConcatSpace(j, pretty.Text("JOIN"))
+		} else {
+			j = pretty.Text("JOIN")
+		}
+
+		operand := []pretty.Doc{p.nestUnder(j, p.Doc(node.Right))}
 		if node.Cond != nil {
 			operand = append(operand, p.Doc(node.Cond))
 		}
@@ -1003,7 +1016,7 @@ func (p *PrettyCfg) docReturning(node ReturningClause) pretty.RLTableRow {
 	case *ReturningExprs:
 		return p.row("RETURNING", p.Doc((*SelectExprs)(r)))
 	default:
-		panic(fmt.Sprintf("unhandled case: %T", node))
+		panic(pgerror.NewAssertionErrorf("unhandled case: %T", node))
 	}
 }
 

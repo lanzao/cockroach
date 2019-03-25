@@ -16,12 +16,15 @@ package memo
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // RelExpr is implemented by all operators tagged as Relational. Relational
@@ -281,6 +284,42 @@ func (sf *ScanFlags) Empty() bool {
 	return !sf.NoIndexJoin && !sf.ForceIndex
 }
 
+// JoinFlags stores restrictions on the join execution method, derived from
+// hints for a join specified in the query (see tree.JoinTableExpr).
+type JoinFlags struct {
+	DisallowLookupJoin bool
+	DisallowMergeJoin  bool
+	DisallowHashJoin   bool
+}
+
+// Empty returns true if there are no flags set.
+func (jf JoinFlags) Empty() bool {
+	return !jf.DisallowLookupJoin && !jf.DisallowMergeJoin && !jf.DisallowHashJoin
+}
+
+func (jf JoinFlags) String() string {
+	if jf.Empty() {
+		return "no flags"
+	}
+	var b strings.Builder
+	if jf.DisallowLookupJoin {
+		b.WriteString("no-lookup-join")
+	}
+	if jf.DisallowMergeJoin {
+		if b.Len() > 0 {
+			b.WriteByte(';')
+		}
+		b.WriteString("no-merge-join")
+	}
+	if jf.DisallowHashJoin {
+		if b.Len() > 0 {
+			b.WriteByte(';')
+		}
+		b.WriteString("no-hash-join")
+	}
+	return b.String()
+}
+
 // NeedResults returns true if the mutation operator can return the rows that
 // were mutated.
 func (m *MutationPrivate) NeedResults() bool {
@@ -294,7 +333,7 @@ func (m *MutationPrivate) NeedResults() bool {
 // NOTE: This can only be called if the mutation operator returns rows.
 func (m *MutationPrivate) MapToInputID(tabColID opt.ColumnID) opt.ColumnID {
 	if m.ReturnCols == nil {
-		panic(fmt.Sprintf("MapToInputID cannot be called if ReturnCols is not defined"))
+		panic(pgerror.NewAssertionErrorf("MapToInputID cannot be called if ReturnCols is not defined"))
 	}
 	ord := m.Table.ColumnOrdinal(tabColID)
 	return m.ReturnCols[ord]
@@ -307,7 +346,7 @@ func (m *MutationPrivate) MapToInputCols(tabCols opt.ColSet) opt.ColSet {
 	tabCols.ForEach(func(t int) {
 		id := m.MapToInputID(opt.ColumnID(t))
 		if id == 0 {
-			panic(fmt.Sprintf("could not find input column for %d", t))
+			panic(pgerror.NewAssertionErrorf("could not find input column for %d", log.Safe(t)))
 		}
 		inCols.Add(int(id))
 	})

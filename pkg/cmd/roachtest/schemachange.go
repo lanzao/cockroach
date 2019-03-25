@@ -60,7 +60,7 @@ func registerSchemaChangeKV(r *registry) {
 				// TODO(dan): Ideally, the test would fail if this queryload failed,
 				// but we can't put it in monitor as-is because the test deadlocks.
 				go func() {
-					const cmd = `./workload run kv --tolerate-errors --min-block-bytes=8 --max-block-bytes=128 --db=test`
+					const cmd = `./workload run kv --tolerate-errors --min-block-bytes=8 --max-block-bytes=127 --db=test`
 					l, err := t.l.ChildLogger(fmt.Sprintf(`kv-%d`, node))
 					if err != nil {
 						t.Fatal(err)
@@ -305,7 +305,7 @@ func makeIndexAddTpccTest(numNodes, warehouses int, length time.Duration) testSp
 	return testSpec{
 		Name:    fmt.Sprintf("schemachange/index/tpcc/w=%d", warehouses),
 		Cluster: makeClusterSpec(numNodes),
-		Timeout: length * 2,
+		Timeout: length * 3,
 		Run: func(ctx context.Context, t *test, c *cluster) {
 			runTPCC(ctx, t, c, tpccOptions{
 				Warehouses: warehouses,

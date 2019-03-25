@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -445,6 +446,18 @@ var (
 	metaRaftCommandCommitLatency = metric.Metadata{
 		Name:        "raft.process.commandcommit.latency",
 		Help:        "Latency histogram for committing Raft commands",
+		Measurement: "Latency",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
+	metaRaftHandleReadyLatency = metric.Metadata{
+		Name:        "raft.process.handleready.latency",
+		Help:        "Latency histogram for handling a Raft ready",
+		Measurement: "Latency",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
+	metaRaftApplyCommittedLatency = metric.Metadata{
+		Name:        "raft.process.applycommitted.latency",
+		Help:        "Latency histogram for applying all committed Raft commands in a Raft ready",
 		Measurement: "Latency",
 		Unit:        metric.Unit_NANOSECONDS,
 	}
@@ -918,6 +931,15 @@ var (
 		Measurement: "Ingestions",
 		Unit:        metric.Unit_COUNT,
 	}
+
+	// Encryption-at-rest metrics.
+	// TODO(mberhault): metrics for key age, per-key file/bytes counts.
+	metaEncryptionAlgorithm = metric.Metadata{
+		Name:        "rocksdb.encryption.algorithm",
+		Help:        "algorithm in use for encryption-at-rest, see ccl/storageccl/engineccl/enginepbccl/key_registry.proto",
+		Measurement: "Encryption At Rest",
+		Unit:        metric.Unit_CONST,
+	}
 )
 
 // StoreMetrics is the set of metrics for a given store.
@@ -1007,12 +1029,14 @@ type StoreMetrics struct {
 	RangeRaftLeaderTransfers        *metric.Counter
 
 	// Raft processing metrics.
-	RaftTicks                *metric.Counter
-	RaftWorkingDurationNanos *metric.Counter
-	RaftTickingDurationNanos *metric.Counter
-	RaftCommandsApplied      *metric.Counter
-	RaftLogCommitLatency     *metric.Histogram
-	RaftCommandCommitLatency *metric.Histogram
+	RaftTicks                 *metric.Counter
+	RaftWorkingDurationNanos  *metric.Counter
+	RaftTickingDurationNanos  *metric.Counter
+	RaftCommandsApplied       *metric.Counter
+	RaftLogCommitLatency      *metric.Histogram
+	RaftCommandCommitLatency  *metric.Histogram
+	RaftHandleReadyLatency    *metric.Histogram
+	RaftApplyCommittedLatency *metric.Histogram
 
 	// Raft message metrics.
 	RaftRcvdMsgProp           *metric.Counter
@@ -1112,6 +1136,13 @@ type StoreMetrics struct {
 	AddSSTableApplications      *metric.Counter
 	AddSSTableApplicationCopies *metric.Counter
 
+	// Encryption-at-rest stats.
+	// EncryptionAlgorithm is an enum representing the cipher in use, so we use a gauge.
+	EncryptionAlgorithm *metric.Gauge
+
+	// RangeFeed counts.
+	RangeFeedMetrics *rangefeed.Metrics
+
 	// Stats for efficient merges.
 	mu struct {
 		syncutil.Mutex
@@ -1202,12 +1233,14 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		RangeRaftLeaderTransfers:        metric.NewCounter(metaRangeRaftLeaderTransfers),
 
 		// Raft processing metrics.
-		RaftTicks:                metric.NewCounter(metaRaftTicks),
-		RaftWorkingDurationNanos: metric.NewCounter(metaRaftWorkingDurationNanos),
-		RaftTickingDurationNanos: metric.NewCounter(metaRaftTickingDurationNanos),
-		RaftCommandsApplied:      metric.NewCounter(metaRaftCommandsApplied),
-		RaftLogCommitLatency:     metric.NewLatency(metaRaftLogCommitLatency, histogramWindow),
-		RaftCommandCommitLatency: metric.NewLatency(metaRaftCommandCommitLatency, histogramWindow),
+		RaftTicks:                 metric.NewCounter(metaRaftTicks),
+		RaftWorkingDurationNanos:  metric.NewCounter(metaRaftWorkingDurationNanos),
+		RaftTickingDurationNanos:  metric.NewCounter(metaRaftTickingDurationNanos),
+		RaftCommandsApplied:       metric.NewCounter(metaRaftCommandsApplied),
+		RaftLogCommitLatency:      metric.NewLatency(metaRaftLogCommitLatency, histogramWindow),
+		RaftCommandCommitLatency:  metric.NewLatency(metaRaftCommandCommitLatency, histogramWindow),
+		RaftHandleReadyLatency:    metric.NewLatency(metaRaftHandleReadyLatency, histogramWindow),
+		RaftApplyCommittedLatency: metric.NewLatency(metaRaftApplyCommittedLatency, histogramWindow),
 
 		// Raft message metrics.
 		RaftRcvdMsgProp:           metric.NewCounter(metaRaftRcvdProp),
@@ -1303,6 +1336,12 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		AddSSTableProposals:         metric.NewCounter(metaAddSSTableProposals),
 		AddSSTableApplications:      metric.NewCounter(metaAddSSTableApplications),
 		AddSSTableApplicationCopies: metric.NewCounter(metaAddSSTableApplicationCopies),
+
+		// Encryption-at-rest.
+		EncryptionAlgorithm: metric.NewGauge(metaEncryptionAlgorithm),
+
+		// RangeFeed counters.
+		RangeFeedMetrics: rangefeed.NewMetrics(),
 	}
 
 	sm.raftRcvdMessages[raftpb.MsgProp] = sm.RaftRcvdMsgProp
@@ -1374,6 +1413,10 @@ func (sm *StoreMetrics) updateRocksDBStats(stats engine.Stats) {
 	sm.RdbFlushes.Update(stats.Flushes)
 	sm.RdbCompactions.Update(stats.Compactions)
 	sm.RdbTableReadersMemEstimate.Update(stats.TableReadersMemEstimate)
+}
+
+func (sm *StoreMetrics) updateEnvStats(stats engine.EnvStats) {
+	sm.EncryptionAlgorithm.Update(int64(stats.EncryptionType))
 }
 
 func (sm *StoreMetrics) handleMetricsResult(ctx context.Context, metric result.Metrics) {

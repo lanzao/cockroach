@@ -27,10 +27,12 @@ import (
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -161,7 +163,8 @@ func (b *writeBuffer) writeTextDatum(
 		case oid.T_int2vector, oid.T_oidvector:
 			// vectors are serialized as a string of space-separated values.
 			sep := ""
-			// TODO(justin): add a test for nested arrays.
+			// TODO(justin): add a test for nested arrays when #32552 is
+			// addressed.
 			for _, d := range v.Array {
 				b.textFormatter.WriteString(sep)
 				b.textFormatter.FormatNode(d)
@@ -275,7 +278,7 @@ func (b *writeBuffer) writeBinaryDatum(
 				// The above encoding is not correct for Infinity, but since that encoding
 				// doesn't exist in postgres, it's unclear what to do. For now use the NaN
 				// encoding and count it to see if anyone even needs this.
-				telemetry.Count("pgwire.#32489.binary_decimal_infinity")
+				telemetry.Inc(sqltelemetry.BinaryDecimalInfinityCounter)
 			}
 
 			return
@@ -430,7 +433,8 @@ func (b *writeBuffer) writeBinaryDatum(
 
 	case *tree.DArray:
 		if v.ParamTyp.FamilyEqual(types.AnyArray) {
-			b.setError(errors.New("unsupported binary serialization of multidimensional arrays"))
+			b.setError(pgerror.UnimplementedWithIssueDetailError(32552,
+				"binenc", "unsupported binary serialization of multidimensional arrays"))
 			return
 		}
 		// TODO(andrei): We shouldn't be allocating a new buffer for every array.
@@ -461,7 +465,7 @@ func (b *writeBuffer) writeBinaryDatum(
 		b.putInt32(4)
 		b.putInt32(int32(v.DInt))
 	default:
-		b.setError(errors.Errorf("unsupported type %T", d))
+		b.setError(pgerror.NewAssertionErrorf("unsupported type %T", d))
 	}
 }
 

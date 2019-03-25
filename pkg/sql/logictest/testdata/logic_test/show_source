@@ -36,9 +36,8 @@ default_int_size                     8
 default_transaction_isolation        serializable
 default_transaction_read_only        off
 distsql                              off
-experimental_enable_zigzag_join      off
+experimental_enable_zigzag_join      on
 experimental_force_split_at          off
-experimental_reorder_joins_limit     4
 experimental_serial_normalization    rowid
 experimental_vectorize               off
 extra_float_digits                   0
@@ -49,6 +48,7 @@ intervalstyle                        postgres
 lock_timeout                         0
 max_index_keys                       32
 node_id                              1
+reorder_joins_limit                  4
 results_buffer_size                  16384
 row_security                         off
 search_path                          public
@@ -147,6 +147,11 @@ pg_catalog
 public
 
 query T colnames
+SELECT * FROM [SHOW SEQUENCES FROM system]
+----
+sequence_name
+
+query T colnames
 SELECT * FROM [SHOW TABLES FROM system]
 ----
 table_name
@@ -170,21 +175,21 @@ query TT colnames
 SELECT * FROM [SHOW TABLES FROM system WITH COMMENT]
 ----
 table_name        comment
-comments          NULL
-descriptor        NULL
-eventlog          NULL
-jobs              NULL
-lease             NULL
-locations         NULL
-namespace         NULL
-rangelog          NULL
-role_members      NULL
-settings          NULL
-table_statistics  NULL
-ui                NULL
-users             NULL
-web_sessions      NULL
-zones             NULL
+namespace         ·
+descriptor        ·
+users             ·
+zones             ·
+settings          ·
+lease             ·
+eventlog          ·
+rangelog          ·
+ui                ·
+jobs              ·
+web_sessions      ·
+table_statistics  ·
+locations         ·
+role_members      ·
+comments          ·
 
 query ITTT colnames
 SELECT node_id, user_name, application_name, active_queries
@@ -301,10 +306,10 @@ SELECT * FROM [SHOW COMPACT TRACE FOR SESSION] LIMIT 0
 ----
 age  message  tag  operation
 
-query ITTTTTTTTTRTI colnames
+query ITTTTTTTTTTRTI colnames
 SELECT * FROM [SHOW JOBS] LIMIT 0
 ----
-job_id  job_type  description  user_name  status  running_status  created  started  finished  modified  fraction_completed  error  coordinator_id
+job_id  job_type  description  statement  user_name  status  running_status  created  started  finished  modified  fraction_completed  error  coordinator_id
 
 query TT colnames
 SELECT * FROM [SHOW SYNTAX 'select 1; select 2']

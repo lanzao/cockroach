@@ -79,16 +79,16 @@ root                 ·             ·                                          
 query TTTTT
 EXPLAIN (VERBOSE) SELECT a FROM abc WHERE a IN (SELECT a FROM abc)
 ----
-join       ·               ·            (a)  ·
- │         type            semi         ·    ·
- │         equality        (a) = (a)    ·    ·
- │         mergeJoinOrder  +"(a=a)"     ·    ·
- ├── scan  ·               ·            (a)  +a
- │         table           abc@primary  ·    ·
- │         spans           ALL          ·    ·
- └── scan  ·               ·            (a)  +a
-·          table           abc@primary  ·    ·
-·          spans           ALL          ·    ·
+merge-join  ·               ·            (a)  ·
+ │          type            semi         ·    ·
+ │          equality        (a) = (a)    ·    ·
+ │          mergeJoinOrder  +"(a=a)"     ·    ·
+ ├── scan   ·               ·            (a)  +a
+ │          table           abc@primary  ·    ·
+ │          spans           ALL          ·    ·
+ └── scan   ·               ·            (a)  +a
+·           table           abc@primary  ·    ·
+·           spans           ALL          ·    ·
 
 query TTT
 EXPLAIN SELECT * FROM (SELECT * FROM (VALUES (1, 8, 8), (3, 1, 1), (2, 4, 4)) AS moo (moo1, moo2, moo3) ORDER BY moo2) as foo (foo1) ORDER BY foo1
@@ -114,7 +114,7 @@ root              ·             ·
 
 # This test checks that the double sub-query plan expansion caused by a
 # sub-expression being shared by two or more plan nodes does not
-# panic.
+# error out.
 statement ok
 CREATE TABLE tab4(col0 INTEGER, col1 FLOAT, col3 INTEGER, col4 FLOAT)
 
@@ -156,21 +156,21 @@ CREATE TABLE b (x INT PRIMARY KEY, z INT);
 query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM a WHERE EXISTS(SELECT * FROM b WHERE a.x=b.x)
 ----
-join       ·               ·          (x, y)  ·
- │         type            semi       ·       ·
- │         equality        (x) = (x)  ·       ·
- │         mergeJoinOrder  +"(x=x)"   ·       ·
- ├── scan  ·               ·          (x, y)  +x
- │         table           a@primary  ·       ·
- │         spans           ALL        ·       ·
- └── scan  ·               ·          (x, z)  +x
-·          table           b@primary  ·       ·
-·          spans           ALL        ·       ·
+merge-join  ·               ·          (x, y)  ·
+ │          type            semi       ·       ·
+ │          equality        (x) = (x)  ·       ·
+ │          mergeJoinOrder  +"(x=x)"   ·       ·
+ ├── scan   ·               ·          (x, y)  +x
+ │          table           a@primary  ·       ·
+ │          spans           ALL        ·       ·
+ └── scan   ·               ·          (x, z)  +x
+·           table           b@primary  ·       ·
+·           spans           ALL        ·       ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM a WHERE EXISTS(SELECT * FROM b WHERE b.x-1 = a.x)
 ----
-join            ·                  ·                (x, y)           ·
+hash-join       ·                  ·                (x, y)           ·
  │              type               semi             ·                ·
  │              equality           (x) = (column5)  ·                ·
  │              left cols are key  ·                ·                ·
@@ -188,21 +188,21 @@ join            ·                  ·                (x, y)           ·
 query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM a WHERE NOT EXISTS(SELECT * FROM b WHERE b.x = a.x)
 ----
-join       ·               ·          (x, y)  ·
- │         type            anti       ·       ·
- │         equality        (x) = (x)  ·       ·
- │         mergeJoinOrder  +"(x=x)"   ·       ·
- ├── scan  ·               ·          (x, y)  +x
- │         table           a@primary  ·       ·
- │         spans           ALL        ·       ·
- └── scan  ·               ·          (x, z)  +x
-·          table           b@primary  ·       ·
-·          spans           ALL        ·       ·
+merge-join  ·               ·          (x, y)  ·
+ │          type            anti       ·       ·
+ │          equality        (x) = (x)  ·       ·
+ │          mergeJoinOrder  +"(x=x)"   ·       ·
+ ├── scan   ·               ·          (x, y)  +x
+ │          table           a@primary  ·       ·
+ │          spans           ALL        ·       ·
+ └── scan   ·               ·          (x, z)  +x
+·           table           b@primary  ·       ·
+·           spans           ALL        ·       ·
 
 query TTTTT
 EXPLAIN (VERBOSE) SELECT * FROM b WHERE NOT EXISTS(SELECT * FROM a WHERE x-1 = b.x)
 ----
-join            ·                  ·                (x, z)           ·
+hash-join       ·                  ·                (x, z)           ·
  │              type               anti             ·                ·
  │              equality           (x) = (column5)  ·                ·
  │              left cols are key  ·                ·                ·
@@ -233,8 +233,15 @@ root            ·              ·                  ("array")  ·
 ·               spans          ALL                ·          ·
 
 # Case where the plan has an apply join.
-query error could not decorrelate subquery
-SELECT * FROM abc WHERE EXISTS(SELECT * FROM (VALUES (a), (b)) WHERE column1=a)
+query TTTTT
+EXPLAIN(verbose) SELECT * FROM abc WHERE EXISTS(SELECT * FROM (VALUES (a), (b)) WHERE column1=a)
+----
+apply-join  ·      ·            (a, b, c)  ·
+ │          type   semi         ·          ·
+ │          pred   column1 = a  ·          ·
+ └── scan   ·      ·            (a, b, c)  ·
+·           table  abc@primary  ·          ·
+·           spans  ALL          ·          ·
 
 # Case where the EXISTS subquery still has outer columns in the subquery
 # (regression test for #28816).

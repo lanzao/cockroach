@@ -41,22 +41,24 @@ func TestMaybeRefreshStats(t *testing.T) {
 	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
-	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := tree.NewTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
-	AutomaticStatisticsClusterMode.Override(&evalCtx.Settings.SV, false)
+	AutomaticStatisticsClusterMode.Override(&st.SV, false)
+	AutomaticStatisticsMinStaleRows.Override(&st.SV, 5)
 
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
 	sqlRun.Exec(t,
 		`CREATE DATABASE t;
-		CREATE TABLE t.a (k INT PRIMARY KEY, v CHAR);
-		INSERT INTO t.a VALUES (1, 'a');
-		CREATE VIEW t.vw AS SELECT k, v FROM t.a;`)
+		CREATE TABLE t.a (k INT PRIMARY KEY);
+		INSERT INTO t.a VALUES (1);
+		CREATE VIEW t.vw AS SELECT k, k+1 FROM t.a;`)
 
 	executor := s.InternalExecutor().(sqlutil.InternalExecutor)
 	descA := sqlbase.GetTableDescriptor(s.DB(), "t", "a")
 	cache := NewTableStatisticsCache(10 /* cacheSize */, s.Gossip(), kvDB, executor)
-	refresher := MakeRefresher(executor, cache, time.Microsecond /* asOfTime */)
+	refresher := MakeRefresher(st, executor, cache, time.Microsecond /* asOfTime */)
 
 	// There should not be any stats yet.
 	if err := checkStatsCount(ctx, cache, descA.ID, 0 /* expected */); err != nil {
@@ -65,23 +67,26 @@ func TestMaybeRefreshStats(t *testing.T) {
 
 	// There are no stats yet, so this must refresh the statistics on table t
 	// even though rowsAffected=0.
-	refresher.maybeRefreshStats(ctx, s.Stopper(), descA.ID, 0 /* rowsAffected */, time.Microsecond /* asOf */)
+	refresher.maybeRefreshStats(
+		ctx, s.Stopper(), descA.ID, 0 /* rowsAffected */, time.Microsecond, /* asOf */
+	)
 	if err := checkStatsCount(ctx, cache, descA.ID, 1 /* expected */); err != nil {
 		t.Fatal(err)
 	}
 
 	// Try to refresh again. With rowsAffected=0, the probability of a refresh
 	// is 0, so refreshing will not succeed.
-	refresher.maybeRefreshStats(ctx, s.Stopper(), descA.ID, 0 /* rowsAffected */, time.Microsecond /* asOf */)
+	refresher.maybeRefreshStats(
+		ctx, s.Stopper(), descA.ID, 0 /* rowsAffected */, time.Microsecond, /* asOf */
+	)
 	if err := checkStatsCount(ctx, cache, descA.ID, 1 /* expected */); err != nil {
 		t.Fatal(err)
 	}
 
 	// With rowsAffected=10, refreshing should work. Since there are more rows
 	// updated than exist in the table, the probability of a refresh is 100%.
-	// Use a non-zero asOf time to test that the thread will sleep if necessary.
 	refresher.maybeRefreshStats(
-		ctx, s.Stopper(), descA.ID, 10 /* rowsAffected */, time.Second, /* asOf */
+		ctx, s.Stopper(), descA.ID, 10 /* rowsAffected */, time.Microsecond, /* asOf */
 	)
 	if err := checkStatsCount(ctx, cache, descA.ID, 2 /* expected */); err != nil {
 		t.Fatal(err)
@@ -91,7 +96,9 @@ func TestMaybeRefreshStats(t *testing.T) {
 	// enqueuing the attempt.
 	// TODO(rytaft): Should not enqueue views to begin with.
 	descVW := sqlbase.GetTableDescriptor(s.DB(), "t", "vw")
-	refresher.maybeRefreshStats(ctx, s.Stopper(), descVW.ID, 0 /* rowsAffected */, 0 /* asOf */)
+	refresher.maybeRefreshStats(
+		ctx, s.Stopper(), descVW.ID, 0 /* rowsAffected */, time.Microsecond, /* asOf */
+	)
 	select {
 	case <-refresher.mutations:
 		t.Fatal("refresher should not re-enqueue attempt to create stats over view")
@@ -106,21 +113,22 @@ func TestAverageRefreshTime(t *testing.T) {
 	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
-	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := tree.NewTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
-	AutomaticStatisticsClusterMode.Override(&evalCtx.Settings.SV, false)
+	AutomaticStatisticsClusterMode.Override(&st.SV, false)
 
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
 	sqlRun.Exec(t,
 		`CREATE DATABASE t;
-		CREATE TABLE t.a (k INT PRIMARY KEY, v CHAR);
-		INSERT INTO t.a VALUES (1, 'a');`)
+		CREATE TABLE t.a (k INT PRIMARY KEY);
+		INSERT INTO t.a VALUES (1);`)
 
 	executor := s.InternalExecutor().(sqlutil.InternalExecutor)
 	tableID := sqlbase.GetTableDescriptor(s.DB(), "t", "a").ID
 	cache := NewTableStatisticsCache(10 /* cacheSize */, s.Gossip(), kvDB, executor)
-	refresher := MakeRefresher(executor, cache, time.Microsecond /* asOfTime */)
+	refresher := MakeRefresher(st, executor, cache, time.Microsecond /* asOfTime */)
 
 	checkAverageRefreshTime := func(expected time.Duration) error {
 		cache.InvalidateTableStats(ctx, tableID)
@@ -262,7 +270,9 @@ func TestAverageRefreshTime(t *testing.T) {
 	// average time between refreshes, so this call is not required to refresh
 	// the statistics on table t. With rowsAffected=0, the probability of refresh
 	// is 0.
-	refresher.maybeRefreshStats(ctx, s.Stopper(), tableID, 0 /* rowsAffected */, time.Microsecond /* asOf */)
+	refresher.maybeRefreshStats(
+		ctx, s.Stopper(), tableID, 0 /* rowsAffected */, time.Microsecond, /* asOf */
+	)
 	if err := checkStatsCount(ctx, cache, tableID, 20 /* expected */); err != nil {
 		t.Fatal(err)
 	}
@@ -307,7 +317,9 @@ func TestAverageRefreshTime(t *testing.T) {
 	// on table t even though rowsAffected=0. After refresh, only 15 stats should
 	// remain (5 from column k and 10 from column v), since the old stats on k
 	// were deleted.
-	refresher.maybeRefreshStats(ctx, s.Stopper(), tableID, 0 /* rowsAffected */, time.Microsecond /* asOf */)
+	refresher.maybeRefreshStats(
+		ctx, s.Stopper(), tableID, 0 /* rowsAffected */, time.Microsecond, /* asOf */
+	)
 	if err := checkStatsCount(ctx, cache, tableID, 15 /* expected */); err != nil {
 		t.Fatal(err)
 	}
@@ -328,16 +340,16 @@ func TestAutoStatsReadOnlyTables(t *testing.T) {
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
 	sqlRun.Exec(t,
 		`CREATE DATABASE t;
-		CREATE TABLE t.a (k INT PRIMARY KEY, v CHAR);`)
+		CREATE TABLE t.a (k INT PRIMARY KEY);`)
 
 	executor := s.InternalExecutor().(sqlutil.InternalExecutor)
 	cache := NewTableStatisticsCache(10 /* cacheSize */, s.Gossip(), kvDB, executor)
-	refresher := MakeRefresher(executor, cache, time.Microsecond /* asOfTime */)
+	refresher := MakeRefresher(st, executor, cache, time.Microsecond /* asOfTime */)
 
 	AutomaticStatisticsClusterMode.Override(&st.SV, true)
 
 	if err := refresher.Start(
-		ctx, &st.SV, s.Stopper(), time.Millisecond, /* refreshInterval */
+		ctx, s.Stopper(), time.Millisecond, /* refreshInterval */
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -357,15 +369,18 @@ func TestNoRetryOnFailure(t *testing.T) {
 	s, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
-	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := tree.NewTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
 	executor := s.InternalExecutor().(sqlutil.InternalExecutor)
 	cache := NewTableStatisticsCache(10 /* cacheSize */, s.Gossip(), kvDB, executor)
-	r := MakeRefresher(executor, cache, 0 /* asOfTime */)
+	r := MakeRefresher(st, executor, cache, time.Microsecond /* asOfTime */)
 
 	// Try to refresh stats on a table that doesn't exist.
-	r.maybeRefreshStats(ctx, s.Stopper(), 100 /* tableID */, math.MaxInt32, 0 /* asOfTime */)
+	r.maybeRefreshStats(
+		ctx, s.Stopper(), 100 /* tableID */, math.MaxInt32, time.Microsecond, /* asOfTime */
+	)
 
 	// Ensure that we will not try to refresh tableID 100 again.
 	if expected, actual := 0, len(r.mutations); expected != actual {
@@ -391,6 +406,35 @@ func TestMutationsChannel(t *testing.T) {
 	if expected, actual := refreshChanBufferLen, len(r.mutations); expected != actual {
 		t.Fatalf("expected channel size %d but found %d", expected, actual)
 	}
+}
+
+func TestDefaultColumns(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+
+	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
+	sqlRun.Exec(t,
+		`CREATE DATABASE t;
+		CREATE TABLE t.a (c0 INT PRIMARY KEY);`)
+
+	for i := 1; i < 110; i++ {
+		// Add more columns than we will collect stats on.
+		sqlRun.Exec(t,
+			fmt.Sprintf("ALTER TABLE t.a ADD COLUMN c%d INT", i))
+	}
+
+	sqlRun.Exec(t, `CREATE STATISTICS s FROM t.a`)
+
+	// There should be 101 stats. One for the primary index, plus 100 other
+	// columns.
+	sqlRun.CheckQueryResults(t,
+		`SELECT count(*) FROM [SHOW STATISTICS FOR TABLE t.a] WHERE statistics_name = 's'`,
+		[][]string{
+			{"101"},
+		})
 }
 
 func checkStatsCount(

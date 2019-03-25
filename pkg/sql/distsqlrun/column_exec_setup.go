@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/exec/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/exec/types/conv"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -127,10 +128,11 @@ func newColOperator(
 		groupTyps := make([]types.T, len(aggSpec.GroupCols))
 		for i, col := range aggSpec.GroupCols {
 			if !orderedCols.Contains(int(col)) {
-				return nil, errors.New("unsorted aggregation not supported")
+				return nil, pgerror.NewErrorf(pgerror.CodeDataExceptionError,
+					"unsorted aggregation not supported")
 			}
 			groupCols.Add(int(col))
-			groupTyps[i] = types.FromColumnType(spec.Input[0].ColumnTypes[col])
+			groupTyps[i] = conv.FromColumnType(spec.Input[0].ColumnTypes[col])
 		}
 		if !orderedCols.SubsetOf(groupCols) {
 			return nil, pgerror.NewAssertionErrorf("ordered cols must be a subset of grouping cols")
@@ -141,17 +143,20 @@ func newColOperator(
 		aggFns := make([]distsqlpb.AggregatorSpec_Func, len(aggSpec.Aggregations))
 		for i, agg := range aggSpec.Aggregations {
 			if agg.Distinct {
-				return nil, errors.New("distinct aggregation not supported")
+				return nil, pgerror.NewErrorf(pgerror.CodeDataExceptionError,
+					"distinct aggregation not supported")
 			}
 			if agg.FilterColIdx != nil {
-				return nil, errors.New("filtering aggregation not supported")
+				return nil, pgerror.NewErrorf(pgerror.CodeDataExceptionError,
+					"filtering aggregation not supported")
 			}
 			if len(agg.Arguments) > 0 {
-				return nil, errors.New("aggregates with arguments not supported")
+				return nil, pgerror.NewErrorf(pgerror.CodeDataExceptionError,
+					"aggregates with arguments not supported")
 			}
 			aggTyps[i] = make([]types.T, len(agg.ColIdx))
 			for j, colIdx := range agg.ColIdx {
-				aggTyps[i][j] = types.FromColumnType(spec.Input[0].ColumnTypes[colIdx])
+				aggTyps[i][j] = conv.FromColumnType(spec.Input[0].ColumnTypes[colIdx])
 			}
 			aggCols[i] = agg.ColIdx
 			aggFns[i] = agg.Func
@@ -162,7 +167,8 @@ func newColOperator(
 					// TODO(alfonso): plan ordinary SUM on integer types by casting to DECIMAL
 					// at the end, mod issues with overflow. Perhaps to avoid the overflow
 					// issues, at first, we could plan SUM for all types besides Int64.
-					return nil, errors.New("sum on int cols not supported (use sum_int)")
+					return nil, pgerror.NewErrorf(pgerror.CodeDataExceptionError,
+						"sum on int cols not supported (use sum_int)")
 				}
 			}
 		}
@@ -185,7 +191,8 @@ func newColOperator(
 		}
 		for _, col := range core.Distinct.DistinctColumns {
 			if !orderedCols.Contains(int(col)) {
-				return nil, errors.New("unsorted distinct not supported")
+				return nil, pgerror.NewErrorf(pgerror.CodeDataExceptionError,
+					"unsorted distinct not supported")
 			}
 			distinctCols.Add(int(col))
 		}
@@ -194,7 +201,7 @@ func newColOperator(
 		}
 
 		columnTypes = spec.Input[0].ColumnTypes
-		typs := types.FromColumnTypes(columnTypes)
+		typs := conv.FromColumnTypes(columnTypes)
 		op, err = exec.NewOrderedDistinct(inputs[0], core.Distinct.OrderedColumns, typs)
 
 	case core.HashJoiner != nil:
@@ -203,11 +210,12 @@ func newColOperator(
 		}
 
 		if !core.HashJoiner.OnExpr.Empty() {
-			return nil, errors.New("can't plan hash join with on expressions")
+			return nil, pgerror.NewErrorf(pgerror.CodeDataExceptionError,
+				"can't plan hash join with on expressions")
 		}
 
-		leftTypes := types.FromColumnTypes(spec.Input[0].ColumnTypes)
-		rightTypes := types.FromColumnTypes(spec.Input[1].ColumnTypes)
+		leftTypes := conv.FromColumnTypes(spec.Input[0].ColumnTypes)
+		rightTypes := conv.FromColumnTypes(spec.Input[1].ColumnTypes)
 
 		nLeftCols := uint32(len(leftTypes))
 		nRightCols := uint32(len(rightTypes))
@@ -247,6 +255,77 @@ func newColOperator(
 			core.HashJoiner.Type,
 		)
 
+	case core.MergeJoiner != nil:
+		if err := checkNumIn(inputs, 2); err != nil {
+			return nil, err
+		}
+
+		if !core.MergeJoiner.OnExpr.Empty() {
+			return nil, pgerror.NewErrorf(pgerror.CodeDataExceptionError,
+				"can't plan merge join with on expressions")
+		}
+
+		leftTypes := conv.FromColumnTypes(spec.Input[0].ColumnTypes)
+		rightTypes := conv.FromColumnTypes(spec.Input[1].ColumnTypes)
+
+		nLeftCols := uint32(len(leftTypes))
+		nRightCols := uint32(len(rightTypes))
+
+		leftEqCols := make([]uint32, 0, nLeftCols)
+		rightEqCols := make([]uint32, 0, nRightCols)
+
+		for _, oCol := range core.MergeJoiner.LeftOrdering.Columns {
+			if leftTypes[oCol.ColIdx] != types.Int64 {
+				return nil, pgerror.NewErrorf(pgerror.CodeDataExceptionError,
+					"merge join equality is only supported on Int64")
+			}
+			leftEqCols = append(leftEqCols, oCol.ColIdx)
+		}
+
+		for _, oCol := range core.MergeJoiner.RightOrdering.Columns {
+			if rightTypes[oCol.ColIdx] != types.Int64 {
+				return nil, pgerror.NewErrorf(pgerror.CodeDataExceptionError,
+					"merge join equality is only supported on Int64")
+			}
+			rightEqCols = append(rightEqCols, oCol.ColIdx)
+		}
+
+		leftOutCols := make([]uint32, 0, nLeftCols)
+		rightOutCols := make([]uint32, 0, nRightCols)
+
+		if post.Projection {
+			for _, col := range post.OutputColumns {
+				if col < nLeftCols {
+					leftOutCols = append(leftOutCols, col)
+				} else {
+					rightOutCols = append(rightOutCols, col-nLeftCols)
+				}
+			}
+		} else {
+			for i := uint32(0); i < nLeftCols; i++ {
+				leftOutCols = append(leftOutCols, i)
+			}
+
+			for i := uint32(0); i < nRightCols; i++ {
+				rightOutCols = append(rightOutCols, i)
+			}
+		}
+
+		op = exec.NewMergeJoinOp(
+			inputs[0],
+			inputs[1],
+			leftOutCols,
+			rightOutCols,
+			leftTypes,
+			rightTypes,
+			leftEqCols,
+			rightEqCols,
+		)
+
+		columnTypes = make([]sqlbase.ColumnType, nLeftCols+nRightCols)
+		copy(columnTypes, spec.Input[0].ColumnTypes)
+		copy(columnTypes[nLeftCols:], spec.Input[1].ColumnTypes)
+
 	case core.JoinReader != nil:
 		if err := checkNumIn(inputs, 1); err != nil {
 			return nil, err
@@ -276,12 +355,20 @@ func newColOperator(
 		if err := checkNumIn(inputs, 1); err != nil {
 			return nil, err
 		}
-		op, err = exec.NewSorter(inputs[0],
-			types.FromColumnTypes(spec.Input[0].ColumnTypes),
-			core.Sorter.OutputOrdering.Columns)
+		if core.Sorter.OrderingMatchLen > 0 {
+			op, err = exec.NewSortChunks(inputs[0],
+				conv.FromColumnTypes(spec.Input[0].ColumnTypes),
+				core.Sorter.OutputOrdering.Columns,
+				int(core.Sorter.OrderingMatchLen))
+		} else {
+			op, err = exec.NewSorter(inputs[0],
+				conv.FromColumnTypes(spec.Input[0].ColumnTypes),
+				core.Sorter.OutputOrdering.Columns)
+		}
 
 	default:
-		return nil, errors.Errorf("unsupported processor core %s", core)
+		return nil, pgerror.NewErrorf(pgerror.CodeDataExceptionError,
+			"unsupported processor core %s", core)
 	}
 	log.VEventf(ctx, 1, "Made op %T\n", op)
 
@@ -291,7 +378,7 @@ func newColOperator(
 
 	if !post.Filter.Empty() {
 		if columnTypes == nil {
-			return nil, errors.Errorf(
+			return nil, pgerror.NewErrorf(pgerror.CodeDataExceptionError,
 				"unable to columnarize filter expression %q: columnTypes is unset", post.Filter.Expr)
 		}
 		var helper exprHelper
@@ -302,7 +389,8 @@ func newColOperator(
 		var filterColumnTypes []sqlbase.ColumnType
 		op, _, filterColumnTypes, err = planExpressionOperators(helper.expr, columnTypes, op)
 		if err != nil {
-			return nil, errors.Wrapf(err, "unable to columnarize filter expression %q", post.Filter.Expr)
+			return nil, pgerror.Wrapf(err, pgerror.CodeDataExceptionError,
+				"unable to columnarize filter expression %q", post.Filter.Expr)
 		}
 		if len(filterColumnTypes) > len(columnTypes) {
 			// Additional columns were appended to store projection results while
@@ -318,7 +406,8 @@ func newColOperator(
 		op = exec.NewSimpleProjectOp(op, post.OutputColumns)
 	} else if post.RenderExprs != nil {
 		if columnTypes == nil {
-			return nil, errors.New("unable to columnarize projection. columnTypes is unset")
+			return nil, pgerror.NewErrorf(pgerror.CodeDataExceptionError,
+				"unable to columnarize projection. columnTypes is unset")
 		}
 		var renderedCols []uint32
 		for _, expr := range post.RenderExprs {
@@ -330,10 +419,11 @@ func newColOperator(
 			var outputIdx int
 			op, outputIdx, columnTypes, err = planExpressionOperators(helper.expr, columnTypes, op)
 			if err != nil {
-				return nil, errors.Wrapf(err, "unable to columnarize render expression %q", expr)
+				return nil, pgerror.Wrapf(err, pgerror.CodeDataExceptionError,
+					"unable to columnarize render expression %q", expr)
 			}
 			if outputIdx < 0 {
-				return nil, errors.New("missing outputIdx")
+				return nil, pgerror.NewAssertionErrorf("missing outputIdx")
 			}
 			renderedCols = append(renderedCols, uint32(outputIdx))
 		}

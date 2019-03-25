@@ -29,6 +29,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
+	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
 	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
 )
@@ -69,10 +70,10 @@ func init() {
 }
 
 var kvMeta = workload.Meta{
-	Name: `kv`,
-	Description: `
-	KV reads and writes to keys spread (by default, uniformly at random) across
-	the cluster.
+	Name:        `kv`,
+	Description: `KV reads and writes to keys spread randomly across the cluster.`,
+	Details: `
+	By default, keys are picked uniformly at random across the cluster.
 	--concurrency workers alternate between doing selects and upserts (according
 	to a --read-percent ratio). Each select/upsert reads/writes a batch of --batch
 	rows. The write keys are randomly generated in a deterministic fashion (or
@@ -81,7 +82,8 @@ var kvMeta = workload.Meta{
 	--write-seq can be used to incorporate data produced by a previous run into
 	the current run.
 	`,
-	Version: `1.0.0`,
+	Version:      `1.0.0`,
+	PublicFacing: true,
 	New: func() workload.Generator {
 		g := &kv{}
 		g.flags.FlagSet = pflag.NewFlagSet(`kv`, pflag.ContinueOnError)
@@ -92,7 +94,7 @@ var kvMeta = workload.Meta{
 			`Number of blocks to read/insert in a single SQL statement.`)
 		g.flags.IntVar(&g.minBlockSizeBytes, `min-block-bytes`, 1,
 			`Minimum amount of raw data written with each insertion.`)
-		g.flags.IntVar(&g.maxBlockSizeBytes, `max-block-bytes`, 2,
+		g.flags.IntVar(&g.maxBlockSizeBytes, `max-block-bytes`, 1,
 			`Maximum amount of raw data written with each insertion`)
 		g.flags.Int64Var(&g.cycleLength, `cycle-length`, math.MaxInt64,
 			`Number of keys repeatedly accessed by each writer through upserts.`)
@@ -175,7 +177,7 @@ func (w *kv) Tables() []workload.Table {
 }
 
 // Ops implements the Opser interface.
-func (w *kv) Ops(urls []string, reg *workload.HistogramRegistry) (workload.QueryLoad, error) {
+func (w *kv) Ops(urls []string, reg *histogram.Registry) (workload.QueryLoad, error) {
 	writeSeq := 0
 	if w.writeSeq != "" {
 		first := w.writeSeq[0]
@@ -271,7 +273,7 @@ func (w *kv) Ops(urls []string, reg *workload.HistogramRegistry) (workload.Query
 
 type kvOp struct {
 	config          *kv
-	hists           *workload.Histograms
+	hists           *histogram.Histograms
 	sr              workload.SQLRunner
 	readStmt        workload.StmtHandle
 	writeStmt       workload.StmtHandle
@@ -489,7 +491,7 @@ func (g *zipfGenerator) sequence() int64 {
 }
 
 func randomBlock(config *kv, r *rand.Rand) []byte {
-	blockSize := r.Intn(config.maxBlockSizeBytes-config.minBlockSizeBytes) + config.minBlockSizeBytes
+	blockSize := r.Intn(config.maxBlockSizeBytes-config.minBlockSizeBytes+1) + config.minBlockSizeBytes
 	blockData := make([]byte, blockSize)
 	uniqueSize := int(float64(blockSize) / config.targetCompressionRatio)
 	if uniqueSize < 1 {

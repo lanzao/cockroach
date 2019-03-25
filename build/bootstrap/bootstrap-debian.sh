@@ -25,7 +25,8 @@ sudo apt-get install -y --no-install-recommends \
   g++ \
   git \
   nodejs \
-  yarn
+  yarn \
+  bison
 
 sudo adduser "${USER}" docker
 
@@ -37,9 +38,9 @@ echo '. ~/.bashrc_bootstrap' >> ~/.bashrc
 
 # Install Go.
 trap 'rm -f /tmp/go.tgz' EXIT
-curl https://dl.google.com/go/go1.11.4.linux-amd64.tar.gz > /tmp/go.tgz
+curl https://dl.google.com/go/go1.11.6.linux-amd64.tar.gz > /tmp/go.tgz
 sha256sum -c - <<EOF
-fb26c30e6a04ad937bbc657a1b5bba92f80096af1e8ee6da6430c045a8db3a5b  /tmp/go.tgz
+4e1864282d8d20010d6385a12a1e35641783a380a7c57907bfb46a5499c5eb49  /tmp/go.tgz
 EOF
 sudo tar -C /usr/local -zxf /tmp/go.tgz
 

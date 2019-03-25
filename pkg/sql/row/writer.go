@@ -717,7 +717,7 @@ func (ru *Updater) UpdateRow(
 		ru.marshaled, ru.UpdateColIDtoRowIndex,
 		&ru.key, &ru.value, ru.valueBuf, insertPutFn, true /* overwrite */, traceKV)
 	if err != nil {
-		return ru.newValues, nil
+		return nil, err
 	}
 
 	// Update secondary indexes.
@@ -752,9 +752,15 @@ func (ru *Updater) UpdateRow(
 		}
 
 		if traceKV {
-			log.VEventf(ctx, 2, "CPut %s -> %v", keys.PrettyPrint(ru.Helper.secIndexValDirs[i], newSecondaryIndexEntry.Key), newSecondaryIndexEntry.Value.PrettyPrint())
+			k := keys.PrettyPrint(ru.Helper.secIndexValDirs[i], newSecondaryIndexEntry.Key)
+			v := newSecondaryIndexEntry.Value.PrettyPrint()
+			if expValue != nil {
+				log.VEventf(ctx, 2, "CPut %s -> %v (replacing %v, if exists)", k, v, expValue)
+			} else {
+				log.VEventf(ctx, 2, "CPut %s -> %v (expecting does not exist)", k, v)
+			}
 		}
-		batch.CPut(newSecondaryIndexEntry.Key, &newSecondaryIndexEntry.Value, expValue)
+		batch.CPutAllowingIfNotExists(newSecondaryIndexEntry.Key, &newSecondaryIndexEntry.Value, expValue)
 	}
 
 	// We're deleting indexes in a delete only state. We're bounding this by the number of indexes because inverted
@@ -802,11 +808,10 @@ func (ru *Updater) UpdateRow(
 		if err := ru.Fks.addIndexChecks(ctx, oldValues, ru.newValues, traceKV); err != nil {
 			return nil, err
 		}
-		if !ru.Fks.hasFKs() {
-			return ru.newValues, nil
-		}
-		if err := ru.Fks.checker.runCheck(ctx, oldValues, ru.newValues); err != nil {
-			return nil, err
+		if ru.Fks.hasFKs() {
+			if err := ru.Fks.checker.runCheck(ctx, oldValues, ru.newValues); err != nil {
+				return nil, err
+			}
 		}
 	}
 

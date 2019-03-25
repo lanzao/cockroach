@@ -28,7 +28,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/fsm"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/lib/pq/oid"
-	"github.com/pkg/errors"
 )
 
 func (ex *connExecutor) execPrepare(
@@ -142,7 +141,6 @@ func (ex *connExecutor) prepare(
 		return prepared, nil
 	}
 	prepared.Statement = stmt.Statement
-	prepared.AnonymizedStr = anonymizeStmt(&stmt)
 
 	// Point to the prepared state, which can be further populated during query
 	// preparation.
@@ -159,7 +157,7 @@ func (ex *connExecutor) prepare(
 	txn := client.NewTxn(ctx, ex.server.cfg.DB, ex.server.cfg.NodeID.Get(), client.RootTxn)
 
 	p := &ex.planner
-	ex.resetPlanner(ctx, p, txn, ex.server.cfg.Clock.PhysicalTime() /* stmtTimestamp */)
+	ex.resetPlanner(ctx, p, txn, ex.server.cfg.Clock.PhysicalTime() /* stmtTS */)
 	p.stmt = &stmt
 	flags, err := ex.populatePrepared(ctx, txn, placeholderHints, p)
 	if err != nil {
@@ -232,8 +230,9 @@ func (ex *connExecutor) populatePrepared(
 	// Fallback on the heuristic planner if the optimizer was not enabled or used:
 	// create a plan for the statement to figure out the typing, then close the
 	// plan.
+	prepared.AnonymizedStr = anonymizeStmt(stmt.AST)
 	if err := p.prepare(ctx, stmt.AST); err != nil {
-		enhanceErrWithCorrelation(err, isCorrelated)
+		err = enhanceErrWithCorrelation(err, isCorrelated)
 		return 0, err
 	}
 
@@ -346,11 +345,11 @@ func (ex *connExecutor) execBind(
 			} else {
 				d, err := pgwirebase.DecodeOidDatum(ptCtx, t, qArgFormatCodes[i], arg)
 				if err != nil {
-					if _, ok := err.(*pgerror.Error); ok {
+					if _, ok := pgerror.GetPGCause(err); ok {
 						return retErr(err)
 					}
-					return retErr(pgwirebase.NewProtocolViolationErrorf(
-						"error in argument for %s: %s", k, err.Error()))
+					return retErr(pgerror.Wrapf(err, pgerror.CodeProtocolViolationError,
+						"error in argument for %s", k))
 
 				}
 				qargs[k] = d
@@ -495,7 +494,8 @@ func (ex *connExecutor) execDescribe(
 			res.SetPortalOutput(ctx, portal.Stmt.Columns, portal.OutFormats)
 		}
 	default:
-		return retErr(errors.Errorf("unknown describe type: %s", descCmd.Type))
+		return retErr(pgerror.NewAssertionErrorf(
+			"unknown describe type: %s", log.Safe(descCmd.Type)))
 	}
 	return nil, nil
 }

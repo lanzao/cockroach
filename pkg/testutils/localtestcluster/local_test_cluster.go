@@ -51,20 +51,19 @@ import (
 // Note that the LocalTestCluster is different from server.TestCluster
 // in that although it uses a distributed sender, there is no RPC traffic.
 type LocalTestCluster struct {
-	Cfg                      storage.StoreConfig
-	Manual                   *hlc.ManualClock
-	Clock                    *hlc.Clock
-	Gossip                   *gossip.Gossip
-	Eng                      engine.Engine
-	Store                    *storage.Store
-	StoreTestingKnobs        *storage.StoreTestingKnobs
-	DBContext                *client.DBContext
-	DB                       *client.DB
-	Stores                   *storage.Stores
-	Stopper                  *stop.Stopper
-	Latency                  time.Duration // sleep for each RPC sent
-	tester                   testing.TB
-	DontRetryPushTxnFailures bool
+	Cfg               storage.StoreConfig
+	Manual            *hlc.ManualClock
+	Clock             *hlc.Clock
+	Gossip            *gossip.Gossip
+	Eng               engine.Engine
+	Store             *storage.Store
+	StoreTestingKnobs *storage.StoreTestingKnobs
+	DBContext         *client.DBContext
+	DB                *client.DB
+	Stores            *storage.Stores
+	Stopper           *stop.Stopper
+	Latency           time.Duration // sleep for each RPC sent
+	tester            testing.TB
 
 	// DisableLivenessHeartbeat, if set, inhibits the heartbeat loop. Some tests
 	// need this because, for example, the heartbeat loop increments some
@@ -143,7 +142,6 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 	} else {
 		cfg.TestingKnobs = *ltc.StoreTestingKnobs
 	}
-	cfg.DontRetryPushTxnFailures = ltc.DontRetryPushTxnFailures
 	cfg.AmbientCtx = ambient
 	cfg.DB = ltc.DB
 	cfg.Gossip = ltc.Gossip
@@ -174,10 +172,10 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 	cfg.TimestampCachePageSize = tscache.TestSklPageSize
 	ctx := context.TODO()
 
-	if err := storage.Bootstrap(ctx, ltc.Eng, roachpb.StoreIdent{NodeID: nodeID, StoreID: 1}, cfg.Settings.Version.BootstrapVersion()); err != nil {
+	if err := storage.InitEngine(ctx, ltc.Eng, roachpb.StoreIdent{NodeID: nodeID, StoreID: 1}, cfg.Settings.Version.BootstrapVersion()); err != nil {
 		t.Fatalf("unable to start local test cluster: %s", err)
 	}
-	ltc.Store = storage.NewStore(cfg, ltc.Eng, nodeDesc)
+	ltc.Store = storage.NewStore(ctx, cfg, ltc.Eng, nodeDesc)
 
 	var initialValues []roachpb.KeyValue
 	var splits []roachpb.RKey
@@ -191,12 +189,14 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 		})
 	}
 
-	if err := ltc.Store.WriteInitialData(
+	if err := storage.WriteInitialClusterData(
 		ctx,
+		ltc.Eng,
 		initialValues,
 		cfg.Settings.Version.ServerVersion,
 		1, /* numStores */
 		splits,
+		ltc.Clock.PhysicalNow(),
 	); err != nil {
 		t.Fatalf("unable to start local test cluster: %s", err)
 	}

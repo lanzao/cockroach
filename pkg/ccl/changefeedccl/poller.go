@@ -10,7 +10,6 @@ package changefeedccl
 
 import (
 	"context"
-	"fmt"
 	"sort"
 	"sync/atomic"
 	"time"
@@ -24,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
@@ -264,7 +264,7 @@ func (p *poller) rangefeedImpl(ctx context.Context) error {
 		// `tableHist` is responsible for detecting and enforcing these (they queue
 		// up in `p.scanBoundaries`), but the after-poller buffer doesn't have
 		// access to any of this state. A cleanup is in order.
-		memBuf := makeMemBuffer(p.mm.MakeBoundAccount())
+		memBuf := makeMemBuffer(p.mm.MakeBoundAccount(), p.metrics)
 		defer memBuf.Close(ctx)
 
 		// Maintain a local spanfrontier to tell when all the component rangefeeds
@@ -288,7 +288,7 @@ func (p *poller) rangefeedImpl(ctx context.Context) error {
 			}
 			frontier.Forward(span, lastHighwater)
 			g.GoCtx(func(ctx context.Context) error {
-				return ds.RangeFeed(ctx, req, eventC).GoError()
+				return ds.RangeFeed(ctx, req, eventC)
 			})
 		}
 		g.GoCtx(func(ctx context.Context) error {
@@ -383,7 +383,8 @@ func getSpansToProcess(
 		ranges, err = allRangeDescriptors(ctx, txn)
 		return err
 	}); err != nil {
-		return nil, errors.Wrap(err, "fetching range descriptors")
+		return nil, pgerror.Wrapf(err, pgerror.CodeDataExceptionError,
+			"fetching range descriptors")
 	}
 
 	type spanMarker struct{}
@@ -496,7 +497,8 @@ func (p *poller) exportSpan(
 	}
 
 	if pErr != nil {
-		return errors.Wrapf(pErr.GoError(), `fetching changes for %s`, span)
+		return pgerror.Wrapf(pErr.GoError(), pgerror.CodeDataExceptionError,
+			`fetching changes for %s`, span)
 	}
 	p.metrics.PollRequestNanosHist.RecordValue(exportDuration.Nanoseconds())
 
@@ -621,7 +623,8 @@ func allRangeDescriptors(ctx context.Context, txn *client.Txn) ([]roachpb.RangeD
 	rangeDescs := make([]roachpb.RangeDescriptor, len(rows))
 	for i, row := range rows {
 		if err := row.ValueProto(&rangeDescs[i]); err != nil {
-			return nil, errors.Wrapf(err, "%s: unable to unmarshal range descriptor", row.Key)
+			return nil, pgerror.NewAssertionErrorWithWrappedErrf(err,
+				"%s: unable to unmarshal range descriptor", row.Key)
 		}
 	}
 	return rangeDescs, nil
@@ -653,12 +656,12 @@ func (p *poller) validateTable(ctx context.Context, desc *sqlbase.TableDescripto
 			// interesting here.
 			if p.details.StatementTime.Less(boundaryTime) {
 				if boundaryTime.Less(p.mu.highWater) {
-					return fmt.Errorf(
+					return pgerror.NewAssertionErrorf(
 						"error: detected table ID %d backfill completed at %s "+
 							"earlier than highwater timestamp %s",
-						desc.ID,
-						boundaryTime,
-						p.mu.highWater,
+						log.Safe(desc.ID),
+						log.Safe(boundaryTime),
+						log.Safe(p.mu.highWater),
 					)
 				}
 				p.mu.scanBoundaries = append(p.mu.scanBoundaries, boundaryTime)

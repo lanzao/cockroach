@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
+	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
 	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
 )
@@ -69,7 +70,7 @@ var tpchMeta = workload.Meta{
 		g.flags.Int64Var(&g.seed, `seed`, 1, `Random number generator seed`)
 		g.flags.IntVar(&g.scaleFactor, `scale-factor`, 1,
 			`Linear scale of how much data to use (each SF is ~1GB)`)
-		g.flags.StringVar(&g.queriesRaw, `queries`, `1,3,7,8,9,19`,
+		g.flags.StringVar(&g.queriesRaw, `queries`, `1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22`,
 			`Queries to run. Use a comma separated list of query numbers`)
 		g.flags.BoolVar(&g.distsql, `dist-sql`, true, `Use DistSQL for query execution`)
 		g.connFlags = workload.NewConnFlags(&g.flags)
@@ -148,7 +149,7 @@ func (w *tpch) Tables() []workload.Table {
 }
 
 // Ops implements the Opser interface.
-func (w *tpch) Ops(urls []string, reg *workload.HistogramRegistry) (workload.QueryLoad, error) {
+func (w *tpch) Ops(urls []string, reg *histogram.Registry) (workload.QueryLoad, error) {
 	sqlDatabase, err := workload.SanitizeUrls(w, w.connFlags.DBOverride, urls)
 	if err != nil {
 		return workload.QueryLoad{}, err
@@ -175,7 +176,7 @@ func (w *tpch) Ops(urls []string, reg *workload.HistogramRegistry) (workload.Que
 
 type worker struct {
 	config *tpch
-	hists  *workload.Histograms
+	hists  *histogram.Histograms
 	db     *gosql.DB
 	ops    int
 }

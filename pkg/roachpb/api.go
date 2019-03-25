@@ -383,10 +383,13 @@ func (h *BatchResponse_Header) combine(o BatchResponse_Header) error {
 		)
 	}
 	h.Timestamp.Forward(o.Timestamp)
-	if h.Txn == nil {
-		h.Txn = o.Txn
-	} else {
-		h.Txn.Update(o.Txn)
+	if txn := o.Txn; txn != nil {
+		if h.Txn == nil {
+			txnClone := txn.Clone()
+			h.Txn = &txnClone
+		} else {
+			h.Txn.Update(txn)
+		}
 	}
 	h.Now.Forward(o.Now)
 	h.CollectedSpans = append(h.CollectedSpans, o.CollectedSpans...)
@@ -873,7 +876,7 @@ func NewPutInline(key Key, value Value) Request {
 
 // NewConditionalPut returns a Request initialized to put value as a byte
 // slice at key if the existing value at key equals expValueBytes.
-func NewConditionalPut(key Key, value, expValue Value) Request {
+func NewConditionalPut(key Key, value, expValue Value, allowNotExist bool) Request {
 	value.InitChecksum(key)
 	var expValuePtr *Value
 	if expValue.RawBytes != nil {
@@ -886,8 +889,9 @@ func NewConditionalPut(key Key, value, expValue Value) Request {
 		RequestHeader: RequestHeader{
 			Key: key,
 		},
-		Value:    value,
-		ExpValue: expValuePtr,
+		Value:               value,
+		ExpValue:            expValuePtr,
+		AllowIfDoesNotExist: allowNotExist,
 	}
 }
 

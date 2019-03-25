@@ -16,10 +16,12 @@ package sql
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -32,6 +34,14 @@ import (
 	"github.com/pkg/errors"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+)
+
+// createStatsPostEvents controls the cluster setting for enabling
+// automatic table statistics collection.
+var createStatsPostEvents = settings.RegisterBoolSetting(
+	"sql.stats.post_events.enabled",
+	"if set, an event is shown for every CREATE STATISTICS job",
+	false,
 )
 
 func (p *planner) CreateStatistics(ctx context.Context, n *tree.CreateStats) (planNode, error) {
@@ -91,12 +101,14 @@ func (*createStatsNode) Values() tree.Datums   { return nil }
 // startJob starts a CreateStats job to plan and execute statistics creation.
 func (n *createStatsNode) startJob(ctx context.Context, resultsCh chan<- tree.Datums) error {
 	if !n.p.ExecCfg().Settings.Version.IsActive(cluster.VersionCreateStats) {
-		return errors.Errorf(`CREATE STATISTICS requires all nodes to be upgraded to %s`,
+		return pgerror.NewErrorf(pgerror.CodeObjectNotInPrerequisiteStateError,
+			`CREATE STATISTICS requires all nodes to be upgraded to %s`,
 			cluster.VersionByKey(cluster.VersionCreateStats),
 		)
 	}
 
 	var tableDesc *ImmutableTableDescriptor
+	var fqTableName string
 	var err error
 	switch t := n.Table.(type) {
 	case *tree.TableName:
@@ -107,12 +119,17 @@ func (n *createStatsNode) startJob(ctx context.Context, resultsCh chan<- tree.Da
 		if err != nil {
 			return err
 		}
+		fqTableName = t.FQString()
 
 	case *tree.TableRef:
 		flags := ObjectLookupFlags{CommonLookupFlags: CommonLookupFlags{
 			avoidCached: n.p.avoidCachedDescriptors,
 		}}
 		tableDesc, err = n.p.Tables().getTableVersionByID(ctx, n.p.txn, sqlbase.ID(t.TableID), flags)
+		if err != nil {
+			return err
+		}
+		fqTableName, err = n.p.getQualifiedTableName(ctx, &tableDesc.TableDescriptor)
 		if err != nil {
 			return err
 		}
@@ -144,6 +161,10 @@ func (n *createStatsNode) startJob(ctx context.Context, resultsCh chan<- tree.Da
 
 		columnIDs := make([]sqlbase.ColumnID, len(columns))
 		for i := range columns {
+			if columns[i].Type.SemanticType == sqlbase.ColumnType_JSONB {
+				return pgerror.UnimplementedWithIssueErrorf(35844,
+					"CREATE STATISTICS is not supported for JSON columns")
+			}
 			columnIDs[i] = columns[i].ID
 		}
 		createStatsColLists = []jobspb.CreateStatsDetails_ColList{{IDs: columnIDs}}
@@ -170,11 +191,24 @@ func (n *createStatsNode) startJob(ctx context.Context, resultsCh chan<- tree.Da
 	}
 
 	// Create a job to run statistics creation.
+	statement := tree.AsStringWithFlags(n, tree.FmtAlwaysQualifyTableNames)
+	var description string
+	if n.Name == stats.AutoStatsName {
+		// Use a user-friendly description for automatic statistics.
+		description = fmt.Sprintf("Table statistics refresh for %s", fqTableName)
+	} else {
+		// This must be a user query, so use the statement (for consistency with
+		// other jobs triggered by statements).
+		description = statement
+		statement = ""
+	}
 	_, errCh, err := n.p.ExecCfg().JobRegistry.StartJob(ctx, resultsCh, jobs.Record{
-		Description: tree.AsStringWithFlags(n, tree.FmtAlwaysQualifyTableNames),
+		Description: description,
+		Statement:   statement,
 		Username:    n.p.User(),
 		Details: jobspb.CreateStatsDetails{
-			Name:        n.Name,
+			Name:        string(n.Name),
+			FQTableName: fqTableName,
 			Table:       tableDesc.TableDescriptor,
 			ColumnLists: createStatsColLists,
 			Statement:   n.String(),
@@ -188,6 +222,10 @@ func (n *createStatsNode) startJob(ctx context.Context, resultsCh chan<- tree.Da
 	return <-errCh
 }
 
+// maxNonIndexCols is the maximum number of non-index columns that we will use
+// when choosing a default set of column statistics.
+const maxNonIndexCols = 100
+
 // createStatsDefaultColumns creates column statistics on a default set of
 // column lists when no columns were specified by the caller.
 //
@@ -198,6 +236,10 @@ func (n *createStatsNode) startJob(ctx context.Context, resultsCh chan<- tree.Da
 // useful to have statistics on prefixes of those columns. For example, if a
 // table abc contains indexes on (a ASC, b ASC) and (b ASC, c ASC), we will
 // collect statistics on a, {a, b}, b, and {b, c}.
+//
+// In addition to the index columns, we collect stats on up to maxNonIndexCols
+// other columns from the table.
+//
 // TODO(rytaft): This currently only generates one single-column stat per
 // index. Add code to collect multi-column stats once they are supported.
 func createStatsDefaultColumns(
@@ -207,15 +249,17 @@ func createStatsDefaultColumns(
 
 	var requestedCols util.FastIntSet
 
-	// If the primary key is not the hidden rowid column, collect stats on it.
+	// Add a column for the primary key.
 	pkCol := desc.PrimaryIndex.ColumnIDs[0]
-	if !isHidden(desc, pkCol) {
-		columns = append(columns, jobspb.CreateStatsDetails_ColList{IDs: []sqlbase.ColumnID{pkCol}})
-		requestedCols.Add(int(pkCol))
-	}
+	columns = append(columns, jobspb.CreateStatsDetails_ColList{IDs: []sqlbase.ColumnID{pkCol}})
+	requestedCols.Add(int(pkCol))
 
 	// Add columns for each secondary index.
 	for i := range desc.Indexes {
+		if desc.Indexes[i].Type == sqlbase.IndexDescriptor_INVERTED {
+			// We don't yet support stats on inverted indexes.
+			continue
+		}
 		idxCol := desc.Indexes[i].ColumnIDs[0]
 		if !requestedCols.Contains(int(idxCol)) {
 			columns = append(
@@ -225,34 +269,19 @@ func createStatsDefaultColumns(
 		}
 	}
 
-	// If there are no non-hidden index columns, collect stats on the first
-	// non-hidden column in the table.
-	if len(columns) == 0 {
-		for i := range desc.Columns {
-			if !desc.Columns[i].IsHidden() {
-				columns = append(
-					columns, jobspb.CreateStatsDetails_ColList{IDs: []sqlbase.ColumnID{desc.Columns[i].ID}},
-				)
-				break
-			}
+	// Add all remaining non-json columns in the table, up to maxNonIndexCols.
+	nonIdxCols := 0
+	for i := 0; i < len(desc.Columns) && nonIdxCols < maxNonIndexCols; i++ {
+		col := &desc.Columns[i]
+		if col.Type.SemanticType != sqlbase.ColumnType_JSONB && !requestedCols.Contains(int(col.ID)) {
+			columns = append(
+				columns, jobspb.CreateStatsDetails_ColList{IDs: []sqlbase.ColumnID{col.ID}},
+			)
+			nonIdxCols++
 		}
-	}
-
-	// If there are still no columns, return an error.
-	if len(columns) == 0 {
-		return nil, errors.New("CREATE STATISTICS called on a table with no visible columns")
 	}
 
 	return columns, nil
-}
-
-func isHidden(desc *ImmutableTableDescriptor, columnID sqlbase.ColumnID) bool {
-	for i := range desc.Columns {
-		if desc.Columns[i].ID == columnID {
-			return desc.Columns[i].IsHidden()
-		}
-	}
-	panic("column not found in table")
 }
 
 // createStatsResumer implements the jobs.Resumer interface for CreateStats
@@ -297,8 +326,10 @@ func (r *createStatsResumer) Resume(
 			txn.SetFixedTimestamp(ctx, *details.AsOf)
 		}
 
+		planCtx := dsp.NewPlanningCtx(ctx, r.evalCtx, txn)
+		planCtx.planner = p
 		if err := dsp.planAndRunCreateStats(
-			ctx, r.evalCtx, txn, job, NewRowResultWriter(rows),
+			ctx, r.evalCtx, planCtx, txn, job, NewRowResultWriter(rows),
 		); err != nil {
 			// Check if this was a context canceled error and restart if it was.
 			if s, ok := status.FromError(errors.Cause(err)); ok {
@@ -331,18 +362,24 @@ func (r *createStatsResumer) Resume(
 }
 
 // checkRunningJobs checks whether there are any other CreateStats jobs in the
-// pending or running status that started earlier than this one. If there are,
-// checkRunningJobs returns an error. If job is nil, checkRunningJobs just
-// checks if there are any pending or running CreateStats jobs.
+// pending, running, or paused status that started earlier than this one. If
+// there are, checkRunningJobs returns an error. If job is nil, checkRunningJobs
+// just checks if there are any pending, running, or paused CreateStats jobs.
 func checkRunningJobs(ctx context.Context, job *jobs.Job, p *planner) error {
 	var jobID int64
 	if job != nil {
 		jobID = *job.ID()
 	}
-	const stmt = `SELECT id, payload FROM system.jobs WHERE status IN ($1, $2) ORDER BY created`
+	const stmt = `SELECT id, payload FROM system.jobs WHERE status IN ($1, $2, $3) ORDER BY created`
 
 	rows, err := p.ExecCfg().InternalExecutor.Query(
-		ctx, "get-jobs", nil /* txn */, stmt, jobs.StatusPending, jobs.StatusRunning,
+		ctx,
+		"get-jobs",
+		nil, /* txn */
+		stmt,
+		jobs.StatusPending,
+		jobs.StatusRunning,
+		jobs.StatusPaused,
 	)
 	if err != nil {
 		return err
@@ -354,7 +391,7 @@ func checkRunningJobs(ctx context.Context, job *jobs.Job, p *planner) error {
 			return err
 		}
 
-		if payload.Type() == jobspb.TypeCreateStats {
+		if payload.Type() == jobspb.TypeCreateStats || payload.Type() == jobspb.TypeAutoCreateStats {
 			id := (*int64)(row[0].(*tree.DInt))
 			if *id == jobID {
 				break
@@ -380,6 +417,10 @@ func (r *createStatsResumer) OnFailOrCancel(
 // OnSuccess is part of the jobs.Resumer interface.
 func (r *createStatsResumer) OnSuccess(ctx context.Context, _ *client.Txn, job *jobs.Job) error {
 	details := job.Details().(jobspb.CreateStatsDetails)
+
+	if !createStatsPostEvents.Get(&r.evalCtx.Settings.SV) {
+		return nil
+	}
 	// Record this statistics creation in the event log.
 	// TODO(rytaft): This creates a new transaction for the CREATE STATISTICS
 	// event. It must be different from the CREATE STATISTICS transaction,
@@ -395,9 +436,9 @@ func (r *createStatsResumer) OnSuccess(ctx context.Context, _ *client.Txn, job *
 			int32(details.Table.ID),
 			int32(r.evalCtx.NodeID),
 			struct {
-				StatisticName string
-				Statement     string
-			}{details.Name.String(), details.Statement},
+				TableName string
+				Statement string
+			}{details.FQTableName, details.Statement},
 		)
 	})
 }
@@ -410,7 +451,7 @@ func (r *createStatsResumer) OnTerminal(
 
 func init() {
 	jobs.AddResumeHook(func(typ jobspb.Type, settings *cluster.Settings) jobs.Resumer {
-		if typ != jobspb.TypeCreateStats {
+		if typ != jobspb.TypeCreateStats && typ != jobspb.TypeAutoCreateStats {
 			return nil
 		}
 		return &createStatsResumer{}

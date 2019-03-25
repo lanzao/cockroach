@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
@@ -246,7 +247,7 @@ var varGen = map[string]sessionVar{
 			// set to int4 by a connection string.
 			// TODO(bob): Change to 8 in v2.3: https://github.com/cockroachdb/cockroach/issues/32534
 			if i == 4 {
-				telemetry.Count("sql.default_int_size.4")
+				telemetry.Inc(sqltelemetry.DefaultIntSize4Counter)
 			}
 			m.SetDefaultIntSize(int(i))
 			return nil
@@ -338,16 +339,20 @@ var varGen = map[string]sessionVar{
 		Get: func(evalCtx *extendedEvalContext) string {
 			return formatBoolAsPostgresSetting(evalCtx.SessionData.ZigzagJoinEnabled)
 		},
-		GlobalDefault: globalFalse,
+		GlobalDefault: globalTrue,
 	},
 
 	// CockroachDB extension.
-	`experimental_reorder_joins_limit`: {
-		GetStringVal: makeIntGetStringValFn(`experimental_reorder_joins_limit`),
+	`reorder_joins_limit`: {
+		GetStringVal: makeIntGetStringValFn(`reorder_joins_limit`),
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
 			b, err := strconv.ParseInt(s, 10, 64)
 			if err != nil {
 				return err
+			}
+			if b < 0 {
+				return pgerror.NewErrorf(pgerror.CodeInvalidParameterValueError,
+					"cannot set reorder_joins_limit to a negative value: %d", b)
 			}
 			m.SetReorderJoinsLimit(int(b))
 			return nil
@@ -456,7 +461,7 @@ var varGen = map[string]sessionVar{
 				return err
 			}
 			if b {
-				telemetry.Count("sql.force_savepoint_restart")
+				telemetry.Inc(sqltelemetry.ForceSavepointRestartCounter)
 			}
 			m.SetForceSavepointRestart(b)
 			return nil
@@ -749,6 +754,7 @@ func displayPgBool(val bool) func(_ *settings.Values) string {
 	return func(_ *settings.Values) string { return strVal }
 }
 
+var globalTrue = displayPgBool(true)
 var globalFalse = displayPgBool(false)
 
 func makeCompatBoolVar(varName string, displayValue, anyValAllowed bool) sessionVar {
@@ -758,12 +764,12 @@ func makeCompatBoolVar(varName string, displayValue, anyValAllowed bool) session
 		Set: func(_ context.Context, m *sessionDataMutator, s string) error {
 			b, err := parsePostgresBool(s)
 			if err != nil {
-				return pgerror.NewErrorf(pgerror.CodeInvalidParameterValueError, "%v", err)
+				return pgerror.Wrapf(err, pgerror.CodeInvalidParameterValueError, "")
 			}
 			if anyValAllowed || b == displayValue {
 				return nil
 			}
-			telemetry.Count(fmt.Sprintf("unimplemented.sql.session_var.%s.%s", varName, s))
+			telemetry.Inc(sqltelemetry.UnimplementedSessionVarValueCounter(varName, s))
 			allowedVals := []string{displayValStr}
 			if anyValAllowed {
 				allowedVals = append(allowedVals, formatBoolAsPostgresSetting(!displayValue))
@@ -799,7 +805,7 @@ func makeCompatStringVar(varName, displayValue string, extraAllowed ...string) s
 					return nil
 				}
 			}
-			telemetry.Count(fmt.Sprintf("unimplemented.sql.session_var.%s.%s", varName, s))
+			telemetry.Inc(sqltelemetry.UnimplementedSessionVarValueCounter(varName, s))
 			return newVarValueError(varName, s, allowedVals...).SetDetailf(
 				"this parameter is currently recognized only for compatibility and has no effect in CockroachDB.")
 		},
@@ -853,4 +859,52 @@ func getSingleBool(
 			"%s is a %s", values[0], val.ResolvedType())
 	}
 	return b, nil
+}
+
+func getSessionVar(name string, missingOk bool) (bool, sessionVar, error) {
+	if _, ok := UnsupportedVars[name]; ok {
+		return false, sessionVar{}, pgerror.Unimplemented("set."+name,
+			"the configuration setting %q is not supported", name)
+	}
+
+	v, ok := varGen[name]
+	if !ok {
+		if missingOk {
+			return false, sessionVar{}, nil
+		}
+		return false, sessionVar{}, pgerror.NewErrorf(pgerror.CodeUndefinedObjectError,
+			"unrecognized configuration parameter %q", name)
+	}
+
+	return true, v, nil
+}
+
+// GetSessionVar implements the EvalSessionAccessor interface.
+func (p *planner) GetSessionVar(
+	_ context.Context, varName string, missingOk bool,
+) (bool, string, error) {
+	name := strings.ToLower(varName)
+	ok, v, err := getSessionVar(name, missingOk)
+	if err != nil || !ok {
+		return ok, "", err
+	}
+
+	return true, v.Get(&p.extendedEvalCtx), nil
+}
+
+// SetSessionVar implements the EvalSessionAccessor interface.
+func (p *planner) SetSessionVar(ctx context.Context, varName, newVal string) error {
+	name := strings.ToLower(varName)
+	_, v, err := getSessionVar(name, false /* missingOk */)
+	if err != nil {
+		return err
+	}
+
+	if v.Set == nil && v.RuntimeSet == nil {
+		return newCannotChangeParameterError(name)
+	}
+	if v.RuntimeSet != nil {
+		return v.RuntimeSet(ctx, &p.extendedEvalCtx, newVal)
+	}
+	return v.Set(ctx, p.sessionDataMutator, newVal)
 }

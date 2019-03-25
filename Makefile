@@ -62,8 +62,11 @@ TESTCONFIG :=
 ## if they are provided.
 SUBTESTS :=
 
+## Test timeout to use for the linter.
+LINTTIMEOUT := 20m
+
 ## Test timeout to use for regular tests.
-TESTTIMEOUT := 8m
+TESTTIMEOUT := 12m
 
 ## Test timeout to use for race tests.
 RACETIMEOUT := 25m
@@ -448,11 +451,12 @@ C_LIBS_COMMON = $(if $(use-stdmalloc),,$(LIBJEMALLOC)) $(LIBPROTOBUF) $(LIBSNAPP
 C_LIBS_OSS = $(C_LIBS_COMMON) $(LIBROACH)
 C_LIBS_CCL = $(C_LIBS_COMMON) $(LIBCRYPTOPP) $(LIBROACHCCL)
 
-# We only include krb5 on linux.
-ifeq "$(findstring linux,$(TARGET_TRIPLE))" "linux"
+# We only include krb5 on linux, non-musl builds.
+ifeq "$(findstring linux-gnu,$(TARGET_TRIPLE))" "linux-gnu"
 C_LIBS_CCL += $(LIBKRB5)
-KRB_CPPFLAGS := -I$(KRB5_DIR)/include
+KRB_CPPFLAGS := $(KRB5_DIR)/include
 KRB_DIR := $(KRB5_DIR)/lib
+override TAGS += gss
 endif
 
 # Go does not permit dashes in build tags. This is undocumented.
@@ -490,7 +494,7 @@ $(CGO_FLAGS_FILES): Makefile
 	@echo >> $@
 	@echo 'package $(notdir $(@D))' >> $@
 	@echo >> $@
-	@echo '// #cgo CPPFLAGS: -I$(JEMALLOC_DIR)/include $(KRB_CPPFLAGS)' >> $@
+	@echo '// #cgo CPPFLAGS: $(addprefix -I,$(JEMALLOC_DIR)/include $(KRB_CPPFLAGS))' >> $@
 	@echo '// #cgo LDFLAGS: $(addprefix -L,$(CRYPTOPP_DIR) $(PROTOBUF_DIR) $(JEMALLOC_DIR)/lib $(SNAPPY_DIR) $(ROCKSDB_DIR) $(LIBROACH_DIR) $(KRB_DIR))' >> $@
 	@echo 'import "C"' >> $@
 
@@ -602,7 +606,8 @@ $(LIBROACH_DIR)/Makefile: $(C_DEPS_DIR)/libroach-rebuild | bin/.submodules-initi
 	mkdir -p $(LIBROACH_DIR)
 	@# NOTE: If you change the CMake flags below, bump the version in
 	@# $(C_DEPS_DIR)/libroach-rebuild. See above for rationale.
-	cd $(LIBROACH_DIR) && cmake $(xcmake-flags) $(LIBROACH_SRC_DIR) -DCMAKE_BUILD_TYPE=Release \
+	cd $(LIBROACH_DIR) && cmake $(xcmake-flags) $(LIBROACH_SRC_DIR) \
+		-DCMAKE_BUILD_TYPE=$(if $(ENABLE_LIBROACH_ASSERTIONS),Debug,Release) \
 		-DPROTOBUF_LIB=$(LIBPROTOBUF) -DROCKSDB_LIB=$(LIBROCKSDB) \
 		-DJEMALLOC_LIB=$(LIBJEMALLOC) -DSNAPPY_LIB=$(LIBSNAPPY) \
 		-DCRYPTOPP_LIB=$(LIBCRYPTOPP)
@@ -734,15 +739,17 @@ DOCGEN_TARGETS := bin/.docgen_bnfs bin/.docgen_functions
 EXECGEN_TARGETS = \
   pkg/sql/exec/any_not_null_agg.eg.go \
   pkg/sql/exec/avg_agg.eg.go \
-  pkg/sql/exec/colvec.eg.go \
+  pkg/sql/exec/coldata/vec.eg.go \
   pkg/sql/exec/distinct.eg.go \
   pkg/sql/exec/hashjoiner.eg.go \
+  pkg/sql/exec/mergejoiner.eg.go \
   pkg/sql/exec/projection_ops.eg.go \
   pkg/sql/exec/quicksort.eg.go \
   pkg/sql/exec/rowstovec.eg.go \
   pkg/sql/exec/selection_ops.eg.go \
   pkg/sql/exec/sort.eg.go \
-  pkg/sql/exec/sum_agg.eg.go
+  pkg/sql/exec/sum_agg.eg.go \
+  pkg/sql/exec/tuples_differ.eg.go
 
 OPTGEN_TARGETS = \
 	pkg/sql/opt/memo/expr.og.go \
@@ -971,6 +978,8 @@ generate: ## Regenerate generated code.
 generate: protobuf $(DOCGEN_TARGETS) $(EXECGEN_TARGETS) $(OPTGEN_TARGETS) $(SQLPARSER_TARGETS) $(SETTINGS_DOC_PAGE) bin/langgen
 	$(GO) generate $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' $(PKG)
 
+lint lintshort: TESTTIMEOUT := $(LINTTIMEOUT)
+
 .PHONY: lint
 lint: override TAGS += lint
 lint: ## Run all style checkers and linters.
@@ -980,12 +989,12 @@ lint: bin/returncheck
 	@# packages. In Go 1.10, only 'go vet' recompiles on demand. For details:
 	@# https://groups.google.com/forum/#!msg/golang-dev/qfa3mHN4ZPA/X2UzjNV1BAAJ.
 	$(xgo) build -i -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' $(PKG)
-	$(xgo) test ./pkg/testutils/lint -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run 'Lint/$(TESTS)'
+	$(xgo) test ./pkg/testutils/lint -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -timeout $(TESTTIMEOUT) -run 'Lint/$(TESTS)'
 
 .PHONY: lintshort
 lintshort: override TAGS += lint
 lintshort: ## Run a fast subset of the style checkers and linters.
-	$(xgo) test ./pkg/testutils/lint -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -short -run 'TestLint/$(TESTS)'
+	$(xgo) test ./pkg/testutils/lint -v $(GOFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -short -timeout $(TESTTIMEOUT) -run 'TestLint/$(TESTS)'
 
 .PHONY: protobuf
 protobuf: $(PROTOBUF_TARGETS)
@@ -1383,12 +1392,14 @@ $(SETTINGS_DOC_PAGE): $(settings-doc-gen)
 
 pkg/sql/exec/any_not_null_agg.eg.go: pkg/sql/exec/any_not_null_agg_tmpl.go
 pkg/sql/exec/avg_agg.eg.go: pkg/sql/exec/avg_agg_tmpl.go
-pkg/sql/exec/colvec.eg.go: pkg/sql/exec/colvec_tmpl.go
+pkg/sql/exec/coldata/vec.eg.go: pkg/sql/exec/coldata/vec_tmpl.go
 pkg/sql/exec/distinct.eg.go: pkg/sql/exec/distinct_tmpl.go
 pkg/sql/exec/hashjoiner.eg.go: pkg/sql/exec/hashjoiner_tmpl.go
+pkg/sql/exec/mergejoiner.eg.go: pkg/sql/exec/mergejoiner_tmpl.go
 pkg/sql/exec/quicksort.eg.go: pkg/sql/exec/quicksort_tmpl.go
 pkg/sql/exec/sort.eg.go: pkg/sql/exec/sort_tmpl.go
 pkg/sql/exec/sum_agg.eg.go: pkg/sql/exec/sum_agg_tmpl.go
+pkg/sql/exec/tuples_differ.eg.go: pkg/sql/exec/tuples_differ_tmpl.go
 
 $(EXECGEN_TARGETS): bin/execgen
 	@# Remove generated files with the old suffix to avoid conflicts.

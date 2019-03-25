@@ -17,9 +17,11 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 )
 
 // This file contains the implementation of common table expressions. See
@@ -122,6 +124,9 @@ func (p *planner) initWith(ctx context.Context, with *tree.With) (func(p *planne
 		}
 		return popCteNameEnvironment, nil
 	}
+
+	telemetry.Inc(sqltelemetry.CteUseCounter)
+
 	return nil, nil
 }
 
@@ -145,7 +150,7 @@ func (p *planner) getCTEDataSource(tn *tree.TableName) (planDataSource, bool, er
 				// TODO(jordan): figure out how to lift this restriction.
 				// CTE expressions that are used more than once will need to be
 				// pre-evaluated like subqueries, I think.
-				return planDataSource{}, false, pgerror.NewErrorf(pgerror.CodeFeatureNotSupportedError,
+				return planDataSource{}, false, pgerror.UnimplementedWithIssueErrorf(21084,
 					"unsupported multiple use of CTE clause %q", tree.ErrString(tn))
 			}
 			cteSource.used = true

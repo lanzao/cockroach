@@ -123,8 +123,8 @@ func (b *Builder) analyzeSelectList(
 				switch v.(type) {
 				case tree.UnqualifiedStar, *tree.AllColumnsSelector, *tree.TupleStar:
 					if e.As != "" {
-						panic(builderError{pgerror.NewErrorf(pgerror.CodeSyntaxError,
-							"%q cannot be aliased", tree.ErrString(v))})
+						panic(pgerror.NewErrorf(pgerror.CodeSyntaxError,
+							"%q cannot be aliased", tree.ErrString(v)))
 					}
 
 					aliases, exprs := b.expandStar(e.Expr, inScope)
@@ -249,15 +249,13 @@ func (b *Builder) finishBuildScalar(
 func (b *Builder) finishBuildScalarRef(
 	col *scopeColumn, inScope, outScope *scope, outCol *scopeColumn, colRefs *opt.ColSet,
 ) (out opt.ScalarExpr) {
-	isOuterColumn := inScope == nil || inScope.isOuterColumn(col.id)
-
-	// Remember whether the query was correlated for later.
-	b.IsCorrelated = b.IsCorrelated || isOuterColumn
-
 	// Update the sets of column references and outer columns if needed.
 	if colRefs != nil {
 		colRefs.Add(int(col.id))
 	}
+
+	// Collect the outer columns of the current subquery, if any.
+	isOuterColumn := inScope == nil || inScope.isOuterColumn(col.id)
 	if isOuterColumn && b.subquery != nil {
 		b.subquery.outerCols.Add(int(col.id))
 	}

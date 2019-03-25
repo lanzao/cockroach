@@ -115,7 +115,7 @@ func TestSessionBoundInternalExecutor(t *testing.T) {
 	}
 
 	expDB := "foo"
-	ie := sql.MakeSessionBoundInternalExecutor(
+	ie := sql.NewSessionBoundInternalExecutor(
 		ctx,
 		&sessiondata.SessionData{
 			Database:      expDB,
@@ -165,8 +165,8 @@ func TestInternalExecAppNameInitialization(t *testing.T) {
 		defer s.Stopper().Stop(context.TODO())
 
 		testInternalExecutorAppNameInitialization(t, sem,
-			sql.InternalAppNamePrefix+"internal-test-query", // app name in SHOW
-			sql.InternalAppNamePrefix+"internal-test-query", // app name in stats
+			sql.InternalAppNamePrefix+"-test-query", // app name in SHOW
+			sql.InternalAppNamePrefix+"-test-query", // app name in stats
 			s.InternalExecutor().(*sql.InternalExecutor))
 	})
 
@@ -176,7 +176,7 @@ func TestInternalExecAppNameInitialization(t *testing.T) {
 		s, _, _ := serverutils.StartServer(t, params)
 		defer s.Stopper().Stop(context.TODO())
 
-		ie := sql.MakeSessionBoundInternalExecutor(
+		ie := sql.NewSessionBoundInternalExecutor(
 			context.TODO(),
 			&sessiondata.SessionData{
 				User:            security.RootUser,
@@ -188,10 +188,12 @@ func TestInternalExecAppNameInitialization(t *testing.T) {
 			sql.MemoryMetrics{},
 			s.ExecutorConfig().(sql.ExecutorConfig).Settings,
 		)
-		testInternalExecutorAppNameInitialization(t, sem,
+		testInternalExecutorAppNameInitialization(
+			t, sem,
 			"appname_findme", // app name in SHOW
 			sql.DelegatedAppNamePrefix+"appname_findme", // app name in stats
-			&ie)
+			ie,
+		)
 	})
 }
 
@@ -245,7 +247,7 @@ func testInternalExecutorAppNameInitialization(
 			nil, /* txn */
 			// We need to assemble the magic string so that this SELECT
 			// does not find itself.
-			"SELECT query_id, application_name FROM [SHOW QUERIES] WHERE query LIKE '%337' || '666%'")
+			"SELECT query_id, application_name FROM [SHOW ALL QUERIES] WHERE query LIKE '%337' || '666%'")
 		if err != nil {
 			return err
 		}

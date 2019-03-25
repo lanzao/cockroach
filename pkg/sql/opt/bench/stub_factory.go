@@ -15,9 +15,12 @@
 package bench
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
@@ -72,6 +75,19 @@ func (f *stubFactory) ConstructHashJoin(
 	leftEqCols, rightEqCols []exec.ColumnOrdinal,
 	leftEqColsAreKey, rightEqColsAreKey bool,
 	extraOnCond tree.TypedExpr,
+) (exec.Node, error) {
+	return struct{}{}, nil
+}
+
+func (f *stubFactory) ConstructApplyJoin(
+	joinType sqlbase.JoinType,
+	left exec.Node,
+	leftBoundColMap opt.ColMap,
+	memo *memo.Memo,
+	rightProps *physical.Required,
+	fakeRight exec.Node,
+	right memo.RelExpr,
+	onCond tree.TypedExpr,
 ) (exec.Node, error) {
 	return struct{}{}, nil
 }
@@ -180,6 +196,12 @@ func (f *stubFactory) RenameColumns(input exec.Node, colNames []string) (exec.No
 }
 
 func (f *stubFactory) ConstructPlan(root exec.Node, subqueries []exec.Subquery) (exec.Plan, error) {
+	return struct{}{}, nil
+}
+
+func (f *stubFactory) ConstructExplainOpt(
+	plan string, envOpts exec.ExplainEnvData,
+) (exec.Node, error) {
 	return struct{}{}, nil
 }
 

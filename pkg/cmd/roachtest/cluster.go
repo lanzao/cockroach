@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"math/rand"
 	"net"
 	"net/url"
@@ -41,9 +40,9 @@ import (
 
 	"github.com/armon/circbuf"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	// "postgres" gosql driver
 	_ "github.com/lib/pq"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
@@ -404,8 +403,13 @@ func awsMachineType(cpus int) string {
 		return "c5d.4xlarge"
 	case cpus <= 36:
 		return "c5d.9xlarge"
-	default:
+	case cpus <= 72:
 		return "c5d.18xlarge"
+	case cpus <= 96:
+		// There is no c5d.24xlarge.
+		return "m5d.24xlarge"
+	default:
+		panic(fmt.Sprintf("no aws machine type with %d cpus", cpus))
 	}
 }
 
@@ -684,7 +688,7 @@ func newCluster(ctx context.Context, l *logger, cfg clusterConfig) (*cluster, er
 	var name string
 	if cfg.localCluster {
 		if cfg.name != "" {
-			log.Fatal(ctx, "can't specify name %q with local flag", cfg.name)
+			log.Fatalf(ctx, "can't specify name %q with local flag", cfg.name)
 		}
 		name = "local" // The roachprod tool understands this magic name.
 	} else {
@@ -915,9 +919,11 @@ func (c *cluster) FetchDebugZip(ctx context.Context) error {
 		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 			return err
 		}
-		err := execCmd(ctx, c.l, roachprod, "ssh", c.name+":1", "--",
+		// `./cockroach debug zip` is noisy. Suppress the output unless it fails.
+		output, err := execCmdWithBuffer(ctx, c.l, roachprod, "ssh", c.name+":1", "--",
 			"./cockroach", "debug", "zip", "--url", "{pgurl:1}", zipName)
 		if err != nil {
+			c.l.Printf("./cockroach debug zip failed: %s", output)
 			return err
 		}
 		return execCmd(ctx, c.l, roachprod, "get", c.name+":1", zipName /* src */, path /* dest */)
@@ -937,7 +943,7 @@ func (c *cluster) FetchDmesg(ctx context.Context) error {
 	c.status("fetching dmesg")
 
 	// Don't hang forever.
-	return contextutil.RunWithTimeout(ctx, "debug zip", 20*time.Second, func(ctx context.Context) error {
+	return contextutil.RunWithTimeout(ctx, "dmesg", 20*time.Second, func(ctx context.Context) error {
 		const name = "dmesg.txt"
 		path := filepath.Join(c.t.ArtifactsDir(), name)
 		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
@@ -952,6 +958,25 @@ func (c *cluster) FetchDmesg(ctx context.Context) error {
 			c.l.Printf("during dmesg fetching: %s", err)
 		}
 		return execCmd(ctx, c.l, roachprod, "get", c.name, name /* src */, path /* dest */)
+	})
+}
+
+// FetchCores fetches any core files on the cluster.
+func (c *cluster) FetchCores(ctx context.Context) error {
+	if c.nodes == 0 || c.isLocal() {
+		// No nodes can happen during unit tests and implies nothing to do.
+		// Also, don't grab dmesg on local runs.
+		return nil
+	}
+
+	c.l.Printf("fetching cores\n")
+	c.status("fetching cores")
+
+	// Don't hang forever. The core files can be large, so we give a generous
+	// timeout.
+	return contextutil.RunWithTimeout(ctx, "cores", 60*time.Second, func(ctx context.Context) error {
+		path := filepath.Join(c.t.ArtifactsDir(), "cores")
+		return execCmd(ctx, c.l, roachprod, "get", c.name, "/tmp/cores" /* src */, path /* dest */)
 	})
 }
 
@@ -1016,6 +1041,22 @@ func (c *cluster) Put(ctx context.Context, src, dest string, opts ...option) {
 	}
 	c.status("uploading binary")
 	err := execCmd(ctx, c.l, roachprod, "put", c.makeNodes(opts...), src, dest)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+}
+
+// Get gets files from remote hosts.
+func (c *cluster) Get(ctx context.Context, src, dest string, opts ...option) {
+	if c.t.Failed() {
+		// If the test has failed, don't try to limp along.
+		return
+	}
+	if atomic.LoadInt32(&interrupted) == 1 {
+		c.t.Fatal("interrupted")
+	}
+	c.status(fmt.Sprintf("getting %v", src))
+	err := execCmd(ctx, c.l, roachprod, "get", c.makeNodes(opts...), src, dest)
 	if err != nil {
 		c.t.Fatal(err)
 	}

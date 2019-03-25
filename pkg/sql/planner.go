@@ -24,7 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
@@ -166,9 +165,9 @@ type planner struct {
 	// be pool allocated.
 	alloc sqlbase.DatumAlloc
 
-	// optimizer caches an instance of the cost-based optimizer that can be reused
-	// to plan queries (reused in order to reduce allocations).
-	optimizer xform.Optimizer
+	// optPlanningCtx stores the optimizer planning context, which contains
+	// data structures that can be reused between queries (for efficiency).
+	optPlanningCtx optPlanningCtx
 
 	queryCacheSession querycache.Session
 }
@@ -219,15 +218,14 @@ func newInternalPlanner(
 		leaseMgr:      execCfg.LeaseManager,
 		databaseCache: newDatabaseCache(config.NewSystemConfig()),
 	}
-	txnReadOnly := new(bool)
 	dataMutator := &sessionDataMutator{
 		data: sd,
 		defaults: SessionDefaults(map[string]string{
 			"application_name": "crdb-internal",
 			"database":         "system",
 		}),
-		settings:       execCfg.Settings,
-		curTxnReadOnly: txnReadOnly,
+		settings:          execCfg.Settings,
+		setCurTxnReadOnly: func(bool) {},
 	}
 
 	var ts time.Time
@@ -259,9 +257,11 @@ func newInternalPlanner(
 		ctx, sd, dataMutator, tables, txn, ts, ts, execCfg, &plannerMon,
 	)
 	p.extendedEvalCtx.Planner = p
+	p.extendedEvalCtx.SessionAccessor = p
 	p.extendedEvalCtx.Sequence = p
 	p.extendedEvalCtx.ClusterID = execCfg.ClusterID()
 	p.extendedEvalCtx.NodeID = execCfg.NodeID.Get()
+	p.extendedEvalCtx.Locality = execCfg.Locality
 
 	p.sessionDataMutator = dataMutator
 	p.autoCommit = false
@@ -304,7 +304,7 @@ func internalExtendedEvalCtx(
 		EvalContext: tree.EvalContext{
 			Txn:           txn,
 			SessionData:   sd,
-			TxnReadOnly:   *dataMutator.curTxnReadOnly,
+			TxnReadOnly:   false,
 			TxnImplicit:   true,
 			Settings:      execCfg.Settings,
 			Context:       ctx,
@@ -593,7 +593,10 @@ func (p *planner) runWithDistSQL(
 // txnModesSetter is an interface used by SQL execution to influence the current
 // transaction.
 type txnModesSetter interface {
-	setTransactionModes(modes tree.TransactionModes) error
+	// setTransactionModes updates some characteristics of the current
+	// transaction.
+	// asOfTs, if not empty, is the evaluation of modes.AsOf.
+	setTransactionModes(modes tree.TransactionModes, asOfTs hlc.Timestamp) error
 }
 
 // sqlStatsCollector is the interface used by SQL execution, through the

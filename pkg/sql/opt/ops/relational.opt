@@ -229,6 +229,8 @@ define AntiJoin {
 # variants, but excluding IndexJoin, LookupJoin, MergeJoin.
 [Private]
 define JoinPrivate {
+    # Flags modify what type of join we choose.
+    Flags JoinFlags
 }
 
 # IndexJoin represents an inner join between an input expression and a primary
@@ -301,6 +303,8 @@ define LookupJoinPrivate {
     # join, treating it as if it were another relational input. This makes the
     # lookup join appear more like other join operators.
     lookupProps RelProps
+
+    _ JoinPrivate
 }
 
 # MergeJoin represents a join that is executed using merge-join.
@@ -339,6 +343,8 @@ define MergeJoinPrivate {
     # columns and orderings.
     LeftOrdering  OrderingChoice
     RightOrdering OrderingChoice
+
+    _ JoinPrivate
 }
 
 # ZigzagJoin represents a join that is executed using the zigzag joiner.
@@ -599,6 +605,9 @@ define Union {
 #   Left:  [2, 1]
 #   Right: [4, 3]
 #   Out:   [5, 6]  <-- synthesized output columns
+#
+# To make normalization rules and execution simpler, both inputs to the set op
+# must have matching types.
 [Private]
 define SetPrivate {
     LeftCols  ColList

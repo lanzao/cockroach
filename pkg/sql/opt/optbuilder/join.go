@@ -38,14 +38,39 @@ func (b *Builder) buildJoin(join *tree.JoinTableExpr, inScope *scope) (outScope 
 	// Check that the same table name is not used on both sides.
 	b.validateJoinTableNames(leftScope, rightScope)
 
-	joinType := sqlbase.JoinTypeFromAstString(join.Join)
+	joinType := sqlbase.JoinTypeFromAstString(join.JoinType)
+	var flags memo.JoinFlags
+	switch join.Hint {
+	case "":
+	case tree.AstHash:
+		flags.DisallowMergeJoin = true
+		flags.DisallowLookupJoin = true
+
+	case tree.AstLookup:
+		flags.DisallowHashJoin = true
+		flags.DisallowMergeJoin = true
+		if joinType != sqlbase.InnerJoin && joinType != sqlbase.LeftOuterJoin {
+			panic(pgerror.NewErrorf(pgerror.CodeSyntaxError,
+				"%s can only be used with INNER or LEFT joins", tree.AstLookup,
+			))
+		}
+
+	case tree.AstMerge:
+		flags.DisallowLookupJoin = true
+		flags.DisallowHashJoin = true
+
+	default:
+		panic(pgerror.NewErrorf(
+			pgerror.CodeFeatureNotSupportedError, "join hint %s not supported", join.Hint,
+		))
+	}
 
 	switch cond := join.Cond.(type) {
 	case tree.NaturalJoinCond, *tree.UsingJoinCond:
 		outScope = inScope.push()
 
 		var jb usingJoinBuilder
-		jb.init(b, joinType, leftScope, rightScope, outScope)
+		jb.init(b, joinType, flags, leftScope, rightScope, outScope)
 
 		switch t := cond.(type) {
 		case tree.NaturalJoinCond:
@@ -76,7 +101,9 @@ func (b *Builder) buildJoin(join *tree.JoinTableExpr, inScope *scope) (outScope 
 
 		left := leftScope.expr.(memo.RelExpr)
 		right := rightScope.expr.(memo.RelExpr)
-		outScope.expr = b.constructJoin(joinType, left, right, filters, memo.EmptyJoinPrivate)
+		outScope.expr = b.constructJoin(
+			joinType, left, right, filters, &memo.JoinPrivate{Flags: flags},
+		)
 		return outScope
 
 	default:
@@ -108,11 +135,11 @@ func (b *Builder) validateJoinTableNames(leftScope, rightScope *scope) {
 				continue
 			}
 
-			panic(builderError{pgerror.NewErrorf(
+			panic(pgerror.NewErrorf(
 				pgerror.CodeDuplicateAliasError,
 				"source name %q specified more than once (missing AS clause)",
 				tree.ErrString(&leftName.TableName),
-			)})
+			))
 		}
 	}
 }
@@ -155,7 +182,8 @@ func (b *Builder) constructJoin(
 	case sqlbase.FullOuterJoin:
 		return b.factory.ConstructFullJoin(left, right, on, private)
 	default:
-		panic(fmt.Errorf("unsupported JOIN type %d", joinType))
+		panic(pgerror.NewErrorf(pgerror.CodeFeatureNotSupportedError,
+			"unsupported JOIN type %d", joinType))
 	}
 }
 
@@ -223,6 +251,7 @@ func (b *Builder) constructJoin(
 type usingJoinBuilder struct {
 	b          *Builder
 	joinType   sqlbase.JoinType
+	joinFlags  memo.JoinFlags
 	filters    memo.FiltersExpr
 	leftScope  *scope
 	rightScope *scope
@@ -242,10 +271,14 @@ type usingJoinBuilder struct {
 }
 
 func (jb *usingJoinBuilder) init(
-	b *Builder, joinType sqlbase.JoinType, leftScope, rightScope, outScope *scope,
+	b *Builder,
+	joinType sqlbase.JoinType,
+	flags memo.JoinFlags,
+	leftScope, rightScope, outScope *scope,
 ) {
 	jb.b = b
 	jb.joinType = joinType
+	jb.joinFlags = flags
 	jb.leftScope = leftScope
 	jb.rightScope = rightScope
 	jb.outScope = outScope
@@ -263,8 +296,8 @@ func (jb *usingJoinBuilder) buildUsingJoin(using *tree.UsingJoinCond) {
 		}
 		if seenCols.Contains(int(leftCol.id)) {
 			// Same name exists more than once in USING column name list.
-			panic(builderError{pgerror.NewErrorf(pgerror.CodeDuplicateColumnError,
-				"column %q appears more than once in USING clause", tree.ErrString(&name))})
+			panic(pgerror.NewErrorf(pgerror.CodeDuplicateColumnError,
+				"column %q appears more than once in USING clause", tree.ErrString(&name)))
 		}
 		seenCols.Add(int(leftCol.id))
 
@@ -316,7 +349,7 @@ func (jb *usingJoinBuilder) finishBuild() {
 		jb.leftScope.expr.(memo.RelExpr),
 		jb.rightScope.expr.(memo.RelExpr),
 		jb.filters,
-		memo.EmptyJoinPrivate,
+		&memo.JoinPrivate{Flags: jb.joinFlags},
 	)
 
 	if !jb.ifNullCols.Empty() {
@@ -382,9 +415,9 @@ func (jb *usingJoinBuilder) addEqualityCondition(leftCol, rightCol *scopeColumn)
 	// First, check if the comparison would even be valid.
 	if !leftCol.typ.Equivalent(rightCol.typ) {
 		if _, found := tree.FindEqualComparisonFunction(leftCol.typ, rightCol.typ); !found {
-			panic(builderError{pgerror.NewErrorf(pgerror.CodeDatatypeMismatchError,
+			panic(pgerror.NewErrorf(pgerror.CodeDatatypeMismatchError,
 				"JOIN/USING types %s for left and %s for right cannot be matched for column %q",
-				leftCol.typ, rightCol.typ, tree.ErrString(&leftCol.name))})
+				leftCol.typ, rightCol.typ, tree.ErrString(&leftCol.name)))
 		}
 	}
 
@@ -426,11 +459,11 @@ func (jb *usingJoinBuilder) addEqualityCondition(leftCol, rightCol *scopeColumn)
 }
 
 func (jb *usingJoinBuilder) raiseDuplicateColError(name tree.Name) {
-	panic(builderError{pgerror.NewErrorf(pgerror.CodeDuplicateColumnError,
-		"duplicate column name: %q", tree.ErrString(&name))})
+	panic(pgerror.NewErrorf(pgerror.CodeDuplicateColumnError,
+		"duplicate column name: %q", tree.ErrString(&name)))
 }
 
 func (jb *usingJoinBuilder) raiseUndefinedColError(name tree.Name, context string) {
-	panic(builderError{pgerror.NewErrorf(pgerror.CodeUndefinedColumnError,
-		"column \"%s\" specified in USING clause does not exist in %s table", name, context)})
+	panic(pgerror.NewErrorf(pgerror.CodeUndefinedColumnError,
+		"column \"%s\" specified in USING clause does not exist in %s table", name, context))
 }

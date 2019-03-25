@@ -181,7 +181,7 @@ ALTER TABLE t DROP CONSTRAINT bar
 statement ok
 ALTER TABLE t DROP CONSTRAINT IF EXISTS bar
 
-statement error UNIQUE constraint depends on index "foo", use DROP INDEX with CASCADE if you really want to drop it
+statement error cannot drop UNIQUE constraint \"foo\" using ALTER TABLE DROP CONSTRAINT, use DROP INDEX CASCADE instead
 ALTER TABLE t DROP CONSTRAINT foo
 
 statement ok
@@ -411,21 +411,24 @@ ALTER TABLE t ADD b INT DEFAULT 1, ADD c INT DEFAULT 2 CHECK (c > b)
 statement ok
 ALTER TABLE t ADD d INT UNIQUE, ADD e INT UNIQUE, ADD f INT
 
-# TODO (lucy): Add a test like this after #35011 is fixed
-# statement ok
-# ALTER TABLE t ADD d INT UNIQUE, ADD e INT UNIQUE, ADD f INT CHECK (f > e)
-
 # Check references column added in same statement
 statement error pq: validation of CHECK "g = h" failed on row:.* g=3.* h=2
 ALTER TABLE t ADD g INT DEFAULT 3, ADD h INT DEFAULT 2 CHECK (g = h)
+
+# Multiple unique columns can be added, followed by other commands (#35011)
+statement ok
+ALTER TABLE t ADD COLUMN u INT UNIQUE, ADD COLUMN v INT UNIQUE, ADD CONSTRAINT ck CHECK (a > 0);
 
 query TTTTB
 SHOW CONSTRAINTS FROM t
 ----
 t  check_c_b  CHECK        CHECK (c > b)        true
+t  ck         CHECK        CHECK (a > 0)        true
 t  primary    PRIMARY KEY  PRIMARY KEY (a ASC)  true
 t  t_d_key    UNIQUE       UNIQUE (d ASC)       true
 t  t_e_key    UNIQUE       UNIQUE (e ASC)       true
+t  t_u_key    UNIQUE       UNIQUE (u ASC)       true
+t  t_v_key    UNIQUE       UNIQUE (v ASC)       true
 
 statement ok
 DROP TABLE t
@@ -863,3 +866,30 @@ INSERT INTO rides VALUES (567, 'lagos', 'lagos', 10, 100)
 
 statement ok
 ALTER TABLE vehicles DROP COLUMN mycol;
+
+# check that adding a reference on a column still being backfilled fails.
+# fix through #32917
+
+statement ok
+CREATE TABLE t32917 (a INT PRIMARY KEY)
+
+statement ok
+INSERT INTO t32917 VALUES (1), (2), (3)
+
+statement ok
+CREATE TABLE t32917_2 (b INT PRIMARY KEY)
+
+statement ok
+INSERT INTO t32917_2 VALUES (1), (2), (3)
+
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE t32917_2 ADD c INT UNIQUE DEFAULT 4
+
+statement error adding a REFERENCES constraint while the column is being added not supported
+ALTER TABLE t32917_2 ADD CONSTRAINT fk_c_a FOREIGN KEY (c) references t32917 (a)
+
+statement ok
+ROLLBACK

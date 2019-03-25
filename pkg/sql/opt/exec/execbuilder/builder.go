@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/pkg/errors"
 )
@@ -35,6 +36,12 @@ type Builder struct {
 	// expressions we built. Each entry is associated with a tree.Subquery
 	// expression node.
 	subqueries []exec.Subquery
+
+	// nullifyMissingVarExprs, if greater than 0, tells the builder to replace
+	// VariableExprs that have no bindings with DNull. This is useful for apply
+	// join, which needs to be able to create a plan that has outer columns.
+	// The number indicates the depth of apply joins.
+	nullifyMissingVarExprs int
 }
 
 // New constructs an instance of the execution node builder using the
@@ -46,7 +53,21 @@ func New(factory exec.Factory, mem *memo.Memo, e opt.Expr, evalCtx *tree.EvalCon
 
 // Build constructs the execution node tree and returns its root node if no
 // error occurred.
-func (b *Builder) Build() (exec.Plan, error) {
+func (b *Builder) Build() (_ exec.Plan, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			// This code allows us to propagate internal errors without having to add
+			// error checks everywhere throughout the code. This is only possible
+			// because the code does not update shared state and does not manipulate
+			// locks.
+			if pgErr, ok := r.(*pgerror.Error); ok {
+				err = pgErr
+			} else {
+				panic(r)
+			}
+		}
+	}()
+
 	root, err := b.build(b.e)
 	if err != nil {
 		return nil, err

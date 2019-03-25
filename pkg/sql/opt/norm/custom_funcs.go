@@ -15,7 +15,6 @@
 package norm
 
 import (
-	"fmt"
 	"math"
 	"reflect"
 	"sort"
@@ -27,9 +26,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // CustomFuncs contains all the custom match and replace functions used by
@@ -162,6 +164,14 @@ func (c *CustomFuncs) ArrayType(in memo.RelExpr) types.T {
 	inCol, _ := c.OutputCols(in).Next(0)
 	inTyp := c.mem.Metadata().ColumnMeta(opt.ColumnID(inCol)).Type
 	return types.TArray{Typ: inTyp}
+}
+
+// BinaryColType returns the column type of the binary overload for the
+// given operator and operands.
+func (c *CustomFuncs) BinaryColType(op opt.Operator, left, right opt.ScalarExpr) coltypes.T {
+	o, _ := memo.FindBinaryOverload(op, left.DataType(), right.DataType())
+	colType, _ := coltypes.DatumTypeToColumnType(o.ReturnType)
+	return colType
 }
 
 // ----------------------------------------------------------------------
@@ -334,7 +344,7 @@ func (c *CustomFuncs) sharedProps(e opt.Expr) *props.Shared {
 	case memo.ScalarPropsExpr:
 		return &t.ScalarProps(c.mem).Shared
 	}
-	panic(fmt.Sprintf("no logical properties available for node: %v", e))
+	panic(pgerror.NewAssertionErrorf("no logical properties available for node: %v", e))
 }
 
 // ----------------------------------------------------------------------
@@ -444,7 +454,7 @@ func (c *CustomFuncs) RemoveFiltersItem(
 			return newFilters
 		}
 	}
-	panic(fmt.Sprintf("item to remove is not in the list: %v", search))
+	panic(pgerror.NewAssertionErrorf("item to remove is not in the list: %v", search))
 }
 
 // ReplaceFiltersItem returns a new list that is a copy of the given list,
@@ -464,7 +474,7 @@ func (c *CustomFuncs) ReplaceFiltersItem(
 			return newFilters
 		}
 	}
-	panic(fmt.Sprintf("item to replace is not in the list: %v", search))
+	panic(pgerror.NewAssertionErrorf("item to replace is not in the list: %v", search))
 }
 
 // FiltersBoundBy returns true if all outer references in any of the filter
@@ -517,7 +527,7 @@ func (c *CustomFuncs) ExtractBoundConditions(
 }
 
 // ExtractUnboundConditions is the opposite of ExtractBoundConditions. Instead of
-// extracting expressions that are bound by the given expression, it extracts
+// extracting expressions that are bound by the given columns, it extracts
 // list expressions that have at least one outer reference that is *not* bound
 // by the given columns (i.e. it has a "free" variable).
 func (c *CustomFuncs) ExtractUnboundConditions(
@@ -529,6 +539,113 @@ func (c *CustomFuncs) ExtractUnboundConditions(
 			newFilters = append(newFilters, filters[i])
 		}
 	}
+	return newFilters
+}
+
+// CanConsolidateFilters returns true if there are at least two different
+// filter conditions that contain the same variable, where the conditions
+// have tight constraints and contain a single variable. For example,
+// CanConsolidateFilters returns true with filters {x > 5, x < 10}, but false
+// with {x > 5, y < 10} and {x > 5, x = y}.
+func (c *CustomFuncs) CanConsolidateFilters(filters memo.FiltersExpr) bool {
+	var seen opt.ColSet
+	for i := range filters {
+		if col, ok := c.canConsolidateFilter(&filters[i]); ok {
+			if seen.Contains(col) {
+				return true
+			}
+			seen.Add(col)
+		}
+	}
+	return false
+}
+
+// canConsolidateFilter determines whether a filter condition can be
+// consolidated. Filters can be consolidated if they have tight constraints
+// and contain a single variable. Examples of such filters include x < 5 and
+// x IS NULL. If the filter can be consolidated, canConsolidateFilter returns
+// the column ID of the variable and ok=true. Otherwise, canConsolidateFilter
+// returns ok=false.
+func (c *CustomFuncs) canConsolidateFilter(filter *memo.FiltersItem) (col int, ok bool) {
+	if !filter.ScalarProps(c.mem).TightConstraints {
+		return 0, false
+	}
+
+	outerCols := c.OuterCols(filter)
+	if outerCols.Len() != 1 {
+		return 0, false
+	}
+
+	col, _ = outerCols.Next(0)
+	return col, true
+}
+
+// ConsolidateFilters consolidates filter conditions that contain the same
+// variable, where the conditions have tight constraints and contain a single
+// variable. The consolidated filters are combined with a tree of nested
+// And operations, and wrapped with a Range expression.
+//
+// See the ConsolidateSelectFilters rule for more details about why this is
+// necessary.
+func (c *CustomFuncs) ConsolidateFilters(filters memo.FiltersExpr) memo.FiltersExpr {
+	// First find the columns that have filter conditions that can be
+	// consolidated.
+	var seen, seenTwice opt.ColSet
+	for i := range filters {
+		if col, ok := c.canConsolidateFilter(&filters[i]); ok {
+			if seen.Contains(col) {
+				seenTwice.Add(col)
+			} else {
+				seen.Add(col)
+			}
+		}
+	}
+
+	newFilters := make(memo.FiltersExpr, seenTwice.Len(), len(filters)-seenTwice.Len())
+
+	// newFilters contains an empty item for each of the new Range expressions
+	// that will be created below. Fill in rangeMap to track which column
+	// corresponds to each item.
+	var rangeMap util.FastIntMap
+	i := 0
+	for col, ok := seenTwice.Next(0); ok; col, ok = seenTwice.Next(col + 1) {
+		rangeMap.Set(col, i)
+		i++
+	}
+
+	// Iterate through each existing filter condition, and either consolidate it
+	// into one of the new Range expressions or add it unchanged to the new
+	// filters.
+	for i := range filters {
+		if col, ok := c.canConsolidateFilter(&filters[i]); ok && seenTwice.Contains(col) {
+			// This is one of the filter conditions that can be consolidated into a
+			// Range.
+			cond := filters[i].Condition
+			switch t := cond.(type) {
+			case *memo.RangeExpr:
+				// If it is already a range expression, unwrap it.
+				cond = t.And
+			}
+			rangeIdx, _ := rangeMap.Get(col)
+			rangeItem := &newFilters[rangeIdx]
+			if rangeItem.Condition == nil {
+				// This is the first condition.
+				rangeItem.Condition = cond
+			} else {
+				// Build a left-deep tree of ANDs.
+				rangeItem.Condition = c.f.ConstructAnd(rangeItem.Condition, cond)
+			}
+		} else {
+			newFilters = append(newFilters, filters[i])
+		}
+	}
+
+	// Construct each of the new Range operators now that we have built the
+	// conjunctions.
+	for i, n := 0, seenTwice.Len(); i < n; i++ {
+		newFilters[i].Condition = c.f.ConstructRange(newFilters[i].Condition)
+	}
+
 	return newFilters
 }
 
@@ -648,32 +765,6 @@ func (c *CustomFuncs) AreProjectionsCorrelated(
 		}
 	}
 	return false
-}
-
-// ProjectColMapLeft returns a Projections operator that maps the left side
-// columns in a SetPrivate to the output columns in it. Useful for replacing set
-// operations with simpler constructs.
-func (c *CustomFuncs) ProjectColMapLeft(set *memo.SetPrivate) memo.ProjectionsExpr {
-	return c.projectColMapSide(set.OutCols, set.LeftCols)
-}
-
-// ProjectColMapRight returns a Project operator that maps the right side
-// columns in a SetPrivate to the output columns in it. Useful for replacing set
-// operations with simpler constructs.
-func (c *CustomFuncs) ProjectColMapRight(set *memo.SetPrivate) memo.ProjectionsExpr {
-	return c.projectColMapSide(set.OutCols, set.RightCols)
-}
-
-// projectColMapSide implements the side-agnostic logic from ProjectColMapLeft
-// and ProjectColMapRight.
-func (c *CustomFuncs) projectColMapSide(toList, fromList opt.ColList) memo.ProjectionsExpr {
-	items := make(memo.ProjectionsExpr, len(toList))
-	for idx, fromCol := range fromList {
-		toCol := toList[idx]
-		items[idx].Element = c.f.ConstructVariable(fromCol)
-		items[idx].Col = toCol
-	}
-	return items
 }
 
 // MakeEmptyColSet returns a column set with no columns in it.
@@ -879,6 +970,39 @@ func (c *CustomFuncs) ZipOuterCols(zip memo.ZipExpr) opt.ColSet {
 
 // ----------------------------------------------------------------------
 //
+// Set Rules
+//   Custom match and replace functions used with set.opt rules.
+//
+// ----------------------------------------------------------------------
+
+// ProjectColMapLeft returns a Projections operator that maps the left side
+// columns in a SetPrivate to the output columns in it. Useful for replacing set
+// operations with simpler constructs.
+func (c *CustomFuncs) ProjectColMapLeft(set *memo.SetPrivate) memo.ProjectionsExpr {
+	return c.projectColMapSide(set.OutCols, set.LeftCols)
+}
+
+// ProjectColMapRight returns a Project operator that maps the right side
+// columns in a SetPrivate to the output columns in it. Useful for replacing set
+// operations with simpler constructs.
+func (c *CustomFuncs) ProjectColMapRight(set *memo.SetPrivate) memo.ProjectionsExpr {
+	return c.projectColMapSide(set.OutCols, set.RightCols)
+}
+
+// projectColMapSide implements the side-agnostic logic from ProjectColMapLeft
+// and ProjectColMapRight.
+func (c *CustomFuncs) projectColMapSide(toList, fromList opt.ColList) memo.ProjectionsExpr {
+	items := make(memo.ProjectionsExpr, len(toList))
+	for idx, fromCol := range fromList {
+		toCol := toList[idx]
+		items[idx].Element = c.f.ConstructVariable(fromCol)
+		items[idx].Col = toCol
+	}
+	return items
+}
+
+// ----------------------------------------------------------------------
+//
 // Boolean Rules
 //   Custom match and replace functions used with bool.opt rules.
 //
@@ -924,7 +1048,7 @@ func (c *CustomFuncs) CommuteInequality(
 	case opt.LtOp:
 		return c.f.ConstructGt(right, left)
 	}
-	panic(fmt.Sprintf("called commuteInequality with operator %s", op))
+	panic(pgerror.NewAssertionErrorf("called commuteInequality with operator %s", log.Safe(op)))
 }
 
 // FindRedundantConjunct takes the left and right operands of an Or operator as
@@ -1035,7 +1159,7 @@ func (c *CustomFuncs) extractConjunct(conjunct opt.ScalarExpr, and *memo.AndExpr
 //   (a = x) AND (b = y) AND (c = z)
 func (c *CustomFuncs) NormalizeTupleEquality(left, right memo.ScalarListExpr) opt.ScalarExpr {
 	if len(left) != len(right) {
-		panic("tuple length mismatch")
+		panic(pgerror.NewAssertionErrorf("tuple length mismatch"))
 	}
 	if len(left) == 0 {
 		// () = (), which is always true.
@@ -1135,7 +1259,7 @@ func (c *CustomFuncs) IsConstValueEqual(const1, const2 opt.ScalarExpr) bool {
 		datum2 := const2.(*memo.ConstExpr).Value
 		return datum1.Compare(c.f.evalCtx, datum2) == 0
 	default:
-		panic(fmt.Errorf("unexpected Op type: %v", op1))
+		panic(pgerror.NewAssertionErrorf("unexpected Op type: %v", log.Safe(op1)))
 	}
 }
 
@@ -1157,7 +1281,7 @@ func (c *CustomFuncs) SimplifyWhens(
 			// If this is true, we won't ever match anything else, so convert this to
 			// the ELSE (or just return it if there are no earlier items).
 			if len(newWhens) == 0 {
-				return when.Value
+				return c.ensureTyped(when.Value, memo.InferWhensType(whens, orElse))
 			}
 			return c.f.ConstructCase(condition, newWhens, when.Value)
 		}
@@ -1168,10 +1292,23 @@ func (c *CustomFuncs) SimplifyWhens(
 	// The ELSE value.
 	if len(newWhens) == 0 {
 		// ELSE is the only clause (there are no WHENs), remove the CASE.
-		return orElse
+		// NULLs in this position will not be typed, so we tag them with
+		// a type we observed earlier.
+		// typ will never be nil here because the definition of
+		// SimplifyCaseWhenConstValue ensures that whens is nonempty.
+		return c.ensureTyped(orElse, memo.InferWhensType(whens, orElse))
 	}
 
 	return c.f.ConstructCase(condition, newWhens, orElse)
+}
+
+// ensureTyped makes sure that any NULL passing through gets tagged with an
+// appropriate type.
+func (c *CustomFuncs) ensureTyped(d opt.ScalarExpr, typ types.T) opt.ScalarExpr {
+	if d.DataType() == types.Unknown {
+		return c.f.ConstructNull(typ)
+	}
+	return d
 }
 
 // OpsAreSame returns true if the two operators are the same.
@@ -1212,7 +1349,7 @@ func (c *CustomFuncs) CastToCollatedString(str opt.ScalarExpr, locale string) op
 	case *tree.DCollatedString:
 		value = t.Contents
 	default:
-		panic(fmt.Sprintf("unexpected type for COLLATE: %T", str.(*memo.ConstExpr).Value))
+		panic(pgerror.NewAssertionErrorf("unexpected type for COLLATE: %T", log.Safe(str.(*memo.ConstExpr).Value)))
 	}
 
 	return c.f.ConstructConst(tree.NewDCollatedString(value, locale, &c.f.evalCtx.CollationEnv))
@@ -1270,6 +1407,15 @@ func (c *CustomFuncs) MakeLimited(sub *memo.SubqueryPrivate) *memo.SubqueryPriva
 //   Custom match and replace functions used with numeric.opt rules.
 //
 // ----------------------------------------------------------------------
+
+// IsAdditive returns true if the type of the expression supports addition and
+// subtraction in the natural way. This differs from "has a +/- Numeric
+// implementation" because JSON has an implementation for "- INT" which doesn't
+// obey x - 0 = x. Additive types include all numeric types as well as
+// timestamps and dates.
+func (c *CustomFuncs) IsAdditive(e opt.ScalarExpr) bool {
+	return types.IsAdditiveType(e.DataType())
+}
 
 // EqualsNumber returns true if the given numeric value (decimal, float, or
 // integer) is equal to the given integer value.
@@ -1368,6 +1514,29 @@ func (c *CustomFuncs) FoldUnary(op opt.Operator, input opt.ScalarExpr) opt.Scala
 		return nil
 	}
 	return c.f.ConstructConstVal(result, o.ReturnType)
+}
+
+// FoldCast evaluates a cast expression with a constant input. It returns
+// a constant expression as long as the evaluation causes no error.
+func (c *CustomFuncs) FoldCast(input opt.ScalarExpr, colType coltypes.T) opt.ScalarExpr {
+	switch colType.(type) {
+	case *coltypes.TOid:
+		// Save this cast for the execbuilder.
+		return nil
+	}
+
+	datum := memo.ExtractConstDatum(input)
+	texpr, err := tree.NewTypedCastExpr(datum, colType)
+	if err != nil {
+		return nil
+	}
+
+	result, err := texpr.Eval(c.f.evalCtx)
+	if err != nil {
+		return nil
+	}
+
+	return c.f.ConstructConstVal(result, c.ColTypeToDatumType(colType))
 }
 
 // isMonotonicConversion returns true if conversion of a value from FROM to

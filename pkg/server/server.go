@@ -41,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/server/debug"
+	"github.com/cockroachdb/cockroach/pkg/server/goroutinedumper"
 	"github.com/cockroachdb/cockroach/pkg/server/heapprofiler"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
@@ -109,7 +110,7 @@ var (
 
 	forwardClockJumpCheckEnabled = settings.RegisterBoolSetting(
 		"server.clock.forward_jump_check_enabled",
-		"if enabled, forward clock jumps > max_offset/2 will cause a panic.",
+		"if enabled, forward clock jumps > max_offset/2 will cause a panic",
 		false,
 	)
 
@@ -514,6 +515,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	distSQLCfg := distsqlrun.ServerConfig{
 		AmbientContext: s.cfg.AmbientCtx,
 		Settings:       st,
+		RuntimeStats:   s.runtime,
 		DB:             s.db,
 		Executor:       internalExecutor,
 		FlowDB:         client.NewDB(s.cfg.AmbientCtx, s.tcsFactory, s.clock),
@@ -588,11 +590,11 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	// Set up Executor
 
-	var sqlExecutorTestingKnobs *sql.ExecutorTestingKnobs
+	var sqlExecutorTestingKnobs sql.ExecutorTestingKnobs
 	if k := s.cfg.TestingKnobs.SQLExecutor; k != nil {
-		sqlExecutorTestingKnobs = k.(*sql.ExecutorTestingKnobs)
+		sqlExecutorTestingKnobs = *k.(*sql.ExecutorTestingKnobs)
 	} else {
-		sqlExecutorTestingKnobs = new(sql.ExecutorTestingKnobs)
+		sqlExecutorTestingKnobs = sql.ExecutorTestingKnobs{}
 	}
 
 	loggerCtx, _ := s.stopper.WithCancelOnStop(ctx)
@@ -600,6 +602,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	execCfg = sql.ExecutorConfig{
 		Settings:                s.st,
 		NodeInfo:                nodeInfo,
+		Locality:                s.cfg.Locality,
 		AmbientCtx:              s.cfg.AmbientCtx,
 		DB:                      s.db,
 		Gossip:                  s.gossip,
@@ -666,6 +669,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	}
 
 	s.statsRefresher = stats.MakeRefresher(
+		s.st,
 		internalExecutor,
 		execCfg.TableStatsCache,
 		stats.DefaultAsOfTime,
@@ -692,14 +696,14 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		func(
 			ctx context.Context, sessionData *sessiondata.SessionData,
 		) sqlutil.InternalExecutor {
-			ie := sql.MakeSessionBoundInternalExecutor(
+			ie := sql.NewSessionBoundInternalExecutor(
 				ctx,
 				sessionData,
 				s.pgServer.SQLServer,
 				s.sqlMemMetrics,
 				s.st,
 			)
-			return &ie
+			return ie
 		}
 
 	for _, m := range s.pgServer.Metrics() {
@@ -1608,7 +1612,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// Start the background thread for periodically refreshing table statistics.
 	if err := s.statsRefresher.Start(
-		ctx, &s.st.SV, s.stopper, stats.DefaultRefreshInterval,
+		ctx, s.stopper, stats.DefaultRefreshInterval,
 	); err != nil {
 		return err
 	}
@@ -1771,7 +1775,7 @@ func (s *Server) bootstrapCluster(ctx context.Context) error {
 		}
 	}
 
-	if err := s.node.bootstrap(ctx, s.engines, bootstrapVersion); err != nil {
+	if err := s.node.bootstrapCluster(ctx, s.engines, bootstrapVersion); err != nil {
 		return err
 	}
 	// Force all the system ranges through the replication queue so they
@@ -1903,6 +1907,10 @@ func (s *Server) Decommission(ctx context.Context, setTo bool, nodeIDs []roachpb
 func (s *Server) startSampleEnvironment(frequency time.Duration) {
 	// Immediately record summaries once on server startup.
 	ctx := s.AnnotateCtx(context.Background())
+	goroutineDumper, err := goroutinedumper.NewGoroutineDumper(s.cfg.GoroutineDumpDirName)
+	if err != nil {
+		log.Infof(ctx, "Could not start goroutine dumper worker due to: %s", err)
+	}
 	var heapProfiler *heapprofiler.HeapProfiler
 
 	{
@@ -1947,6 +1955,9 @@ func (s *Server) startSampleEnvironment(frequency time.Duration) {
 			case <-timer.C:
 				timer.Read = true
 				s.runtime.SampleEnvironment(ctx)
+				if goroutineDumper != nil {
+					goroutineDumper.MaybeDump(ctx, s.ClusterSettings(), s.runtime.Goroutines.Value())
+				}
 				if heapProfiler != nil {
 					heapProfiler.MaybeTakeProfile(ctx, s.ClusterSettings(), s.runtime.Rss.Value())
 				}

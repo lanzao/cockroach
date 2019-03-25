@@ -1381,7 +1381,7 @@ func Example_sql_table() {
 	// sql -e insert into t.t values (e'a\tb\tc\n12\t123123213\t12313', 'tabs')
 	// INSERT 1
 	// sql -e insert into t.t values (e'\xc3\x28', 'non-UTF8 string')
-	// pq: invalid UTF-8 byte sequence
+	// pq: lexical error: invalid UTF-8 byte sequence
 	// DETAIL: source SQL:
 	// insert into t.t values (e'\xc3\x28', 'non-UTF8 string')
 	//                         ^
@@ -2306,12 +2306,16 @@ writing ` + os.DevNull + `
   debug/liveness
   debug/settings
   debug/reports/problemranges
-  debug/gossip/liveness
-  debug/gossip/network
-  debug/gossip/nodes
-  debug/metrics
-  debug/alerts
+  debug/crdb_internal.jobs
+  debug/crdb_internal.schema_changes
   debug/nodes/1/status
+  debug/nodes/1/crdb_internal.gossip_liveness
+  debug/nodes/1/crdb_internal.gossip_network
+  debug/nodes/1/crdb_internal.gossip_nodes
+  debug/nodes/1/crdb_internal.node_metrics
+  debug/nodes/1/crdb_internal.gossip_alerts
+  debug/nodes/1/queries
+  debug/nodes/1/sessions
   debug/nodes/1/details
   debug/nodes/1/gossip
   debug/nodes/1/stacks

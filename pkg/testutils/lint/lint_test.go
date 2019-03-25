@@ -99,6 +99,7 @@ func TestLint(t *testing.T) {
 	pkgVar, pkgSpecified := os.LookupEnv("PKG")
 
 	t.Run("TestLowercaseFunctionNames", func(t *testing.T) {
+		t.Parallel()
 		reSkipCasedFunction, err := regexp.Compile(`^(Binary file.*|[^:]+:\d+:(` +
 			`query error .*` + // OK when in logic tests
 			`|` +
@@ -342,6 +343,180 @@ func TestLint(t *testing.T) {
 		}
 	})
 
+	t.Run("TestSQLTelemetryDirectCount", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(
+			pkgDir,
+			"git",
+			"grep",
+			"-nE",
+			`[^[:alnum:]]telemetry\.Count\(`,
+			"--",
+			"sql",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(filter, func(s string) {
+			t.Errorf("\n%s <- forbidden; use 'sqltelemetry.xxxCounter()' / `telemetry.Inc' instead", s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
+	t.Run("TestSQLTelemetryGetCounter", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(
+			pkgDir,
+			"git",
+			"grep",
+			"-nE",
+			`[^[:alnum:]]telemetry\.GetCounter`,
+			"--",
+			"sql",
+			":!sql/sqltelemetry",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(filter, func(s string) {
+			t.Errorf("\n%s <- forbidden; use 'sqltelemetry.xxxCounter() instead", s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
+	t.Run("TestCBOPanics", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(
+			pkgDir,
+			"git",
+			"grep",
+			"-nE",
+			fmt.Sprintf(`[^[:alnum:]]panic\((%s|"|[a-z]+Error\{errors\.(New|Errorf)|fmt\.Errorf)`, "`"),
+			"--",
+			"sql/opt",
+			":!sql/opt/optgen",
+			":!sql/opt/testutils",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(filter, func(s string) {
+			t.Errorf("\n%s <- forbidden; use panic(pgerror.NewAssertionErrorf()) instead", s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
+	t.Run("TestInternalErrorCodes", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(
+			pkgDir,
+			"git",
+			"grep",
+			"-nE",
+			`[^[:alnum:]]pgerror\.(NewError|Wrap).*pgerror\.CodeInternalError`,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(filter, func(s string) {
+			t.Errorf("\n%s <- forbidden; use pgerror.NewAssertionErrorf() instead", s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
+	t.Run("TestPGErrorWrap", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(
+			pkgDir,
+			"git",
+			"grep",
+			"-nE",
+			`[^[:alnum:]]errors\.Wrap`,
+			`--`,
+			`sql`,
+			// `ccl`,
+			`:!sql/pgwire/pgerror/*`,
+			`:!*_test.go`,
+			`:!*/execgen/*`,
+			`:!*/optgen/*`,
+			`:!*/langgen/*`,
+			`:!sql/logictest/*`,
+			`:!*/testutils/*`,
+			`:!*/workloadccl/*`,
+			`:!*/storageccl/*`,
+			`:!*/baseccl/*`,
+			`:!*/cdctest/*`,
+			`:!*/cliccl/*`,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(filter, func(s string) {
+			t.Errorf("\n%s <- forbidden; use pgerror.Wrapf/NewAssertionErrorWithWrappedErrf() instead", s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
 	t.Run("TestTodoStyle", func(t *testing.T) {
 		t.Parallel()
 		// TODO(tamird): enforce presence of name.
@@ -444,6 +619,7 @@ func TestLint(t *testing.T) {
 			":!server/debug/**",
 			":!workload/**",
 			":!*_test.go",
+			":!cli/debug_synctest.go",
 			":!cmd/**",
 		)
 		if err != nil {
@@ -479,6 +655,7 @@ func TestLint(t *testing.T) {
 			"*.go",
 			":!rpc/context_test.go",
 			":!rpc/context.go",
+			":!rpc/nodedialer/nodedialer_test.go",
 			":!util/grpcutil/grpc_util_test.go",
 			":!cli/systembench/network_test_server.go",
 		)
@@ -1094,30 +1271,56 @@ func TestLint(t *testing.T) {
 		t.Parallel()
 		// `go vet` is a special snowflake that emits all its output on
 		// `stderr.
+		//
+		// The -printfuncs functionality is interesting and
+		// under-documented. It checks two things:
+		//
+		// - that functions that accept formatting specifiers are given
+		//   arguments of the proper type.
+		// - that functions that don't accept formatting specifiers
+		//   are not given any.
+		//
+		// Whether a function takes a format string or not is determined
+		// as follows: (comment taken from the source of `go vet`)
+		//
+		//    A function may be a Printf or Print wrapper if its last argument is ...interface{}.
+		//    If the next-to-last argument is a string, then this may be a Printf wrapper.
+		//    Otherwise it may be a Print wrapper.
 		cmd := exec.Command("go", "vet", "-all", "-shadow", "-printfuncs",
 			strings.Join([]string{
-				"Info:1",
-				"Infof:1",
-				"InfofDepth:2",
-				"Warning:1",
-				"Warningf:1",
-				"WarningfDepth:2",
-				"Error:1",
-				"Errorf:1",
-				"ErrorfDepth:2",
-				"Fatal:1",
-				"Fatalf:1",
-				"FatalfDepth:2",
-				"Event:1",
-				"Eventf:1",
-				"ErrEvent:1",
-				"ErrEventf:1",
-				"NewError:1",
-				"NewErrorf:1",
-				"VEvent:2",
-				"VEventf:2",
-				"UnimplementedWithIssueErrorf:1",
-				"Wrapf:1",
+				"ErrEvent",
+				"ErrEventf",
+				"Error",
+				"Errorf",
+				"ErrorfDepth",
+				"Event",
+				"Eventf",
+				"Fatal",
+				"Fatalf",
+				"FatalfDepth",
+				"Info",
+				"Infof",
+				"InfofDepth",
+				"NewAssertionErrorWithDepthf",
+				"NewAssertionErrorWithWrappedErrf",
+				"NewAssertionErrorf",
+				"NewDangerousStatementErrorf",
+				"NewError",
+				"NewErrorWithDepthf",
+				"NewErrorf",
+				"SetDetailf",
+				"SetHintf",
+				"Unimplemented",
+				"UnimplementedWithDepth",
+				"UnimplementedWithIssueDetailErrorf",
+				"UnimplementedWithIssueErrorf",
+				"VEvent",
+				"VEventf",
+				"Warning",
+				"Warningf",
+				"WarningfDepth",
+				"Wrapf",
+				"WrapWithDepthf",
 			}, ","),
 			pkgScope,
 		)

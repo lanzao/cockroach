@@ -132,6 +132,9 @@ type Config struct {
 	// Note that values	less than or equal to zero will result in the use of
 	// DefaultInFlightBackpressureLimit.
 	InFlightBackpressureLimit int
+
+	// NowFunc is used to determine the current time. It defaults to timeutil.Now.
+	NowFunc func() time.Time
 }
 
 const (
@@ -199,6 +202,9 @@ func validateConfig(cfg *Config) {
 	if cfg.InFlightBackpressureLimit <= 0 {
 		cfg.InFlightBackpressureLimit = DefaultInFlightBackpressureLimit
 	}
+	if cfg.NowFunc == nil {
+		cfg.NowFunc = timeutil.Now
+	}
 }
 
 // SendWithChan sends a request with a client provided response channel. The
@@ -241,7 +247,8 @@ func (b *RequestBatcher) Send(
 	}
 }
 
-func (b *RequestBatcher) sendDone() {
+func (b *RequestBatcher) sendDone(ba *batch) {
+	b.pool.putBatch(ba)
 	select {
 	case b.sendDoneChan <- struct{}{}:
 	case <-b.cfg.Stopper.ShouldQuiesce():
@@ -250,7 +257,7 @@ func (b *RequestBatcher) sendDone() {
 
 func (b *RequestBatcher) sendBatch(ctx context.Context, ba *batch) {
 	b.cfg.Stopper.RunWorker(ctx, func(ctx context.Context) {
-		defer b.sendDone()
+		defer b.sendDone(ba)
 		resp, pErr := b.cfg.Sender.Send(ctx, ba.batchRequest())
 		for i, r := range ba.reqs {
 			res := Response{}
@@ -329,7 +336,7 @@ func (b *RequestBatcher) run(ctx context.Context) {
 			}
 		}
 		handleRequest = func(req *request) {
-			now := timeutil.Now()
+			now := b.cfg.NowFunc()
 			ba, existsInQueue := b.batches.get(req.rangeID)
 			if !existsInQueue {
 				ba = b.pool.newBatch(now)
@@ -350,7 +357,7 @@ func (b *RequestBatcher) run(ctx context.Context) {
 			if next := b.batches.peekFront(); next != nil {
 				nextDeadline = next.deadline
 			}
-			if !deadline.Equal(nextDeadline) {
+			if !deadline.Equal(nextDeadline) || timer.Read {
 				deadline = nextDeadline
 				if !deadline.IsZero() {
 					timer.Reset(time.Until(deadline))
@@ -360,7 +367,6 @@ func (b *RequestBatcher) run(ctx context.Context) {
 					timer.Stop()
 					timer = timeutil.NewTimer()
 				}
-				deadline = nextDeadline
 			}
 		}
 	)
@@ -479,6 +485,11 @@ func (p *pool) newBatch(now time.Time) *batch {
 	return ba
 }
 
+func (p *pool) putBatch(b *batch) {
+	*b = batch{}
+	p.batchPool.Put(b)
+}
+
 // batchQueue is a container for batch objects which offers O(1) get based on
 // rangeID and peekFront as well as O(log(n)) upsert, removal, popFront.
 // Batch structs are heap ordered inside of the batches slice based on their
@@ -545,7 +556,11 @@ func (q *batchQueue) Swap(i, j int) {
 }
 
 func (q *batchQueue) Less(i, j int) bool {
-	return q.batches[i].deadline.Before(q.batches[j].deadline)
+	idl, jdl := q.batches[i].deadline, q.batches[j].deadline
+	if before := idl.Before(jdl); before || !idl.Equal(jdl) {
+		return before
+	}
+	return q.batches[i].rangeID() < q.batches[j].rangeID()
 }
 
 func (q *batchQueue) Push(v interface{}) {

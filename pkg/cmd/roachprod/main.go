@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"os/user"
@@ -85,6 +86,7 @@ var (
 	external       = false
 	adminurlOpen   = false
 	adminurlPath   = ""
+	adminurlIPs    = false
 	useTreeDist    = true
 	encrypt        = false
 	quiet          = false
@@ -95,6 +97,8 @@ var (
 	logsFrom       time.Time
 	logsTo         time.Time
 	logsInterval   time.Duration
+
+	cachedHostsCluster string
 )
 
 func sortedClusters() []string {
@@ -192,6 +196,14 @@ func verifyClusterName(clusterName string) (string, error) {
 	}
 	if clusterName == config.Local {
 		return clusterName, nil
+	}
+
+	alphaNum, err := regexp.Compile(`^[a-zA-Z0-9\-]+$`)
+	if err != nil {
+		return "", err
+	}
+	if !alphaNum.MatchString(clusterName) {
+		return "", errors.Errorf("cluster name must match %s", alphaNum.String())
 	}
 
 	// Use the vm.Provider account names, or --username.
@@ -297,7 +309,7 @@ Local Clusters
   always named "local", and has no expiration (unlimited lifetime).
 `,
 	Args: cobra.ExactArgs(1),
-	Run: wrap(func(cmd *cobra.Command, args []string) error {
+	Run: wrap(func(cmd *cobra.Command, args []string) (retErr error) {
 		if numNodes <= 0 || numNodes >= 1000 {
 			// Upper limit is just for safety.
 			return fmt.Errorf("number of nodes must be in [1..999]")
@@ -307,6 +319,18 @@ Local Clusters
 		if err != nil {
 			return err
 		}
+
+		defer func() {
+			if retErr == nil || clusterName == config.Local {
+				return
+			}
+			fmt.Fprintf(os.Stderr, "Cleaning up partially-created cluster (prev err: %s)\n", retErr)
+			if err := cleanupFailedCreate(clusterName); err != nil {
+				fmt.Fprintf(os.Stderr, "Error while cleaning up partially-created cluster: %s\n", err)
+			} else {
+				fmt.Fprintf(os.Stderr, "Cleaning up OK\n")
+			}
+		}()
 
 		if clusterName != config.Local {
 			cloud, err := cld.ListCloud()
@@ -326,18 +350,9 @@ Local Clusters
 		}
 
 		fmt.Printf("Creating cluster %s with %d nodes\n", clusterName, numNodes)
-		if createErr := cld.CreateCluster(clusterName, numNodes, createVMOpts); createErr == nil {
-			fmt.Println("OK")
-		} else if clusterName == config.Local {
+		if createErr := cld.CreateCluster(clusterName, numNodes, createVMOpts); createErr != nil {
 			return createErr
-		} else {
-			fmt.Fprintf(os.Stderr, "Unable to create cluster:\n%s\nCleaning up...\n", createErr)
-			if err := cleanupFailedCreate(clusterName); err != nil {
-				fmt.Fprintf(os.Stderr, "Error while cleaning up partially-created cluster: %s\n", err)
-			}
-			os.Exit(1)
 		}
-
 		if clusterName != config.Local {
 			{
 				cloud, err := cld.ListCloud()
@@ -376,9 +391,23 @@ Local Clusters
 				if err != nil {
 					return err
 				}
-
 				if err := c.Wait(); err != nil {
 					return err
+				}
+				// If we are using AWS we need to fetch public keys from gcloud to set
+				// up ssh access for other users.
+				var haveAWS bool
+				for _, p := range createVMOpts.VMProviders {
+					if haveAWS = p == "aws"; haveAWS {
+						break
+					}
+				}
+				if haveAWS {
+					c.AuthorizedKeys, err = gce.GetUserAuthorizedKeys()
+					// Don't fail if we can't get other user's authorized keys, just log.
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "failed to retrieve authorized keys from gcloud: %v", err)
+					}
 				}
 				if err := c.SetupSSH(); err != nil {
 					return err
@@ -464,6 +493,39 @@ directory is removed.
 		}
 
 		fmt.Println("OK")
+		return nil
+	}),
+}
+
+var cachedHostsCmd = &cobra.Command{
+	Use:   "cached-hosts",
+	Short: "list all clusters (and optionally their host numbers) from local cache",
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		if err := loadClusters(); err != nil {
+			return err
+		}
+
+		names := make([]string, 0, len(install.Clusters))
+		for name := range install.Clusters {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+
+		for _, name := range names {
+			c := install.Clusters[name]
+			if strings.HasPrefix(c.Name, "teamcity") {
+				continue
+			}
+			fmt.Print(c.Name)
+			// when invokved by bash-completion, cachedHostsCluster is what the user
+			// has currently typed -- if this cluster matches that, expand its hosts.
+			if strings.HasPrefix(cachedHostsCluster, c.Name) {
+				for i := range c.VMs {
+					fmt.Printf(" %s:%d", c.Name, i+1)
+				}
+			}
+			fmt.Println()
+		}
 		return nil
 	}),
 }
@@ -663,6 +725,15 @@ func syncAll(cloud *cld.Cloud, quiet bool) error {
 	if err := syncHosts(cloud); err != nil {
 		return err
 	}
+
+	var vms vm.List
+	for _, c := range cloud.Clusters {
+		vms = append(vms, c.VMs...)
+	}
+	if err := gce.SyncDNS(vms); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to update %s DNS: %v", gce.Subdomain, err)
+	}
+
 	err = vm.ProvidersSequential(vm.AllProviderNames(), func(p vm.Provider) error {
 		return p.CleanSSH()
 	})
@@ -670,25 +741,8 @@ func syncAll(cloud *cld.Cloud, quiet bool) error {
 		return err
 	}
 
-	{
-		names := make([]string, 0, len(cloud.Clusters)*3)
-		for name, c := range cloud.Clusters {
-			names = append(names, name)
-			for i := range c.VMs {
-				names = append(names, fmt.Sprintf("%s:%d", name, i))
-			}
-		}
-		for _, cmd := range []*cobra.Command{
-			startCmd, stopCmd, wipeCmd,
-			extendCmd, destroyCmd,
-			statusCmd, monitorCmd,
-			runCmd, sqlCmd,
-			adminurlCmd, pgurlCmd, ipCmd,
-		} {
-			cmd.ValidArgs = names
-		}
-		_ = rootCmd.GenBashCompletionFile(bashCompletion)
-	}
+	_ = rootCmd.GenBashCompletionFile(bashCompletion)
+
 	return vm.ProvidersSequential(vm.AllProviderNames(), func(p vm.Provider) error {
 		return p.ConfigSSH()
 	})
@@ -1230,8 +1284,20 @@ var adminurlCmd = &cobra.Command{
 			return err
 		}
 
-		for _, node := range c.ServerNodes() {
-			ip := c.VMs[node-1]
+		for i, node := range c.ServerNodes() {
+			host := vm.Name(c.Name, node) + "." + gce.Subdomain
+
+			// verify DNS is working / fallback to IPs if not.
+			if i == 0 && !adminurlIPs {
+				if _, err := net.LookupHost(host); err != nil {
+					fmt.Fprintf(os.Stderr, "no valid DNS (yet?). might need to re-run `sync`?")
+					adminurlIPs = true
+				}
+			}
+
+			if adminurlIPs {
+				host = c.VMs[node-1]
+			}
 			port := install.GetAdminUIPort(c.Impl.NodePort(c, node))
 			scheme := "http"
 			if c.Secure {
@@ -1240,7 +1306,7 @@ var adminurlCmd = &cobra.Command{
 			if !strings.HasPrefix(adminurlPath, "/") {
 				adminurlPath = "/" + adminurlPath
 			}
-			url := fmt.Sprintf("%s://%s:%d%s", scheme, ip, port, adminurlPath)
+			url := fmt.Sprintf("%s://%s:%d%s", scheme, host, port, adminurlPath)
 			if adminurlOpen {
 				if err := exec.Command("python", "-m", "webbrowser", url).Run(); err != nil {
 					return err
@@ -1348,6 +1414,34 @@ func main() {
 
 		webCmd,
 		dumpCmd,
+		cachedHostsCmd,
+	)
+	rootCmd.BashCompletionFunction = fmt.Sprintf(`__custom_func()
+	{
+		# only complete the 2nd arg, e.g. adminurl <foo>
+		if ! [ $c -eq 2 ]; then
+			return
+		fi
+
+		# don't complete commands which do not accept a cluster/host arg
+		case ${last_command} in
+			%s)
+				return
+				;;
+		esac
+
+		local hosts_out
+		if hosts_out=$(roachprod cached-hosts --cluster="${cur}" 2>/dev/null); then
+				COMPREPLY=( $( compgen -W "${hosts_out[*]}" -- "$cur" ) )
+		fi
+
+	}`,
+		strings.Join(func(cmds ...*cobra.Command) (s []string) {
+			for _, cmd := range cmds {
+				s = append(s, fmt.Sprintf("%s_%s", rootCmd.Name(), cmd.Name()))
+			}
+			return s
+		}(createCmd, listCmd, syncCmd, gcCmd, webCmd, dumpCmd), " | "),
 	)
 
 	rootCmd.PersistentFlags().BoolVarP(
@@ -1406,6 +1500,8 @@ func main() {
 		&adminurlOpen, `open`, false, `Open the url in a browser`)
 	adminurlCmd.Flags().StringVar(
 		&adminurlPath, `path`, "/", `Path to add to URL (e.g. to open a same page on each node)`)
+	adminurlCmd.Flags().BoolVar(
+		&adminurlIPs, `ips`, false, `Use Public IPs instead of DNS names in URL`)
 
 	gcCmd.Flags().BoolVarP(
 		&dryrun, "dry-run", "n", dryrun, "dry run (don't perform any actions)")
@@ -1458,6 +1554,8 @@ func main() {
 	logsCmd.Flags().StringVar(
 		&logsDir, "logs-dir", "logs", "path to the logs dir, if remote, relative to username's home dir, ignored if local")
 
+	cachedHostsCmd.Flags().StringVar(&cachedHostsCluster, "cluster", "", "print hosts matching cluster")
+
 	for _, cmd := range []*cobra.Command{
 		getCmd, putCmd, runCmd, startCmd, statusCmd, stopCmd, testCmd,
 		wipeCmd, pgurlCmd, adminurlCmd, sqlCmd, installCmd,
@@ -1465,7 +1563,7 @@ func main() {
 		switch cmd {
 		case startCmd, testCmd:
 			cmd.Flags().BoolVar(
-				&install.StartOpts.Sequential, "sequential", false,
+				&install.StartOpts.Sequential, "sequential", true,
 				"start nodes sequentially so node IDs match hostnames")
 			cmd.Flags().StringArrayVarP(
 				&nodeArgs, "args", "a", nil, "node arguments")

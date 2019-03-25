@@ -19,11 +19,11 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/storage/batcheval/result"
-	"github.com/cockroachdb/cockroach/pkg/storage/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/intentresolver"
@@ -133,7 +133,8 @@ func (r *Replica) RangeFeed(
 	iteratorLimiter limit.ConcurrentRequestLimiter,
 ) *roachpb.Error {
 	if !RangefeedEnabled.Get(&r.store.cfg.Settings.SV) {
-		return roachpb.NewErrorf("rangefeeds are not enabled. See kv.rangefeed.enabled.")
+		return roachpb.NewErrorf("rangefeeds require the kv.rangefeed.enabled setting. See " +
+			base.DocsURL(`change-data-capture.html#enable-rangefeeds-to-reduce-latency`))
 	}
 	ctx := r.AnnotateCtx(stream.Context())
 
@@ -210,8 +211,15 @@ func (r *Replica) RangeFeed(
 	var catchUpIter engine.SimpleIterator
 	if usingCatchupIter {
 		innerIter := r.Engine().NewIterator(engine.IterOptions{
-			UpperBound:       args.Span.EndKey,
-			MinTimestampHint: args.Timestamp,
+			UpperBound: args.Span.EndKey,
+			// RangeFeed originally intended to use the time-bound iterator
+			// performance optimization. However, they've had correctness issues in
+			// the past (#28358, #34819) and no-one has the time for the due-diligence
+			// necessary to be confidant in their correctness going forward. Not using
+			// them causes the total time spent in RangeFeed catchup on changefeed
+			// over tpcc-1000 to go from 40s -> 4853s, which is quite large but still
+			// workable. See #35122 for details.
+			// MinTimestampHint: args.Timestamp,
 		})
 		catchUpIter = iteratorWithCloser{
 			SimpleIterator: innerIter,
@@ -235,6 +243,16 @@ func (r *Replica) RangeFeed(
 	return <-errC
 }
 
+// The size of an event is 112 bytes, so this will result in an allocation on
+// the order of ~512KB per RangeFeed. That's probably ok given the number of
+// ranges on a node that we'd like to support with active rangefeeds, but it's
+// certainly on the upper end of the range.
+//
+// TODO(dan): Everyone seems to agree that this memory limit would be better set
+// at a store-wide level, but there doesn't seem to be an easy way to accomplish
+// that.
+const defaultEventChanCap = 4096
+
 // maybeInitRangefeedRaftMuLocked initializes a rangefeed for the Replica if one
 // is not already running. Requires raftMu be locked.
 func (r *Replica) maybeInitRangefeedRaftMuLocked() *rangefeed.Processor {
@@ -250,8 +268,9 @@ func (r *Replica) maybeInitRangefeedRaftMuLocked() *rangefeed.Processor {
 		Clock:            r.Clock(),
 		Span:             desc.RSpan(),
 		TxnPusher:        &tp,
-		EventChanCap:     256,
+		EventChanCap:     defaultEventChanCap,
 		EventChanTimeout: 50 * time.Millisecond,
+		Metrics:          r.store.metrics.RangeFeedMetrics,
 	}
 	r.raftMu.rangefeed = rangefeed.NewProcessor(cfg)
 	r.store.addReplicaWithRangefeed(r.RangeID)
@@ -358,7 +377,8 @@ func (r *Replica) handleLogicalOpLogRaftMuLocked(ctx context.Context, ops *stora
 			key, ts, valPtr = t.Key, t.Timestamp, &t.Value
 		case *enginepb.MVCCWriteIntentOp,
 			*enginepb.MVCCUpdateIntentOp,
-			*enginepb.MVCCAbortIntentOp:
+			*enginepb.MVCCAbortIntentOp,
+			*enginepb.MVCCAbortTxnOp:
 			// Nothing to do.
 			continue
 		default:
@@ -404,15 +424,8 @@ func (r *Replica) handleClosedTimestampUpdateRaftMuLocked() {
 		return
 	}
 
-	r.mu.RLock()
-	lai := r.mu.state.LeaseAppliedIndex
-	lease := *r.mu.state.Lease
-	r.mu.RUnlock()
-
 	// Determine what the maximum closed timestamp is for this replica.
-	closedTS := r.store.cfg.ClosedTimestamp.Provider.MaxClosed(
-		lease.Replica.NodeID, r.RangeID, ctpb.Epoch(lease.Epoch), ctpb.LAI(lai),
-	)
+	closedTS := r.maxClosed(context.Background())
 
 	// If the closed timestamp is not empty, inform the Processor.
 	if closedTS.IsEmpty() {

@@ -12,6 +12,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -26,15 +27,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
-var changefeedPollInterval = settings.RegisterNonNegativeDurationSetting(
-	"changefeed.experimental_poll_interval",
-	"polling interval for the prototype changefeed implementation",
-	1*time.Second,
-)
-
-func init() {
-	changefeedPollInterval.Hide()
-}
+var changefeedPollInterval = func() *settings.DurationSetting {
+	s := settings.RegisterNonNegativeDurationSetting(
+		"changefeed.experimental_poll_interval",
+		"polling interval for the prototype changefeed implementation",
+		1*time.Second,
+	)
+	s.SetSensitive()
+	return s
+}()
 
 // PushEnabled is a cluster setting that triggers all subsequently
 // created/unpaused changefeeds to receive kv changes via RangeFeed push
@@ -42,7 +43,8 @@ func init() {
 var PushEnabled = settings.RegisterBoolSetting(
 	"changefeed.push.enabled",
 	"if set, changed are pushed instead of pulled. This requires the "+
-		"kv.rangefeed.enabled setting.",
+		"kv.rangefeed.enabled setting. See "+
+		base.DocsURL(`change-data-capture.html#enable-rangefeeds-to-reduce-latency`),
 	true,
 )
 
@@ -190,7 +192,7 @@ func emitEntries(
 		scratch, valueCopy = scratch.Copy(encodedValue, 0 /* extraCap */)
 
 		if knobs.BeforeEmitRow != nil {
-			if err := knobs.BeforeEmitRow(); err != nil {
+			if err := knobs.BeforeEmitRow(ctx); err != nil {
 				return err
 			}
 		}

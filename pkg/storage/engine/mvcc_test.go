@@ -2357,7 +2357,7 @@ func TestMVCCConditionalPut(t *testing.T) {
 
 	clock := hlc.NewClock(hlc.NewManualClock(123).UnixNano, time.Nanosecond)
 
-	err := MVCCConditionalPut(ctx, engine, nil, testKey1, clock.Now(), value1, &value2, nil)
+	err := MVCCConditionalPut(ctx, engine, nil, testKey1, clock.Now(), value1, &value2, CPutFailIfMissing, nil)
 	if err == nil {
 		t.Fatal("expected error on key not exists")
 	}
@@ -2371,7 +2371,7 @@ func TestMVCCConditionalPut(t *testing.T) {
 	}
 
 	// Verify the difference between missing value and empty value.
-	err = MVCCConditionalPut(ctx, engine, nil, testKey1, clock.Now(), value1, &valueEmpty, nil)
+	err = MVCCConditionalPut(ctx, engine, nil, testKey1, clock.Now(), value1, &valueEmpty, CPutFailIfMissing, nil)
 	if err == nil {
 		t.Fatal("expected error on key not exists")
 	}
@@ -2385,13 +2385,13 @@ func TestMVCCConditionalPut(t *testing.T) {
 	}
 
 	// Do a conditional put with expectation that the value is completely missing; will succeed.
-	err = MVCCConditionalPut(ctx, engine, nil, testKey1, clock.Now(), value1, nil, nil)
+	err = MVCCConditionalPut(ctx, engine, nil, testKey1, clock.Now(), value1, nil, CPutFailIfMissing, nil)
 	if err != nil {
 		t.Fatalf("expected success with condition that key doesn't yet exist: %v", err)
 	}
 
 	// Another conditional put expecting value missing will fail, now that value1 is written.
-	err = MVCCConditionalPut(ctx, engine, nil, testKey1, clock.Now(), value1, nil, nil)
+	err = MVCCConditionalPut(ctx, engine, nil, testKey1, clock.Now(), value1, nil, CPutFailIfMissing, nil)
 	if err == nil {
 		t.Fatal("expected error on key already exists")
 	}
@@ -2408,7 +2408,7 @@ func TestMVCCConditionalPut(t *testing.T) {
 	}
 
 	// Conditional put expecting wrong value2, will fail.
-	err = MVCCConditionalPut(ctx, engine, nil, testKey1, clock.Now(), value1, &value2, nil)
+	err = MVCCConditionalPut(ctx, engine, nil, testKey1, clock.Now(), value1, &value2, CPutFailIfMissing, nil)
 	if err == nil {
 		t.Fatal("expected error on key does not match")
 	}
@@ -2426,11 +2426,52 @@ func TestMVCCConditionalPut(t *testing.T) {
 	}
 
 	// Move to an empty value. Will succeed.
-	if err := MVCCConditionalPut(ctx, engine, nil, testKey1, clock.Now(), valueEmpty, &value1, nil); err != nil {
+	if err := MVCCConditionalPut(ctx, engine, nil, testKey1, clock.Now(), valueEmpty, &value1, CPutFailIfMissing, nil); err != nil {
 		t.Fatal(err)
 	}
+
+	// Move key2 (which does not exist) to from value1 to value2.
+	// Expect it to fail since it does not exist with value1.
+	err = MVCCConditionalPut(ctx, engine, nil, testKey2, clock.Now(), value2, &value1, CPutFailIfMissing, nil)
+	if err == nil {
+		t.Fatal("expected error on key not exists")
+	}
+	switch e := err.(type) {
+	default:
+		t.Fatalf("unexpected error %T", e)
+	case *roachpb.ConditionFailedError:
+		if e.ActualValue != nil {
+			t.Fatalf("expected missing actual value: %v", e.ActualValue)
+		}
+	}
+
+	// Move key2 (which does not yet exist) to from value1 to value2, but allowing for it not existing.
+	if err := MVCCConditionalPut(ctx, engine, nil, testKey2, clock.Now(), value2, &value1, CPutAllowIfMissing, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Try to move key2 (which has value2) from value1 to empty. Expect error.
+	err = MVCCConditionalPut(ctx, engine, nil, testKey2, clock.Now(), valueEmpty, &value1, CPutAllowIfMissing, nil)
+	if err == nil {
+		t.Fatal("expected error on key not exists")
+	}
+	switch e := err.(type) {
+	default:
+		t.Fatalf("unexpected error %T", e)
+	case *roachpb.ConditionFailedError:
+		if !bytes.Equal(e.ActualValue.RawBytes, value2.RawBytes) {
+			t.Fatalf("the value %s in get result does not match the value %s in request",
+				e.ActualValue.RawBytes, value2.RawBytes)
+		}
+	}
+
+	// Try to move key2 (which has value2) from value2 to empty. Expect success.
+	if err := MVCCConditionalPut(ctx, engine, nil, testKey2, clock.Now(), valueEmpty, &value2, CPutAllowIfMissing, nil); err != nil {
+		t.Fatal(err)
+	}
+
 	// Now move to value2 from expected empty value.
-	if err := MVCCConditionalPut(ctx, engine, nil, testKey1, clock.Now(), value2, &valueEmpty, nil); err != nil {
+	if err := MVCCConditionalPut(ctx, engine, nil, testKey1, clock.Now(), value2, &valueEmpty, CPutFailIfMissing, nil); err != nil {
 		t.Fatal(err)
 	}
 	// Verify we get value2 as expected.
@@ -2456,18 +2497,18 @@ func TestMVCCConditionalPutWithTxn(t *testing.T) {
 	// Write value1.
 	txn := *txn1
 	txn.Sequence++
-	if err := MVCCConditionalPut(ctx, engine, nil, testKey1, txn.OrigTimestamp, value1, nil, &txn); err != nil {
+	if err := MVCCConditionalPut(ctx, engine, nil, testKey1, txn.OrigTimestamp, value1, nil, CPutFailIfMissing, &txn); err != nil {
 		t.Fatal(err)
 	}
 	// Now, overwrite value1 with value2 from same txn; should see value1 as pre-existing value.
 	txn.Sequence++
-	if err := MVCCConditionalPut(ctx, engine, nil, testKey1, txn.OrigTimestamp, value2, &value1, &txn); err != nil {
+	if err := MVCCConditionalPut(ctx, engine, nil, testKey1, txn.OrigTimestamp, value2, &value1, CPutFailIfMissing, &txn); err != nil {
 		t.Fatal(err)
 	}
 	// Writing value3 from a new epoch should see nil again.
 	txn.Sequence++
 	txn.Epoch = 2
-	if err := MVCCConditionalPut(ctx, engine, nil, testKey1, txn.OrigTimestamp, value3, nil, &txn); err != nil {
+	if err := MVCCConditionalPut(ctx, engine, nil, testKey1, txn.OrigTimestamp, value3, nil, CPutFailIfMissing, &txn); err != nil {
 		t.Fatal(err)
 	}
 	// Commit value3.
@@ -2482,7 +2523,7 @@ func TestMVCCConditionalPutWithTxn(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Write value4 with an old timestamp without txn...should get a write too old error.
-	err := MVCCConditionalPut(ctx, engine, nil, testKey1, clock.Now(), value4, &value3, nil)
+	err := MVCCConditionalPut(ctx, engine, nil, testKey1, clock.Now(), value4, &value3, CPutFailIfMissing, nil)
 	if _, ok := err.(*roachpb.WriteTooOldError); !ok {
 		t.Fatalf("expected write too old error; got %s", err)
 	}
@@ -2657,24 +2698,24 @@ func TestMVCCConditionalPutWriteTooOld(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Try a non-transactional put @t=1ns with expectation of nil; should fail.
-	err = MVCCConditionalPut(ctx, engine, nil, testKey1, hlc.Timestamp{WallTime: 1}, value2, nil, nil)
+	err = MVCCConditionalPut(ctx, engine, nil, testKey1, hlc.Timestamp{WallTime: 1}, value2, nil, CPutFailIfMissing, nil)
 	if err == nil {
 		t.Fatal("expected error on conditional put")
 	}
 	// Now do a non-transactional put @t=1ns with expectation of value1; will succeed @t=10,1.
-	err = MVCCConditionalPut(ctx, engine, nil, testKey1, hlc.Timestamp{WallTime: 1}, value2, &value1, nil)
+	err = MVCCConditionalPut(ctx, engine, nil, testKey1, hlc.Timestamp{WallTime: 1}, value2, &value1, CPutFailIfMissing, nil)
 	expTS := hlc.Timestamp{WallTime: 10, Logical: 1}
 	if wtoErr, ok := err.(*roachpb.WriteTooOldError); !ok || wtoErr.ActualTimestamp != expTS {
 		t.Fatalf("expected WriteTooOldError with actual time = %s; got %s", expTS, err)
 	}
 	// Try a transactional put @t=1ns with expectation of value2; should fail.
 	txn := makeTxn(*txn1, hlc.Timestamp{WallTime: 1})
-	err = MVCCConditionalPut(ctx, engine, nil, testKey1, txn.OrigTimestamp, value2, &value1, txn)
+	err = MVCCConditionalPut(ctx, engine, nil, testKey1, txn.OrigTimestamp, value2, &value1, CPutFailIfMissing, txn)
 	if err == nil {
 		t.Fatal("expected error on conditional put")
 	}
 	// Now do a transactional put @t=1ns with expectation of nil; will succeed @t=10,2.
-	err = MVCCConditionalPut(ctx, engine, nil, testKey1, txn.OrigTimestamp, value3, nil, txn)
+	err = MVCCConditionalPut(ctx, engine, nil, testKey1, txn.OrigTimestamp, value3, nil, CPutFailIfMissing, txn)
 	expTS = hlc.Timestamp{WallTime: 10, Logical: 2}
 	if wtoErr, ok := err.(*roachpb.WriteTooOldError); !ok || wtoErr.ActualTimestamp != expTS {
 		t.Fatalf("expected WriteTooOldError with actual time = %s; got %s", expTS, err)
@@ -2876,6 +2917,43 @@ func TestMVCCReverseScanFirstKeyInFuture(t *testing.T) {
 	}
 }
 
+// Exposes a bug where the reverse MVCC scan can get stuck in an infinite loop
+// until we OOM. It happened in the code path optimized to use `SeekForPrev()`
+// after N `Prev()`s do not reach another logical key. Further, a write intent
+// needed to be present on the logical key to make it conflict with our chosen
+// `SeekForPrev()` target (logical key + '\0').
+func TestMVCCReverseScanSeeksOverRepeatedKeys(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+	engine := createTestEngine()
+	defer engine.Close()
+
+	// 10 is the value of `kMaxItersBeforeSeek` at the time this test case was
+	// written. Repeat the key enough times to make sure the `SeekForPrev()`
+	// optimization will be used.
+	for i := 1; i <= 10; i++ {
+		if err := MVCCPut(ctx, engine, nil, testKey2, hlc.Timestamp{WallTime: int64(i)}, value2, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	txn1ts := makeTxn(*txn1, hlc.Timestamp{WallTime: 11})
+	if err := MVCCPut(ctx, engine, nil, testKey2, txn1ts.OrigTimestamp, value2, txn1ts); err != nil {
+		t.Fatal(err)
+	}
+
+	kvs, _, _, err := MVCCScan(ctx, engine, testKey1, testKey3, math.MaxInt64,
+		hlc.Timestamp{WallTime: 1}, MVCCScanOptions{Reverse: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(kvs) != 1 ||
+		!bytes.Equal(kvs[0].Key, testKey2) ||
+		!bytes.Equal(kvs[0].Value.RawBytes, value2.RawBytes) {
+		t.Fatal("unexpected scan results")
+	}
+}
+
 func TestMVCCResolveTxn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -3031,7 +3109,7 @@ func TestMVCCConditionalPutOldTimestamp(t *testing.T) {
 	}
 
 	// Check nothing is written if the value doesn't match.
-	err = MVCCConditionalPut(ctx, engine, nil, testKey1, hlc.Timestamp{WallTime: 2}, value3, &value1, nil)
+	err = MVCCConditionalPut(ctx, engine, nil, testKey1, hlc.Timestamp{WallTime: 2}, value3, &value1, CPutFailIfMissing, nil)
 	if err == nil {
 		t.Errorf("unexpected success on conditional put")
 	}
@@ -3041,7 +3119,7 @@ func TestMVCCConditionalPutOldTimestamp(t *testing.T) {
 
 	// But if value does match the most recently written version, we'll get
 	// a write too old error but still write updated value.
-	err = MVCCConditionalPut(ctx, engine, nil, testKey1, hlc.Timestamp{WallTime: 2}, value3, &value2, nil)
+	err = MVCCConditionalPut(ctx, engine, nil, testKey1, hlc.Timestamp{WallTime: 2}, value3, &value2, CPutFailIfMissing, nil)
 	if err == nil {
 		t.Errorf("unexpected success on conditional put")
 	}

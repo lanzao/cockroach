@@ -79,6 +79,29 @@ var schemaChangeLeaseRenewFraction = settings.RegisterFloatSetting(
 // attempting to become the job coordinator.
 const asyncSchemaChangeDelay = 1 * time.Minute
 
+const (
+	// RunningStatusDrainingNames is for jobs that are currently in progress and
+	// are draining names.
+	RunningStatusDrainingNames jobs.RunningStatus = "draining names"
+	// RunningStatusWaitingGC is for jobs that are currently in progress and
+	// are waiting for the GC interval to expire
+	RunningStatusWaitingGC jobs.RunningStatus = "waiting for GC TTL"
+	// RunningStatusCompaction is for jobs that are currently in progress and
+	// undergoing RocksDB compaction
+	RunningStatusCompaction jobs.RunningStatus = "RocksDB compaction"
+	// RunningStatusDeleteOnly is for jobs that are currently waiting on
+	// the cluster to converge to seeing the schema element in the DELETE_ONLY
+	// state.
+	RunningStatusDeleteOnly jobs.RunningStatus = "waiting in DELETE-ONLY"
+	// RunningStatusDeleteAndWriteOnly is for jobs that are currently waiting on
+	// the cluster to converge to seeing the schema element in the
+	// DELETE_AND_WRITE_ONLY state.
+	RunningStatusDeleteAndWriteOnly jobs.RunningStatus = "waiting in DELETE-AND-WRITE_ONLY"
+	// RunningStatusBackfill is for jobs that are currently running a backfill
+	// for a schema element.
+	RunningStatusBackfill jobs.RunningStatus = "populating schema"
+)
+
 type droppedIndex struct {
 	indexID  sqlbase.IndexID
 	dropTime int64
@@ -192,10 +215,9 @@ func isPermanentSchemaChangeError(err error) bool {
 			return false
 
 		case pgerror.CodeInternalError:
-			if err.Message == context.DeadlineExceeded.Error() {
+			if strings.Contains(err.Message, context.DeadlineExceeded.Error()) {
 				return false
 			}
-
 		}
 	}
 
@@ -203,11 +225,11 @@ func isPermanentSchemaChangeError(err error) bool {
 }
 
 var (
-	errExistingSchemaChangeLease  = errors.New("an outstanding schema change lease exists")
-	errExpiredSchemaChangeLease   = errors.New("the schema change lease has expired")
-	errSchemaChangeNotFirstInLine = errors.New("schema change not first in line")
-	errNotHitGCTTLDeadline        = errors.New("not hit gc ttl deadline")
-	errSchemaChangeDuringDrain    = errors.New("a schema change ran during the drain phase, re-increment")
+	errExistingSchemaChangeLease  = pgerror.NewErrorf(pgerror.CodeDataExceptionError, "an outstanding schema change lease exists")
+	errExpiredSchemaChangeLease   = pgerror.NewErrorf(pgerror.CodeDataExceptionError, "the schema change lease has expired")
+	errSchemaChangeNotFirstInLine = pgerror.NewErrorf(pgerror.CodeDataExceptionError, "schema change not first in line")
+	errNotHitGCTTLDeadline        = pgerror.NewErrorf(pgerror.CodeDataExceptionError, "not hit gc ttl deadline")
+	errSchemaChangeDuringDrain    = pgerror.NewErrorf(pgerror.CodeDataExceptionError, "a schema change ran during the drain phase, re-increment")
 )
 
 func shouldLogSchemaChangeError(err error) bool {
@@ -275,7 +297,7 @@ func (sc *SchemaChanger) findTableWithLease(
 		return nil, err
 	}
 	if tableDesc.Lease == nil {
-		return nil, errors.Errorf("no lease present for tableID: %d", sc.tableID)
+		return nil, pgerror.NewAssertionErrorf("no lease present for tableID: %d", log.Safe(sc.tableID))
 	}
 	if *tableDesc.Lease != lease {
 		log.Errorf(ctx, "table: %d has lease: %v, expected: %v", sc.tableID, tableDesc.Lease, lease)
@@ -384,7 +406,8 @@ func (sc *SchemaChanger) DropTableDesc(
 					b.DelRange(dbZoneKeyPrefix, dbZoneKeyPrefix.PrefixEnd(), false /* returnKeys */)
 					return nil
 				}); err != nil {
-				return errors.Wrapf(err, "failed to update job %d", tableDesc.GetDropJobID())
+				return pgerror.NewAssertionErrorWithWrappedErrf(err,
+					"failed to update job %d", log.Safe(tableDesc.GetDropJobID()))
 			}
 		}
 		return txn.Run(ctx, b)
@@ -596,7 +619,7 @@ func (sc *SchemaChanger) maybeGCMutations(
 		}
 	}
 	if !found {
-		return errors.Errorf("no GC mutation for index %d", sc.dropIndexTimes[0].indexID)
+		return pgerror.NewAssertionErrorf("no GC mutation for index %d", log.Safe(sc.dropIndexTimes[0].indexID))
 	}
 
 	// Check if the deadline for GC'd dropped index expired because
@@ -670,7 +693,7 @@ func (sc *SchemaChanger) updateDropTableJob(
 
 	schemaDetails, ok := job.Details().(jobspb.SchemaChangeDetails)
 	if !ok {
-		return errors.Errorf("unexpected details for job %d", *job.ID())
+		return pgerror.NewAssertionErrorf("unexpected details for job %d: %T", log.Safe(*job.ID()), job.Details())
 	}
 
 	lowestStatus := jobspb.Status_DONE
@@ -687,15 +710,15 @@ func (sc *SchemaChanger) updateDropTableJob(
 	var runningStatus jobs.RunningStatus
 	switch lowestStatus {
 	case jobspb.Status_DRAINING_NAMES:
-		runningStatus = jobs.RunningStatusDrainingNames
+		runningStatus = RunningStatusDrainingNames
 	case jobspb.Status_WAIT_FOR_GC_INTERVAL:
-		runningStatus = jobs.RunningStatusWaitingGC
+		runningStatus = RunningStatusWaitingGC
 	case jobspb.Status_ROCKSDB_COMPACTION:
-		runningStatus = jobs.RunningStatusCompaction
+		runningStatus = RunningStatusCompaction
 	case jobspb.Status_DONE:
 		return job.WithTxn(txn).Succeeded(ctx, onSuccess)
 	default:
-		return errors.Errorf("unexpected dropped table status %d", lowestStatus)
+		return pgerror.NewAssertionErrorf("unexpected dropped table status %d", log.Safe(lowestStatus))
 	}
 
 	if err := job.WithTxn(txn).SetDetails(ctx, schemaDetails); err != nil {
@@ -792,15 +815,20 @@ func (sc *SchemaChanger) exec(
 	// Wait for the schema change to propagate to all nodes after this function
 	// returns, so that the new schema is live everywhere. This is not needed for
 	// correctness but is done to make the UI experience/tests predictable.
-	waitToUpdateLeases := func() {
+	waitToUpdateLeases := func(refreshStats bool) {
 		if err := sc.waitToUpdateLeases(ctx, sc.tableID); err != nil {
 			log.Warning(ctx, err)
+		}
+		// We wait to trigger a stats refresh until we know the leases have been
+		// updated.
+		if refreshStats {
+			sc.refreshStats()
 		}
 	}
 
 	if sc.mutationID == sqlbase.InvalidMutationID {
 		// Nothing more to do.
-		waitToUpdateLeases()
+		waitToUpdateLeases(false /* refreshStats */)
 		return nil
 	}
 
@@ -842,10 +870,16 @@ func (sc *SchemaChanger) exec(
 		}
 	}
 
-	defer waitToUpdateLeases()
+	if err := sc.initJobRunningStatus(ctx); err != nil {
+		if log.V(2) {
+			log.Infof(ctx, "Failed to update job %d running status: %v", *sc.job.ID(), err)
+		}
+	}
 
 	// Run through mutation state machine and backfill.
 	err = sc.runStateMachineAndBackfill(ctx, &lease, evalCtx)
+
+	defer waitToUpdateLeases(err == nil /* refreshStats */)
 
 	// Purge the mutations if the application of the mutations failed due to
 	// a permanent error. All other errors are transient errors that are
@@ -857,6 +891,49 @@ func (sc *SchemaChanger) exec(
 	}
 
 	return err
+}
+
+// initialize the job running status.
+func (sc *SchemaChanger) initJobRunningStatus(ctx context.Context) error {
+	return sc.db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+		desc, err := sqlbase.GetTableDescFromID(ctx, txn, sc.tableID)
+		if err != nil {
+			return err
+		}
+
+		var runStatus jobs.RunningStatus
+		for _, mutation := range desc.Mutations {
+			if mutation.MutationID != sc.mutationID {
+				// Mutations are applied in a FIFO order. Only apply the first set of
+				// mutations if they have the mutation ID we're looking for.
+				break
+			}
+
+			switch mutation.Direction {
+			case sqlbase.DescriptorMutation_ADD:
+				switch mutation.State {
+				case sqlbase.DescriptorMutation_DELETE_ONLY:
+					runStatus = RunningStatusDeleteOnly
+				}
+
+			case sqlbase.DescriptorMutation_DROP:
+				switch mutation.State {
+				case sqlbase.DescriptorMutation_DELETE_AND_WRITE_ONLY:
+					runStatus = RunningStatusDeleteAndWriteOnly
+				}
+			}
+		}
+		if runStatus != "" && !desc.Dropped() {
+			if err := sc.job.WithTxn(txn).RunningStatus(
+				ctx, func(ctx context.Context, details jobspb.Details) (jobs.RunningStatus, error) {
+					return runStatus, nil
+				}); err != nil {
+				return pgerror.NewAssertionErrorWithWrappedErrf(err,
+					"failed to update running status of job %d", log.Safe(*sc.job.ID()))
+			}
+		}
+		return nil
+	})
 }
 
 func (sc *SchemaChanger) rollbackSchemaChange(
@@ -890,8 +967,10 @@ func (sc *SchemaChanger) rollbackSchemaChange(
 // and wait to ensure that all nodes are seeing the latest version
 // of the table.
 func (sc *SchemaChanger) RunStateMachineBeforeBackfill(ctx context.Context) error {
+	var runStatus jobs.RunningStatus
 	if _, err := sc.leaseMgr.Publish(ctx, sc.tableID, func(desc *sqlbase.MutableTableDescriptor) error {
-		var modified bool
+
+		runStatus = ""
 		// Apply mutations belonging to the same version.
 		for i, mutation := range desc.Mutations {
 			if mutation.MutationID != sc.mutationID {
@@ -910,7 +989,7 @@ func (sc *SchemaChanger) RunStateMachineBeforeBackfill(ctx context.Context) erro
 					// DELETE_AND_WRITE_ONLY state to fill in the missing elements of the
 					// index (INSERT and UPDATE that happened in the interim).
 					desc.Mutations[i].State = sqlbase.DescriptorMutation_DELETE_AND_WRITE_ONLY
-					modified = true
+					runStatus = RunningStatusDeleteAndWriteOnly
 
 				case sqlbase.DescriptorMutation_DELETE_AND_WRITE_ONLY:
 					// The state change has already moved forward.
@@ -923,18 +1002,29 @@ func (sc *SchemaChanger) RunStateMachineBeforeBackfill(ctx context.Context) erro
 
 				case sqlbase.DescriptorMutation_DELETE_AND_WRITE_ONLY:
 					desc.Mutations[i].State = sqlbase.DescriptorMutation_DELETE_ONLY
-					modified = true
+					runStatus = RunningStatusDeleteOnly
 				}
 			}
 		}
-		if !modified {
+		if doNothing := runStatus == "" || desc.Dropped(); doNothing {
 			// Return error so that Publish() doesn't increment the version.
 			return errDidntUpdateDescriptor
 		}
 		return nil
-	}, nil); err != nil {
+	}, func(txn *client.Txn) error {
+		if sc.job != nil {
+			if err := sc.job.WithTxn(txn).RunningStatus(ctx, func(ctx context.Context, details jobspb.Details) (jobs.RunningStatus, error) {
+				return runStatus, nil
+			}); err != nil {
+				return pgerror.NewAssertionErrorWithWrappedErrf(err,
+					"failed to update running status of job %d", log.Safe(*sc.job.ID()))
+			}
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
+
 	// wait for the state change to propagate to all leases.
 	return sc.waitToUpdateLeases(ctx, sc.tableID)
 }
@@ -1017,13 +1107,15 @@ func (sc *SchemaChanger) done(ctx context.Context) (*sqlbase.ImmutableTableDescr
 	}, func(txn *client.Txn) error {
 		if jobSucceeded {
 			if err := sc.job.WithTxn(txn).Succeeded(ctx, jobs.NoopFn); err != nil {
-				return errors.Wrapf(err, "failed to mark job %d as successful", *sc.job.ID())
+				return pgerror.NewAssertionErrorWithWrappedErrf(err,
+					"failed to mark job %d as successful", log.Safe(*sc.job.ID()))
 			}
 		} else {
 			if err := sc.job.WithTxn(txn).RunningStatus(ctx, func(ctx context.Context, details jobspb.Details) (jobs.RunningStatus, error) {
-				return jobs.RunningStatusWaitingGC, nil
+				return RunningStatusWaitingGC, nil
 			}); err != nil {
-				return errors.Wrapf(err, "failed to update running status of job %d", *sc.job.ID())
+				return pgerror.NewAssertionErrorWithWrappedErrf(err,
+					"failed to update running status of job %d", log.Safe(*sc.job.ID()))
 			}
 		}
 
@@ -1099,6 +1191,17 @@ func (sc *SchemaChanger) runStateMachineAndBackfill(
 	return err
 }
 
+func (sc *SchemaChanger) refreshStats() {
+	// Initiate an asynchronous run of CREATE STATISTICS. We use a large number
+	// for rowsAffected because we want to make sure that stats always get
+	// created/refreshed here.
+	sc.execCfg.StatsRefresher.NotifyMutation(
+		&sc.settings.SV,
+		sc.tableID,
+		math.MaxInt32, /* rowsAffected */
+	)
+}
+
 // reverseMutations reverses the direction of all the mutations with the
 // mutationID. This is called after hitting an irrecoverable error while
 // applying a schema change. If a column being added is reversed and droped,
@@ -1130,7 +1233,7 @@ func (sc *SchemaChanger) reverseMutations(ctx context.Context, causingError erro
 			if mutation.Rollback {
 				// Can actually never happen. This prevents a rollback of
 				// an already rolled back mutation.
-				return errors.Errorf("mutation already rolled back: %v", mutation)
+				return pgerror.NewAssertionErrorf("mutation already rolled back: %v", mutation)
 			}
 
 			log.Warningf(ctx, "reverse schema change mutation: %+v", mutation)
@@ -1141,7 +1244,7 @@ func (sc *SchemaChanger) reverseMutations(ctx context.Context, causingError erro
 			if constraint := mutation.GetConstraint(); constraint != nil &&
 				mutation.Direction == sqlbase.DescriptorMutation_ADD {
 				log.Warningf(ctx, "dropping constraint %+v", constraint)
-				if err := sc.dropValidatingConstraint(desc, constraint); err != nil {
+				if err := sc.maybeDropValidatingConstraint(ctx, desc, constraint); err != nil {
 					return err
 				}
 			}
@@ -1291,31 +1394,29 @@ func (sc *SchemaChanger) createRollbackJob(
 		}
 	}
 	// Cannot get here.
-	return nil, fmt.Errorf("no job found for table %d mutation %d", sc.tableID, sc.mutationID)
+	return nil, pgerror.NewAssertionErrorf("no job found for table %d mutation %d", log.Safe(sc.tableID), log.Safe(sc.mutationID))
 }
 
-func (sc *SchemaChanger) dropValidatingConstraint(
-	desc *MutableTableDescriptor, constraint *sqlbase.ConstraintToValidate,
+func (sc *SchemaChanger) maybeDropValidatingConstraint(
+	ctx context.Context, desc *MutableTableDescriptor, constraint *sqlbase.ConstraintToUpdate,
 ) error {
 	switch constraint.ConstraintType {
-	case sqlbase.ConstraintToValidate_CHECK:
-		check, err := desc.FindCheckByName(constraint.Name)
-		if err != nil {
-			return err
-		}
-		// This isn't possible right now, but will be when it becomes possible to add constraints as NOT VALID
-		if check.Validity == sqlbase.ConstraintValidity_Unvalidated {
-			break
-		}
-
+	case sqlbase.ConstraintToUpdate_CHECK:
 		for j, c := range desc.Checks {
 			if c.Name == constraint.Name {
 				desc.Checks = append(desc.Checks[:j], desc.Checks[j+1:]...)
-				break
+				return nil
 			}
 		}
+		if log.V(2) {
+			log.Infof(
+				ctx,
+				"attempted to drop constraint %s, but it hadn't been added to the table descriptor yet",
+				constraint.Name,
+			)
+		}
 	default:
-		return errors.Errorf("unsupported constraint type: %d", constraint.ConstraintType)
+		return pgerror.NewAssertionErrorf("unsupported constraint type: %d", log.Safe(constraint.ConstraintType))
 	}
 	return nil
 }
@@ -1556,6 +1657,7 @@ func (s *SchemaChangeManager) Start(stopper *stop.Stopper) {
 		if s.testingKnobs.AsyncExecQuickly {
 			delay = 20 * time.Millisecond
 		}
+		defTTL := config.DefaultZoneConfig().GC.TTLSeconds
 
 		execOneSchemaChange := func(schemaChangers map[sqlbase.ID]SchemaChanger) {
 			for tableID, sc := range schemaChangers {
@@ -1615,8 +1717,12 @@ func (s *SchemaChangeManager) Start(stopper *stop.Stopper) {
 					for id, sc := range s.forGC {
 						zoneCfg, placeholder, _, err := ZoneConfigHook(cfg, uint32(id))
 						if err != nil {
-							log.Errorf(ctx, "no zone config for desc: %d", id)
+							log.Errorf(ctx, "zone config for desc: %d, err = %+v", id, err)
 							return
+						}
+						if zoneCfg == nil {
+							// Do nothing, use the old zone config's TTL.
+							continue
 						}
 						if placeholder == nil {
 							placeholder = zoneCfg
@@ -1711,22 +1817,25 @@ func (s *SchemaChangeManager) Start(stopper *stop.Stopper) {
 						if len(table.GCMutations) > 0 {
 							zoneCfg, placeholder, _, err := ZoneConfigHook(cfg, uint32(table.ID))
 							if err != nil {
-								log.Errorf(ctx, "no zone config for desc: %d", table.ID)
+								log.Errorf(ctx, "zone config for desc: %d, err = %+v", table.ID, err)
 								return
 							}
+
 							if placeholder == nil {
 								placeholder = zoneCfg
 							}
 
 							for _, m := range table.GCMutations {
-								ttlSeconds := zoneCfg.GC.TTLSeconds
-								if subzone := placeholder.GetSubzone(uint32(m.IndexID), ""); subzone != nil {
-									ttlSeconds = subzone.Config.GC.TTLSeconds
+								// Initialize TTL without a zone config in case it's not present.
+								ttlSeconds := defTTL
+								if zoneCfg != nil {
+									ttlSeconds = zoneCfg.GC.TTLSeconds
+									if subzone := placeholder.GetSubzone(uint32(m.IndexID), ""); subzone != nil {
+										ttlSeconds = subzone.Config.GC.TTLSeconds
+									}
 								}
+								deadline := m.DropTime + int64(delay) + int64(ttlSeconds)*time.Second.Nanoseconds()
 
-								deadline := m.DropTime +
-									int64(ttlSeconds)*time.Second.Nanoseconds() +
-									int64(delay)
 								dropped := droppedIndex{m.IndexID, m.DropTime, deadline}
 								if minDeadline == 0 || deadline < minDeadline {
 									minDeadline = deadline
@@ -1760,12 +1869,17 @@ func (s *SchemaChangeManager) Start(stopper *stop.Stopper) {
 								schemaChanger.dropTime = table.DropTime
 								zoneCfg, _, _, err := ZoneConfigHook(cfg, uint32(table.ID))
 								if err != nil {
-									log.Errorf(ctx, "no zone config for desc: %d", table.ID)
+									log.Errorf(ctx, "zone config for desc: %d, err: %+v", table.ID, err)
 									return
 								}
-								deadline := table.DropTime +
-									int64(zoneCfg.GC.TTLSeconds)*time.Second.Nanoseconds() +
-									int64(delay)
+
+								// Initialize deadline without a zone config in case it's not present.
+								deadline := table.DropTime + int64(delay)
+								if zoneCfg != nil {
+									deadline += int64(zoneCfg.GC.TTLSeconds) * time.Second.Nanoseconds()
+								} else {
+									deadline += int64(defTTL) * time.Second.Nanoseconds()
+								}
 								if minDeadline == 0 || deadline < minDeadline {
 									minDeadline = deadline
 								}
@@ -1859,9 +1973,10 @@ func createSchemaChangeEvalCtx(
 			InternalExecutor: ieFactory(ctx, sd),
 			// TODO(andrei): This is wrong (just like on the main code path on
 			// setupFlow). Each processor should override Ctx with its own context.
-			Context:  ctx,
-			Sequence: &sqlbase.DummySequenceOperators{},
-			Planner:  &sqlbase.DummyEvalPlanner{},
+			Context:         ctx,
+			Sequence:        &sqlbase.DummySequenceOperators{},
+			Planner:         &sqlbase.DummyEvalPlanner{},
+			SessionAccessor: &sqlbase.DummySessionAccessor{},
 		},
 	}
 	// The backfill is going to use the current timestamp for the various

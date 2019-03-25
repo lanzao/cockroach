@@ -45,6 +45,11 @@ func unimplemented(sqllex sqlLexer, feature string) int {
     return 1
 }
 
+func setErr(sqllex sqlLexer, err error) int {
+	sqllex.(*lexer).setErr(err)
+	return 1
+}
+
 func unimplementedWithIssue(sqllex sqlLexer, issue int) int {
     sqllex.(*lexer).UnimplementedWithIssue(issue)
     return 1
@@ -500,7 +505,7 @@ func newNameFromStr(s string) *tree.Name {
 
 %token <str> GLOBAL GRANT GRANTS GREATEST GROUP GROUPING GROUPS
 
-%token <str> HAVING HIGH HISTOGRAM HOUR
+%token <str> HAVING HASH HIGH HISTOGRAM HOUR
 
 %token <str> IMMEDIATE IMPORT INCREMENT INCREMENTAL IF IFERROR IFNULL ILIKE IN ISERROR
 %token <str> INET INET_CONTAINED_BY_OR_EQUALS INET_CONTAINS_OR_CONTAINED_BY
@@ -514,9 +519,9 @@ func newNameFromStr(s string) *tree.Name {
 
 %token <str> LANGUAGE LATERAL LC_CTYPE LC_COLLATE
 %token <str> LEADING LEASE LEAST LEFT LESS LEVEL LIKE LIMIT LIST LOCAL
-%token <str> LOCALTIME LOCALTIMESTAMP LOW LSHIFT
+%token <str> LOCALTIME LOCALTIMESTAMP LOOKUP LOW LSHIFT
 
-%token <str> MATCH MATERIALIZED MINVALUE MAXVALUE MINUTE MONTH
+%token <str> MATCH MATERIALIZED MERGE MINVALUE MAXVALUE MINUTE MONTH
 
 %token <str> NAN NAME NAMES NATURAL NEXT NO NO_INDEX_JOIN NORMAL
 %token <str> NOT NOTHING NOTNULL NULL NULLIF NUMERIC
@@ -716,6 +721,7 @@ func newNameFromStr(s string) *tree.Name {
 %type <tree.Statement> show_ranges_stmt
 %type <tree.Statement> show_roles_stmt
 %type <tree.Statement> show_schemas_stmt
+%type <tree.Statement> show_sequences_stmt
 %type <tree.Statement> show_session_stmt
 %type <tree.Statement> show_sessions_stmt
 %type <tree.Statement> show_stats_stmt
@@ -828,6 +834,7 @@ func newNameFromStr(s string) *tree.Name {
 %type <empty> join_outer
 %type <tree.JoinCond> join_qual
 %type <str> join_type
+%type <str> opt_join_hint
 
 %type <tree.Exprs> extract_list
 %type <tree.Exprs> overlay_list
@@ -838,7 +845,7 @@ func newNameFromStr(s string) *tree.Name {
 %type <tree.DurationField> opt_interval interval_second interval_qualifier
 %type <tree.Expr> overlay_placing
 
-%type <bool> opt_unique
+%type <bool> opt_unique opt_cluster
 %type <bool> opt_using_gin_btree
 
 %type <*tree.Limit> limit_clause offset_clause opt_limit_clause
@@ -1414,8 +1421,18 @@ alter_table_cmds:
   }
 
 alter_table_cmd:
+  // ALTER TABLE <name> RENAME [COLUMN] <name> TO <newname>
+  RENAME opt_column column_name TO column_name
+  {
+    $$.val = &tree.AlterTableRenameColumn{Column: tree.Name($3), NewName: tree.Name($5) }
+  }
+  // ALTER TABLE <name> RENAME CONSTRAINT <name> TO <newname>
+| RENAME CONSTRAINT column_name TO column_name
+  {
+    $$.val = &tree.AlterTableRenameConstraint{Constraint: tree.Name($3), NewName: tree.Name($5) }
+  }
   // ALTER TABLE <name> ADD <coldef>
-  ADD column_def
+| ADD column_def
   {
     $$.val = &tree.AlterTableAddColumn{IfNotExists: false, ColumnDef: $2.colDef()}
   }
@@ -1954,8 +1971,7 @@ comment_stmt:
   {
     varName, err := $4.unresolvedName().NormalizeVarName()
     if err != nil {
-      sqllex.Error(err.Error())
-      return 1
+      return setErr(sqllex, err)
     }
 
     columnItem, ok := varName.(*tree.ColumnItem)
@@ -1974,7 +1990,8 @@ comment_stmt:
 comment_text:
   SCONST
   {
-    $$.val = &$1
+    t := $1
+    $$.val = &t
   }
 | NULL
   {
@@ -2581,8 +2598,7 @@ privileges:
   {
      privList, err := privilege.ListFromStrings($1.nameList().ToStrings())
      if err != nil {
-       sqllex.Error(err.Error())
-       return 1
+       return setErr(sqllex, err)
      }
      $$.val = privList
   }
@@ -3011,9 +3027,10 @@ zone_value:
 // %Category: Group
 // %Text:
 // SHOW BACKUP, SHOW CLUSTER SETTING, SHOW COLUMNS, SHOW CONSTRAINTS,
-// SHOW CREATE, SHOW DATABASES, SHOW HISTOGRAM, SHOW INDEXES, SHOW JOBS,
-// SHOW QUERIES, SHOW ROLES, SHOW SESSION, SHOW SESSIONS, SHOW STATISTICS,
-// SHOW SYNTAX, SHOW TABLES, SHOW TRACE SHOW TRANSACTION, SHOW USERS
+// SHOW CREATE, SHOW DATABASES, SHOW HISTOGRAM, SHOW INDEXES, SHOW
+// JOBS, SHOW QUERIES, SHOW ROLES, SHOW SCHEMAS, SHOW SEQUENCES, SHOW
+// SESSION, SHOW SESSIONS, SHOW STATISTICS, SHOW SYNTAX, SHOW TABLES,
+// SHOW TRACE SHOW TRANSACTION, SHOW USERS
 show_stmt:
   show_backup_stmt          // EXTEND WITH HELP: SHOW BACKUP
 | show_columns_stmt         // EXTEND WITH HELP: SHOW COLUMNS
@@ -3030,6 +3047,7 @@ show_stmt:
 | show_ranges_stmt          // EXTEND WITH HELP: SHOW RANGES
 | show_roles_stmt           // EXTEND WITH HELP: SHOW ROLES
 | show_schemas_stmt         // EXTEND WITH HELP: SHOW SCHEMAS
+| show_sequences_stmt       // EXTEND WITH HELP: SHOW SEQUENCES
 | show_session_stmt         // EXTEND WITH HELP: SHOW SESSION
 | show_sessions_stmt        // EXTEND WITH HELP: SHOW SESSIONS
 | show_stats_stmt           // EXTEND WITH HELP: SHOW STATISTICS
@@ -3102,8 +3120,7 @@ show_histogram_stmt:
     /* SKIP DOC */
     id, err := $3.numVal().AsInt64()
     if err != nil {
-      sqllex.Error(err.Error())
-      return 1
+      return setErr(sqllex, err)
     }
     $$.val = &tree.ShowHistogram{HistogramID: id}
   }
@@ -3249,22 +3266,27 @@ show_constraints_stmt:
 
 // %Help: SHOW QUERIES - list running queries
 // %Category: Misc
-// %Text: SHOW [CLUSTER | LOCAL] QUERIES
+// %Text: SHOW [ALL] [CLUSTER | LOCAL] QUERIES
 // %SeeAlso: CANCEL QUERIES
 show_queries_stmt:
-  SHOW QUERIES
+  SHOW opt_cluster QUERIES
   {
-    $$.val = &tree.ShowQueries{Cluster: true}
+    $$.val = &tree.ShowQueries{All: false, Cluster: $2.bool()}
   }
-| SHOW QUERIES error // SHOW HELP: SHOW QUERIES
-| SHOW CLUSTER QUERIES
+| SHOW opt_cluster QUERIES error // SHOW HELP: SHOW QUERIES
+| SHOW ALL opt_cluster QUERIES
   {
-    $$.val = &tree.ShowQueries{Cluster: true}
+    $$.val = &tree.ShowQueries{All: true, Cluster: $3.bool()}
   }
-| SHOW LOCAL QUERIES
-  {
-    $$.val = &tree.ShowQueries{Cluster: false}
-  }
+| SHOW ALL opt_cluster QUERIES error // SHOW HELP: SHOW QUERIES
+
+opt_cluster:
+  /* EMPTY */
+  { $$.val = true }
+| CLUSTER
+  { $$.val = true }
+| LOCAL
+  { $$.val = false }
 
 // %Help: SHOW JOBS - list background jobs
 // %Category: Misc
@@ -3306,26 +3328,23 @@ opt_compact:
 
 // %Help: SHOW SESSIONS - list open client sessions
 // %Category: Misc
-// %Text: SHOW [CLUSTER | LOCAL] SESSIONS
+// %Text: SHOW [ALL] [CLUSTER | LOCAL] SESSIONS
 // %SeeAlso: CANCEL SESSIONS
 show_sessions_stmt:
-  SHOW SESSIONS
+  SHOW opt_cluster SESSIONS
   {
-    $$.val = &tree.ShowSessions{Cluster: true}
+    $$.val = &tree.ShowSessions{Cluster: $2.bool()}
   }
-| SHOW SESSIONS error // SHOW HELP: SHOW SESSIONS
-| SHOW CLUSTER SESSIONS
+| SHOW opt_cluster SESSIONS error // SHOW HELP: SHOW SESSIONS
+| SHOW ALL opt_cluster SESSIONS
   {
-    $$.val = &tree.ShowSessions{Cluster: true}
+    $$.val = &tree.ShowSessions{All: true, Cluster: $3.bool()}
   }
-| SHOW LOCAL SESSIONS
-  {
-    $$.val = &tree.ShowSessions{Cluster: false}
-  }
+| SHOW ALL opt_cluster SESSIONS error // SHOW HELP: SHOW SESSIONS
 
 // %Help: SHOW TABLES - list tables
 // %Category: DDL
-// %Text: SHOW TABLES [FROM <databasename> [ . <schemaname> ] ]
+// %Text: SHOW TABLES [FROM <databasename> [ . <schemaname> ] ] [WITH COMMENT]
 // %SeeAlso: WEBDOCS/show-tables.html
 show_tables_stmt:
   SHOW TABLES FROM name '.' name with_comment
@@ -3371,6 +3390,20 @@ show_schemas_stmt:
     $$.val = &tree.ShowSchemas{}
   }
 | SHOW SCHEMAS error // SHOW HELP: SHOW SCHEMAS
+
+// %Help: SHOW SEQUENCES - list sequences
+// %Category: DDL
+// %Text: SHOW SEQUENCES [FROM <databasename> ]
+show_sequences_stmt:
+  SHOW SEQUENCES FROM name
+  {
+    $$.val = &tree.ShowSequences{Database: tree.Name($4)}
+  }
+| SHOW SEQUENCES
+  {
+    $$.val = &tree.ShowSequences{}
+  }
+| SHOW SEQUENCES error // SHOW HELP: SHOW SEQUENCES
 
 // %Help: SHOW SYNTAX - analyze SQL syntax
 // %Category: Misc
@@ -4016,8 +4049,7 @@ column_def:
   {
     tableDef, err := tree.NewColumnTableDef(tree.Name($1), $2.colType(), $3.colQuals())
     if err != nil {
-      sqllex.Error(err.Error())
-      return 1
+      return setErr(sqllex, err)
     }
     $$.val = tableDef
   }
@@ -4702,30 +4734,6 @@ alter_rename_table_stmt:
     newName := $8.unresolvedObjectName().ToTableName()
     $$.val = &tree.RenameTable{Name: name, NewName: newName, IfExists: true, IsView: false}
   }
-| ALTER TABLE relation_expr RENAME opt_column column_name TO column_name
-  {
-    table := $3.unresolvedObjectName().ToTableName()
-    $$.val = &tree.RenameColumn{
-      Table:    table,
-      Name:     tree.Name($6),
-      NewName:  tree.Name($8),
-      IfExists: false,
-    }
-  }
-| ALTER TABLE IF EXISTS relation_expr RENAME opt_column column_name TO column_name
-  {
-    table := $5.unresolvedObjectName().ToTableName()
-    $$.val = &tree.RenameColumn{
-      Table:    table,
-      Name:     tree.Name($8),
-      NewName:  tree.Name($10),
-      IfExists: true,
-    }
-  }
-| ALTER TABLE relation_expr RENAME CONSTRAINT constraint_name TO constraint_name
-  { return unimplementedWithIssue(sqllex, 32555) }
-| ALTER TABLE IF EXISTS relation_expr RENAME CONSTRAINT constraint_name TO constraint_name
-  { return unimplementedWithIssue(sqllex, 32555) }
 
 alter_rename_view_stmt:
   ALTER VIEW relation_expr RENAME TO view_name
@@ -4943,7 +4951,7 @@ transaction_mode_list:
     a := $1.transactionModes()
     b := $3.transactionModes()
     err := a.Merge(b)
-    if err != nil { sqllex.Error(err.Error()); return 1 }
+    if err != nil { return setErr(sqllex, err) }
     $$.val = a
   }
 
@@ -5855,8 +5863,7 @@ index_flags_param_list:
     a := $1.indexFlags()
     b := $3.indexFlags()
     if err := a.CombineWith(b); err != nil {
-      sqllex.Error(err.Error())
-      return 1
+      return setErr(sqllex, err)
     }
     $$.val = a
   }
@@ -5874,8 +5881,7 @@ opt_index_flags:
   {
     flags := $3.indexFlags()
     if err := flags.Check(); err != nil {
-      sqllex.Error(err.Error())
-      return 1
+      return setErr(sqllex, err)
     }
     $$.val = flags
   }
@@ -5888,13 +5894,13 @@ opt_index_flags:
 // %Category: DML
 // %Text:
 // Data sources:
-//   <tablename> [ @ { <idxname> | <indexhint> } ]
+//   <tablename> [ @ { <idxname> | <indexflags> } ]
 //   <tablefunc> ( <exprs...> )
 //   ( { <selectclause> | <source> } )
 //   <source> [AS] <alias> [( <colnames...> )]
-//   <source> { [INNER] | { LEFT | RIGHT | FULL } [OUTER] } JOIN <source> ON <expr>
-//   <source> { [INNER] | { LEFT | RIGHT | FULL } [OUTER] } JOIN <source> USING ( <colnames...> )
-//   <source> NATURAL { [INNER] | { LEFT | RIGHT | FULL } [OUTER] } JOIN <source>
+//   <source> [ <jointype> ] JOIN <source> ON <expr>
+//   <source> [ <jointype> ] JOIN <source> USING ( <colnames...> )
+//   <source> NATURAL [ <jointype> ] JOIN <source>
 //   <source> CROSS JOIN <source>
 //   <source> WITH ORDINALITY
 //   '[' EXPLAIN ... ']'
@@ -5903,6 +5909,9 @@ opt_index_flags:
 // Index flags:
 //   '{' FORCE_INDEX = <idxname> [, ...] '}'
 //   '{' NO_INDEX_JOIN [, ...] '}'
+//
+// Join types:
+//   { INNER | { LEFT | RIGHT | FULL } [OUTER] } [ { HASH | MERGE | LOOKUP } ]
 //
 // %SeeAlso: WEBDOCS/table-expressions.html
 table_ref:
@@ -6044,25 +6053,25 @@ joined_table:
   {
     $$.val = &tree.ParenTableExpr{Expr: $2.tblExpr()}
   }
-| table_ref CROSS JOIN table_ref
+| table_ref CROSS opt_join_hint JOIN table_ref
   {
-    $$.val = &tree.JoinTableExpr{Join: tree.AstCrossJoin, Left: $1.tblExpr(), Right: $4.tblExpr()}
+    $$.val = &tree.JoinTableExpr{JoinType: tree.AstCross, Left: $1.tblExpr(), Right: $5.tblExpr(), Hint: $3}
   }
-| table_ref join_type JOIN table_ref join_qual
+| table_ref join_type opt_join_hint JOIN table_ref join_qual
   {
-    $$.val = &tree.JoinTableExpr{Join: $2, Left: $1.tblExpr(), Right: $4.tblExpr(), Cond: $5.joinCond()}
+    $$.val = &tree.JoinTableExpr{JoinType: $2, Left: $1.tblExpr(), Right: $5.tblExpr(), Cond: $6.joinCond(), Hint: $3}
   }
 | table_ref JOIN table_ref join_qual
   {
-    $$.val = &tree.JoinTableExpr{Join: tree.AstJoin, Left: $1.tblExpr(), Right: $3.tblExpr(), Cond: $4.joinCond()}
+    $$.val = &tree.JoinTableExpr{Left: $1.tblExpr(), Right: $3.tblExpr(), Cond: $4.joinCond()}
   }
-| table_ref NATURAL join_type JOIN table_ref
+| table_ref NATURAL join_type opt_join_hint JOIN table_ref
   {
-    $$.val = &tree.JoinTableExpr{Join: $3, Left: $1.tblExpr(), Right: $5.tblExpr(), Cond: tree.NaturalJoinCond{}}
+    $$.val = &tree.JoinTableExpr{JoinType: $3, Left: $1.tblExpr(), Right: $6.tblExpr(), Cond: tree.NaturalJoinCond{}, Hint: $4}
   }
 | table_ref NATURAL JOIN table_ref
   {
-    $$.val = &tree.JoinTableExpr{Join: tree.AstJoin, Left: $1.tblExpr(), Right: $4.tblExpr(), Cond: tree.NaturalJoinCond{}}
+    $$.val = &tree.JoinTableExpr{Left: $1.tblExpr(), Right: $4.tblExpr(), Cond: tree.NaturalJoinCond{}}
   }
 
 alias_clause:
@@ -6098,25 +6107,60 @@ opt_as_of_clause:
 join_type:
   FULL join_outer
   {
-    $$ = tree.AstFullJoin
+    $$ = tree.AstFull
   }
 | LEFT join_outer
   {
-    $$ = tree.AstLeftJoin
+    $$ = tree.AstLeft
   }
 | RIGHT join_outer
   {
-    $$ = tree.AstRightJoin
+    $$ = tree.AstRight
   }
 | INNER
   {
-    $$ = tree.AstInnerJoin
+    $$ = tree.AstInner
   }
 
 // OUTER is just noise...
 join_outer:
   OUTER {}
 | /* EMPTY */ {}
+
+// Join hint specifies that the join in the query should use a
+// specific method.
+
+// The semantics are as follows:
+//  - HASH forces a hash join; in other words, it disables merge and lookup
+//    join. A hash join is always possible; even if there are no equality
+//    columns - we consider cartesian join a degenerate case of the hash join
+//    (one bucket).
+//  - MERGE forces a merge join, even if it requires resorting both sides of
+//    the join.
+//  - LOOKUP forces a lookup join into the right side; the right side must be
+//    a table with a suitable index. `LOOKUP` can only be used with INNER and
+//    LEFT joins (though this is not enforced by the syntax).
+//  - If it is not possible to use the algorithm in the hint, an error is
+//    returned.
+//  - When a join hint is specified, the two tables will not be reordered
+//    by the optimizer.
+opt_join_hint:
+  HASH
+  {
+    $$ = tree.AstHash
+  }
+| MERGE
+  {
+    $$ = tree.AstMerge
+  }
+| LOOKUP
+  {
+    $$ = tree.AstLookup
+  }
+| /* EMPTY */
+  {
+    $$ = ""
+  }
 
 // JOIN qualification clauses
 // Possibilities are:
@@ -6214,8 +6258,7 @@ typename:
       var err error
       $$.val, err = coltypes.ArrayOf($1.colType(), bounds)
       if err != nil {
-        sqllex.Error(err.Error())
-        return 1
+        return setErr(sqllex, err)
       }
     } else {
       $$.val = $1.colType()
@@ -6228,16 +6271,15 @@ typename:
     var err error
     $$.val, err = coltypes.ArrayOf($1.colType(), []int32{-1})
     if err != nil {
-      sqllex.Error(err.Error())
-      return 1
+      return setErr(sqllex, err)
     }
   }
+| simple_typename ARRAY '[' ICONST ']' '[' error { return unimplementedWithIssue(sqllex, 32552) }
 | simple_typename ARRAY {
     var err error
     $$.val, err = coltypes.ArrayOf($1.colType(), []int32{-1})
     if err != nil {
-      sqllex.Error(err.Error())
-      return 1
+      return setErr(sqllex, err)
     }
   }
 | postgres_oid
@@ -6255,16 +6297,17 @@ opt_array_bounds:
   // TODO(justin): reintroduce multiple array bounds
   // opt_array_bounds '[' ']' { $$.val = append($1.int32s(), -1) }
   '[' ']' { $$.val = []int32{-1} }
+| '[' ']' '[' error { return unimplementedWithIssue(sqllex, 32552) }
 | '[' ICONST ']'
   {
     /* SKIP DOC */
     bound, err := $2.numVal().AsInt32()
     if err != nil {
-      sqllex.Error(err.Error())
-      return 1
+      return setErr(sqllex, err)
     }
     $$.val = []int32{bound}
   }
+| '[' ICONST ']' '[' error { return unimplementedWithIssue(sqllex, 32552) }
 | /* EMPTY */ { $$.val = []int32(nil) }
 
 const_json:
@@ -6518,13 +6561,11 @@ opt_float:
     nv := $2.numVal()
     prec, err := nv.AsInt64()
     if err != nil {
-      sqllex.Error(err.Error())
-      return 1
+      return setErr(sqllex, err)
     }
     typ, err := coltypes.NewFloat(prec)
     if err != nil {
-      sqllex.Error(err.Error())
-      return 1
+      return setErr(sqllex, err)
     }
     $$.val = typ
   }
@@ -6537,13 +6578,13 @@ bit_with_length:
   BIT opt_varying '(' iconst64 ')'
   {
     bit, err := coltypes.NewBitArrayType(int($4.int64()), $2.bool())
-    if err != nil { sqllex.Error(err.Error()); return 1 }
+    if err != nil { return setErr(sqllex, err) }
     $$.val = bit
   }
 | VARBIT '(' iconst64 ')'
   {
     bit, err := coltypes.NewBitArrayType(int($3.int64()), true)
-    if err != nil { sqllex.Error(err.Error()); return 1 }
+    if err != nil { return setErr(sqllex, err) }
     $$.val = bit
   }
 
@@ -7311,7 +7352,7 @@ d_expr:
 | BITCONST
   {
     d, err := tree.ParseDBitArray($1)
-    if err != nil { sqllex.Error(err.Error()); return 1 }
+    if err != nil { return setErr(sqllex, err) }
     $$.val = d
   }
 | func_name '(' expr_list opt_sort_clause_err ')' SCONST { return unimplemented(sqllex, $1.unresolvedName().String() + "(...) SCONST") }
@@ -8344,9 +8385,7 @@ signed_iconst64:
   signed_iconst
   {
     val, err := $1.numVal().AsInt64()
-    if err != nil {
-      sqllex.Error(err.Error()); return 1
-    }
+    if err != nil { return setErr(sqllex, err) }
     $$.val = val
   }
 
@@ -8355,9 +8394,7 @@ iconst64:
   ICONST
   {
     val, err := $1.numVal().AsInt64()
-    if err != nil {
-      sqllex.Error(err.Error()); return 1
-    }
+    if err != nil { return setErr(sqllex, err) }
     $$.val = val
   }
 
@@ -8373,10 +8410,7 @@ interval:
     } else {
       d, err = tree.ParseDIntervalWithField($2, $3.durationField())
     }
-    if err != nil {
-      sqllex.Error(err.Error())
-      return 1
-    }
+    if err != nil { return setErr(sqllex, err) }
     $$.val = d
   }
 
@@ -8533,10 +8567,7 @@ simple_db_object_name:
   db_object_name_component
   {
     res, err := tree.NewUnresolvedObjectName(1, [3]string{$1})
-    if err != nil {
-      sqllex.Error(err.Error())
-      return 1
-    }
+    if err != nil { return setErr(sqllex, err) }
     $$.val = res
   }
 
@@ -8548,19 +8579,13 @@ complex_db_object_name:
   db_object_name_component '.' unrestricted_name
   {
     res, err := tree.NewUnresolvedObjectName(2, [3]string{$3, $1})
-    if err != nil {
-      sqllex.Error(err.Error())
-      return 1
-    }
+    if err != nil { return setErr(sqllex, err) }
     $$.val = res
   }
 | db_object_name_component '.' unrestricted_name '.' unrestricted_name
   {
     res, err := tree.NewUnresolvedObjectName(3, [3]string{$5, $3, $1})
-    if err != nil {
-      sqllex.Error(err.Error())
-      return 1
-    }
+    if err != nil { return setErr(sqllex, err) }
     $$.val = res
   }
 
@@ -8707,6 +8732,7 @@ unreserved_keyword:
 | GLOBAL
 | GRANTS
 | GROUPS
+| HASH
 | HIGH
 | HISTOGRAM
 | HOUR
@@ -8741,10 +8767,12 @@ unreserved_keyword:
 | LEVEL
 | LIST
 | LOCAL
+| LOOKUP
 | LOW
 | MATCH
 | MATERIALIZED
 | MAXVALUE
+| MERGE
 | MINUTE
 | MINVALUE
 | MONTH

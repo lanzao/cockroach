@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -26,7 +27,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
 )
 
 type changeAggregator struct {
@@ -150,12 +150,21 @@ func (ca *changeAggregator) Start(ctx context.Context) context.Context {
 	metrics := ca.flowCtx.JobRegistry.MetricsStruct().Changefeed.(*Metrics)
 	ca.sink = makeMetricsSink(metrics, ca.sink)
 
+	var knobs TestingKnobs
+	if cfKnobs, ok := ca.flowCtx.TestingKnobs().Changefeed.(*TestingKnobs); ok {
+		knobs = *cfKnobs
+	}
+
 	// It seems like we should also be able to use `ca.ProcessorBase.MemMonitor`
 	// for the poller, but there is a race between the flow's MemoryMonitor
 	// getting Stopped and `changeAggregator.Close`, which causes panics. Not sure
 	// what to do about this yet.
+	pollerMemMonCapacity := memBufferDefaultCapacity
+	if knobs.MemBufferCapacity != 0 {
+		pollerMemMonCapacity = knobs.MemBufferCapacity
+	}
 	pollerMemMon := mon.MakeMonitorInheritWithLimit("poller", math.MaxInt64, ca.ProcessorBase.MemMonitor)
-	pollerMemMon.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
+	pollerMemMon.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(pollerMemMonCapacity))
 	ca.pollerMemMon = &pollerMemMon
 
 	buf := makeBuffer()
@@ -166,10 +175,6 @@ func (ca *changeAggregator) Start(ctx context.Context) context.Context {
 	)
 	rowsFn := kvsToRows(leaseMgr, ca.spec.Feed, buf.Get)
 
-	var knobs TestingKnobs
-	if cfKnobs, ok := ca.flowCtx.TestingKnobs().Changefeed.(*TestingKnobs); ok {
-		knobs = *cfKnobs
-	}
 	ca.tickFn = emitEntries(
 		ca.flowCtx.Settings, ca.spec.Feed, spans, ca.encoder, ca.sink, rowsFn, knobs, metrics)
 
@@ -511,11 +516,12 @@ func (cf *changeFrontier) noteResolvedSpan(d sqlbase.EncDatum) error {
 	}
 	raw, ok := d.Datum.(*tree.DBytes)
 	if !ok {
-		return errors.Errorf(`unexpected datum type %T: %s`, d.Datum, d.Datum)
+		return pgerror.NewAssertionErrorf(`unexpected datum type %T: %s`, d.Datum, d.Datum)
 	}
 	var resolved jobspb.ResolvedSpan
 	if err := protoutil.Unmarshal([]byte(*raw), &resolved); err != nil {
-		return errors.Wrapf(err, `unmarshalling resolved span: %x`, raw)
+		return pgerror.NewAssertionErrorWithWrappedErrf(err,
+			`unmarshalling resolved span: %x`, raw)
 	}
 
 	frontierChanged := cf.sf.Forward(resolved.Span, resolved.Timestamp)

@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -82,6 +83,14 @@ func (b *buffer) Get(ctx context.Context) (bufferEntry, error) {
 	}
 }
 
+// memBufferDefaultCapacity is the default capacity for a memBuffer for a single
+// changefeed.
+//
+// TODO(dan): It would be better if all changefeeds shared a single capacity
+// that was given by the operater at startup, like we do for RocksDB and SQL.
+var memBufferDefaultCapacity = envutil.EnvOrDefaultBytes(
+	"COCKROACH_CHANGEFEED_BUFFER_CAPACITY", 1<<30) // 1GB
+
 var memBufferColTypes = []sqlbase.ColumnType{
 	{SemanticType: sqlbase.ColumnType_BYTES}, // kv.Key
 	{SemanticType: sqlbase.ColumnType_BYTES}, // kv.Value
@@ -97,6 +106,8 @@ var memBufferColTypes = []sqlbase.ColumnType{
 // events. It's size is limited only by the BoundAccount passed to the
 // constructor.
 type memBuffer struct {
+	metrics *Metrics
+
 	mu struct {
 		syncutil.Mutex
 		entries rowcontainer.RowContainer
@@ -108,8 +119,8 @@ type memBuffer struct {
 	}
 }
 
-func makeMemBuffer(acc mon.BoundAccount) *memBuffer {
-	b := &memBuffer{}
+func makeMemBuffer(acc mon.BoundAccount, metrics *Metrics) *memBuffer {
+	b := &memBuffer{metrics: metrics}
 	b.mu.entries.Init(acc, sqlbase.ColTypeInfoFromColTypes(memBufferColTypes), 0 /* rowCapacity */)
 	return b
 }
@@ -196,6 +207,7 @@ func (b *memBuffer) addRow(ctx context.Context, row tree.Datums) error {
 	b.mu.Lock()
 	_, err := b.mu.entries.AddRow(ctx, row)
 	b.mu.Unlock()
+	b.metrics.BufferEntriesIn.Inc(1)
 	return err
 }
 
@@ -214,6 +226,7 @@ func (b *memBuffer) getRow(ctx context.Context) (tree.Datums, error) {
 		}
 		b.mu.Unlock()
 		if row != nil {
+			b.metrics.BufferEntriesOut.Inc(1)
 			return row, nil
 		}
 	}

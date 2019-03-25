@@ -12,9 +12,11 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
-// "make test" would normall test this file, but it should only be tested
-// within docker compose.
-// +build gss
+// "make test" would normally test this file, but it should only be tested
+// within docker compose. We also can't use just "gss" here because that
+// tag is reserved for the toplevel Makefile's linux-gnu build.
+
+// +build gss_compose
 
 package gss
 

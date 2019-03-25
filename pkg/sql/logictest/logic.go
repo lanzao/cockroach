@@ -1024,14 +1024,21 @@ func (t *logicTest) setup(cfg testClusterConfig) {
 		params.ServerArgsPerNode = paramsPerNode
 	}
 
-	// Update the defaults for automatic statistics to avoid delays in testing.
-	stats.DefaultAsOfTime = time.Microsecond
-	stats.DefaultRefreshInterval = time.Millisecond
-
 	t.cluster = serverutils.StartTestCluster(t.t, cfg.numNodes, params)
 	if cfg.useFakeSpanResolver {
 		fakeResolver := distsqlutils.FakeResolverForTestCluster(t.cluster)
 		t.cluster.Server(t.nodeIdx).SetDistSQLSpanResolver(fakeResolver)
+	}
+
+	// Update the defaults for automatic statistics to avoid delays in testing.
+	// Avoid making the DefaultAsOfTime too small to avoid interacting with
+	// schema changes and causing transaction retries.
+	stats.DefaultAsOfTime = 10 * time.Millisecond
+	stats.DefaultRefreshInterval = time.Millisecond
+	if _, err := t.cluster.ServerConn(0).Exec(
+		"SET CLUSTER SETTING sql.stats.automatic_collection.min_stale_rows = $1::int", 5,
+	); err != nil {
+		t.Fatal(err)
 	}
 
 	if cfg.overrideDistSQLMode != "" {
@@ -1072,7 +1079,7 @@ func (t *logicTest) setup(cfg testClusterConfig) {
 	}
 	if cfg.overrideAutoStats != "" {
 		if _, err := t.cluster.ServerConn(0).Exec(
-			"SET CLUSTER SETTING sql.stats.experimental_automatic_collection.enabled = $1::bool", cfg.overrideAutoStats,
+			"SET CLUSTER SETTING sql.stats.automatic_collection.enabled = $1::bool", cfg.overrideAutoStats,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -1687,7 +1694,7 @@ func (t *logicTest) verifyError(
 		}
 
 		errString := pgerror.FullError(err)
-		newErr := errors.Errorf("%s: %s\nexpected %q, but found %q", pos, sql, expectErr, errString)
+		newErr := errors.Errorf("%s: %s\nexpected:\n%s\n\ngot:\n%s", pos, sql, expectErr, errString)
 		if err != nil && strings.Contains(errString, expectErr) {
 			if t.subtestT != nil {
 				t.subtestT.Logf("The output string contained the input regexp. Perhaps you meant to write:\n"+
@@ -1698,6 +1705,18 @@ func (t *logicTest) verifyError(
 			}
 		}
 		return (err == nil) == (expectErr == ""), newErr
+	}
+	if err != nil {
+		pqErr, ok := err.(*pq.Error)
+		if ok &&
+			strings.HasPrefix(string(pqErr.Code), "XX" /* internal error, corruption, etc */) &&
+			string(pqErr.Code) != pgerror.CodeUncategorizedError /* this is also XX but innocuous */ {
+			if expectErrCode != string(pqErr.Code) {
+				return false, errors.Errorf(
+					"%s: %s: serious error with code %q occurred; if expected, must use 'error pgcode %s ...' in test:\n%s",
+					pos, sql, pqErr.Code, pqErr.Code, pgerror.FullError(err))
+			}
+		}
 	}
 	if expectErrCode != "" {
 		if err != nil {
@@ -1721,6 +1740,25 @@ func (t *logicTest) verifyError(
 	return true, nil
 }
 
+// formatErr attempts to provide more details if present.
+func formatErr(err error) string {
+	if pqErr, ok := err.(*pq.Error); ok {
+		var buf bytes.Buffer
+		fmt.Fprintf(&buf, "(%s) %s", pqErr.Code, pqErr.Message)
+		if pqErr.File != "" || pqErr.Line != "" || pqErr.Routine != "" {
+			fmt.Fprintf(&buf, "\n%s:%s: in %s()", pqErr.File, pqErr.Line, pqErr.Routine)
+		}
+		if pqErr.Detail != "" {
+			fmt.Fprintf(&buf, "\nDETAIL: %s", pqErr.Detail)
+		}
+		if pqErr.Code == pgerror.CodeInternalError {
+			fmt.Fprintln(&buf, "\nNOTE: internal errors may have more details in logs. Use -show-logs.")
+		}
+		return buf.String()
+	}
+	return err.Error()
+}
+
 // unexpectedError handles ignoring queries that fail during prepare
 // when -allow-prepare-fail is specified. The argument "sql" is "" to indicate the
 // work is done on behalf of a statement, which always fail upon an
@@ -1734,16 +1772,16 @@ func (t *logicTest) unexpectedError(sql string, pos string, err error) bool {
 		stmt, err := t.db.Prepare(sql)
 		if err != nil {
 			if *showSQL {
-				t.outf("\t-- fails prepare: %s", err)
+				t.outf("\t-- fails prepare: %s", formatErr(err))
 			}
 			t.signalIgnoredError(err, pos, sql)
 			return true
 		}
 		if err := stmt.Close(); err != nil {
-			t.Errorf("%s: %s\nerror when closing prepared statement: %s", sql, pos, err)
+			t.Errorf("%s: %s\nerror when closing prepared statement: %s", sql, pos, formatErr(err))
 		}
 	}
-	t.Errorf("%s: %s\nexpected success, but found\n%s", pos, sql, err)
+	t.Errorf("%s: %s\nexpected success, but found\n%s", pos, sql, formatErr(err))
 	return false
 }
 

@@ -19,7 +19,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/pkg/errors"
 )
 
 // buildDelete builds a memo group for a DeleteOp expression, which deletes all
@@ -35,11 +34,12 @@ import (
 func (b *Builder) buildDelete(del *tree.Delete, inScope *scope) (outScope *scope) {
 	// UX friendliness safeguard.
 	if del.Where == nil && b.evalCtx.SessionData.SafeUpdates {
-		panic(builderError{pgerror.NewDangerousStatementErrorf("DELETE without WHERE clause")})
+		panic(pgerror.NewDangerousStatementErrorf("DELETE without WHERE clause"))
 	}
 
 	if del.OrderBy != nil && del.Limit == nil {
-		panic(builderError{errors.New("DELETE statement requires LIMIT when ORDER BY is used")})
+		panic(pgerror.NewErrorf(pgerror.CodeSyntaxError,
+			"DELETE statement requires LIMIT when ORDER BY is used"))
 	}
 
 	if del.With != nil {

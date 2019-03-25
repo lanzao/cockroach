@@ -10,16 +10,19 @@ package changefeedccl
 
 import (
 	"context"
+	"net/url"
 	"regexp"
 	"sort"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -56,12 +59,18 @@ const (
 	optFormatJSON formatType = `json`
 	optFormatAvro formatType = `experimental_avro`
 
-	sinkParamSchemaTopic      = `schema_topic`
-	sinkParamTopicPrefix      = `topic_prefix`
+	sinkParamCACert           = `ca_cert`
 	sinkParamFileSize         = `file_size`
+	sinkParamSchemaTopic      = `schema_topic`
+	sinkParamTLSEnabled       = `tls_enabled`
+	sinkParamTopicPrefix      = `topic_prefix`
 	sinkSchemeBuffer          = ``
 	sinkSchemeExperimentalSQL = `experimental-sql`
 	sinkSchemeKafka           = `kafka`
+	sinkParamSASLEnabled      = `sasl_enabled`
+	sinkParamSASLHandshake    = `sasl_handshake`
+	sinkParamSASLUser         = `sasl_user`
+	sinkParamSASLPassword     = `sasl_password`
 )
 
 var changefeedOptionExpectValues = map[string]sql.KVStringOptValidate{
@@ -76,15 +85,16 @@ var changefeedOptionExpectValues = map[string]sql.KVStringOptValidate{
 // changefeedPlanHook implements sql.PlanHookFn.
 func changefeedPlanHook(
 	_ context.Context, stmt tree.Statement, p sql.PlanHookState,
-) (sql.PlanHookRowFn, sqlbase.ResultColumns, []sql.PlanNode, error) {
+) (sql.PlanHookRowFn, sqlbase.ResultColumns, []sql.PlanNode, bool, error) {
 	changefeedStmt, ok := stmt.(*tree.CreateChangefeed)
 	if !ok {
-		return nil, nil, nil, nil
+		return nil, nil, nil, false, nil
 	}
 
 	var sinkURIFn func() (string, error)
 	var header sqlbase.ResultColumns
 	unspecifiedSink := changefeedStmt.SinkURI == nil
+	avoidBuffering := false
 	if unspecifiedSink {
 		// An unspecified sink triggers a fairly radical change in behavior.
 		// Instead of setting up a system.job to emit to a sink in the
@@ -99,11 +109,12 @@ func changefeedPlanHook(
 			{Name: "key", Typ: types.Bytes},
 			{Name: "value", Typ: types.Bytes},
 		}
+		avoidBuffering = true
 	} else {
 		var err error
 		sinkURIFn, err = p.TypeAsString(changefeedStmt.SinkURI, `CREATE CHANGEFEED`)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, false, err
 		}
 		header = sqlbase.ResultColumns{
 			{Name: "job_id", Typ: types.Int},
@@ -112,7 +123,7 @@ func changefeedPlanHook(
 
 	optsFn, err := p.TypeAsStringOpts(changefeedStmt.Options, changefeedOptionExpectValues)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, false, err
 	}
 
 	fn := func(ctx context.Context, _ []sql.PlanNode, resultsCh chan<- tree.Datums) error {
@@ -144,7 +155,10 @@ func changefeedPlanHook(
 			return err
 		}
 
-		jobDescription := changefeedJobDescription(changefeedStmt, sinkURI, opts)
+		jobDescription, err := changefeedJobDescription(changefeedStmt, sinkURI, opts)
+		if err != nil {
+			return err
+		}
 
 		statementTime := hlc.Timestamp{
 			WallTime: p.ExtendedEvalContext().GetStmtTimestamp().UnixNano(),
@@ -207,6 +221,23 @@ func changefeedPlanHook(
 			},
 		}
 
+		if details, err = validateDetails(details); err != nil {
+			return err
+		}
+
+		// Feature telemetry
+		parsedSink, err := url.Parse(sinkURI)
+		if err != nil {
+			return err
+		}
+		telemetrySink := parsedSink.Scheme
+		if telemetrySink == `` {
+			telemetrySink = `sinkless`
+		}
+		telemetry.Count(`changefeed.create.sink.` + telemetrySink)
+		telemetry.Count(`changefeed.create.format.` + details.Opts[optFormat])
+		telemetry.CountBucketed(`changefeed.create.num_tables`, int64(len(targets)))
+
 		if details.SinkURI == `` {
 			return distChangefeedFlow(ctx, p, 0 /* jobID */, details, progress, resultsCh)
 		}
@@ -215,10 +246,6 @@ func changefeedPlanHook(
 		if err := utilccl.CheckEnterpriseEnabled(
 			settings, p.ExecCfg().ClusterID(), p.ExecCfg().Organization(), "CHANGEFEED",
 		); err != nil {
-			return err
-		}
-
-		if details, err = validateDetails(details); err != nil {
 			return err
 		}
 
@@ -233,6 +260,10 @@ func changefeedPlanHook(
 			if err != nil {
 				// In this context, we don't want to retry even retryable errors from the
 				// sync. Unwrap any retryable errors encountered.
+				//
+				// TODO(knz): This error handling is suspicious (see #35854
+				// and #35920). What if the error is wrapped? Or has been
+				// flattened into a pgerror.Error?
 				if rErr, ok := err.(*retryableSinkError); ok {
 					return rErr.cause
 				}
@@ -276,17 +307,19 @@ func changefeedPlanHook(
 		}
 		return nil
 	}
-	return fn, header, nil, nil
+	return fn, header, nil, avoidBuffering, nil
 }
 
 func changefeedJobDescription(
 	changefeed *tree.CreateChangefeed, sinkURI string, opts map[string]string,
-) string {
+) (string, error) {
+	cleanedSinkURI, err := storageccl.SanitizeExportStorageURI(sinkURI)
+	if err != nil {
+		return "", err
+	}
 	c := &tree.CreateChangefeed{
 		Targets: changefeed.Targets,
-		// If/when we start accepting export storage uris (or ones with
-		// secrets), we'll need to sanitize sinkURI.
-		SinkURI: tree.NewDString(sinkURI),
+		SinkURI: tree.NewDString(cleanedSinkURI),
 	}
 	for k, v := range opts {
 		opt := tree.KVOption{Key: tree.Name(k)}
@@ -296,7 +329,7 @@ func changefeedJobDescription(
 		c.Options = append(c.Options, opt)
 	}
 	sort.Slice(c.Options, func(i, j int) bool { return c.Options[i].Key < c.Options[j].Key })
-	return tree.AsStringWithFlags(c, tree.FmtAlwaysQualifyTableNames)
+	return tree.AsStringWithFlags(c, tree.FmtAlwaysQualifyTableNames), nil
 }
 
 func validateDetails(details jobspb.ChangefeedDetails) (jobspb.ChangefeedDetails, error) {

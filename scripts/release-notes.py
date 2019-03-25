@@ -78,6 +78,7 @@ crdb_folk = set([
     "Andrew Couch",
     "Andrew Kimball",
     "Andrew Werner",
+    "Andrew Kryczka",
     "Andy Woods",
     "Angela Chang",
     "Arjun Narayan",
@@ -91,6 +92,7 @@ crdb_folk = set([
     "Diana Hsieh",
     "Emmanuel Sales",
     "Erik Trinh",
+    "George Utsin",
     "Jesse Seldess",
     "Jessica Edwards",
     "Joseph Lowinske",
@@ -764,7 +766,7 @@ if not hidedownloads:
 
 {% include copy-clipboard.html %}
 ~~~shell
-$ docker pull cockroachdb/cockroach:""" + current_version + """
+$ docker pull cockroachdb/cockroach""" + ("-unstable:" if "-" in current_version else ":") + current_version + """
 ~~~
 """)
     print()

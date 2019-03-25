@@ -143,11 +143,11 @@
 
 [[projects]]
   branch = "master"
-  digest = "1:dfe2c5eadcbaf622a726116baf37582aa82fa8d364f05e168b58fbe96551832d"
+  digest = "1:caed868e37c6cda382a217d8ad4f55da579e1a1d046836de57f11a569e383443"
   name = "github.com/andy-kimball/arenaskl"
   packages = ["."]
   pruneopts = "UT"
-  revision = "224761e552afe64db9d93004f8d5d3a686b89771"
+  revision = "6bf06cf57626e536063e9398a57dfe1417ed0799"
 
 [[projects]]
   digest = "1:66b3310cf22cdc96c35ef84ede4f7b9b370971c4025f394c89a2638729653b11"
@@ -1029,6 +1029,13 @@
   revision = "9f7362b77ad333b26c01c99de52a11bdb650ded2"
 
 [[projects]]
+  digest = "1:2eeeebccad4f052e6037527e86b8114c6bfd184a97f84d4449a5ea6ad202c216"
+  name = "github.com/maruel/panicparse"
+  packages = ["stack"]
+  pruneopts = "UT"
+  revision = "f20d4c4d746f810c9110e21928d4135e1f2a3efa"
+
+[[projects]]
   digest = "1:130d1249f8a867da8115c3de6cddf0ac29ca405117c88aa1541db690384a51c6"
   name = "github.com/marusama/semaphore"
   packages = ["."]
@@ -1439,6 +1446,14 @@
 
 [[projects]]
   branch = "master"
+  digest = "1:d87af402fc3f371d6b008f58903e98bee8873db45263dc54762f00735c582495"
+  name = "golang.org/x/exp"
+  packages = ["rand"]
+  pruneopts = "UT"
+  revision = "01c40f57f5f67e0faa42df53dbcfb58f5a65bb4e"
+
+[[projects]]
+  branch = "master"
   digest = "1:aa2a7acc4a2f78d9bc0e6ffc795e24221d25f1b1d56fb472f834e377ebed7d28"
   name = "golang.org/x/net"
   packages = [
@@ -1786,6 +1801,7 @@
     "github.com/lightstep/lightstep-tracer-go",
     "github.com/linkedin/goavro",
     "github.com/lufia/iostat",
+    "github.com/maruel/panicparse/stack",
     "github.com/marusama/semaphore",
     "github.com/mattn/go-isatty",
     "github.com/mattn/goveralls",
@@ -1826,6 +1842,7 @@
     "golang.org/x/crypto/ssh/agent",
     "golang.org/x/crypto/ssh/knownhosts",
     "golang.org/x/crypto/ssh/terminal",
+    "golang.org/x/exp/rand",
     "golang.org/x/net/html",
     "golang.org/x/net/http2",
     "golang.org/x/net/trace",

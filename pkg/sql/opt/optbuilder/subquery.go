@@ -15,12 +15,13 @@
 package optbuilder
 
 import (
-	"fmt"
-
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 )
 
 // subquery represents a subquery expression in an expression tree
@@ -52,6 +53,11 @@ type subquery struct {
 	// columns which are referenced within the subquery but are bound in an
 	// outer scope.
 	outerCols opt.ColSet
+}
+
+// isMultiRow returns whether the subquery can return multiple rows.
+func (s *subquery) isMultiRow() bool {
+	return s.wrapInTuple && !s.Exists
 }
 
 // Walk is part of the tree.Expr interface.
@@ -164,7 +170,7 @@ func (s *subquery) ResolvedType() types.T {
 
 // Eval is part of the tree.TypedExpr interface.
 func (s *subquery) Eval(_ *tree.EvalContext) (tree.Datum, error) {
-	panic("subquery must be replaced before evaluation")
+	panic(pgerror.NewAssertionErrorf("subquery must be replaced before evaluation"))
 }
 
 // buildSubqueryProjection ensures that a subquery returns exactly one column.
@@ -179,7 +185,11 @@ func (b *Builder) buildSubqueryProjection(
 
 	switch len(s.cols) {
 	case 0:
-		panic("subquery returned 0 columns")
+		// This can be obtained with:
+		// CREATE TABLE t(x INT); ALTER TABLE t DROP COLUMN x;
+		// SELECT (SELECT * FROM t) = (SELECT * FROM t);
+		panic(pgerror.NewErrorf(pgerror.CodeSyntaxError,
+			"subquery must return only one column"))
 
 	case 1:
 		outScope.cols = append(outScope.cols, s.cols[0])
@@ -204,6 +214,8 @@ func (b *Builder) buildSubqueryProjection(
 		col := b.synthesizeColumn(outScope, "", texpr.ResolvedType(), texpr, tup)
 		out = b.constructProject(out, []scopeColumn{*col})
 	}
+
+	telemetry.Inc(sqltelemetry.SubqueryUseCounter)
 
 	return out, outScope
 }
@@ -279,7 +291,7 @@ func (b *Builder) buildMultiRowSubquery(
 		}
 
 	default:
-		panic(fmt.Errorf(
+		panic(pgerror.NewAssertionErrorf(
 			"buildMultiRowSubquery called with operator %v", c.Operator,
 		))
 	}

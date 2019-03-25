@@ -271,16 +271,13 @@ SET tracing = on,kv,results; UPDATE tu SET c=c+1; SET tracing = off
 
 query T
 SELECT message FROM [SHOW KV TRACE FOR SESSION]
+ WHERE operation != 'dist sender send'
 ----
 Scan /Table/57/{1-2}
-querying next range at /Table/57/1
-r20: sending batch 1 Scan to (n1,s1):1
 fetched: /tu/primary/1 -> NULL
 fetched: /tu/primary/1/b -> 2
 fetched: /tu/primary/1/c/d -> /3/4
 Put /Table/57/1/1/2/1 -> /TUPLE/3:3:Int/4/1:4:Int/4
-querying next range at /Table/57/1/1/2/1
-r20: sending batch 1 Put, 1 EndTxn to (n1,s1):1
 fast path completed
 rows affected: 1
 
@@ -289,16 +286,39 @@ SET tracing = on,kv,results; UPDATE tu SET b = NULL, c = NULL, d = NULL; SET tra
 
 query T
 SELECT message FROM [SHOW KV TRACE FOR SESSION]
+ WHERE operation != 'dist sender send'
 ----
 Scan /Table/57/{1-2}
-querying next range at /Table/57/1
-r20: sending batch 1 Scan to (n1,s1):1
 fetched: /tu/primary/1 -> NULL
 fetched: /tu/primary/1/b -> 2
 fetched: /tu/primary/1/c/d -> /4/4
 Del /Table/57/1/1/1/1
 Del /Table/57/1/1/2/1
-querying next range at /Table/57/1/1/1/1
-r20: sending batch 2 Del, 1 EndTxn to (n1,s1):1
 fast path completed
 rows affected: 1
+
+# Regression test for #35564: make sure we use the Update's input required
+# ordering for the internal projection.
+
+statement ok
+CREATE TABLE abc (a INT, b INT, c INT, INDEX(c) STORING(a,b))
+
+query TTTTT
+EXPLAIN (VERBOSE) SELECT * FROM [ UPDATE abc SET a=c RETURNING a ] ORDER BY a
+----
+render                    ·         ·              (a)                       +a
+ │                        render 0  a              ·                         ·
+ └── run                  ·         ·              (a, b, c, rowid[hidden])  ·
+      └── update          ·         ·              (a, b, c, rowid[hidden])  ·
+           │              table     abc            ·                         ·
+           │              set       a              ·                         ·
+           │              strategy  updater        ·                         ·
+           └── render     ·         ·              (a, b, c, rowid, c)       +c
+                │         render 0  a              ·                         ·
+                │         render 1  b              ·                         ·
+                │         render 2  c              ·                         ·
+                │         render 3  rowid          ·                         ·
+                │         render 4  c              ·                         ·
+                └── scan  ·         ·              (a, b, c, rowid[hidden])  +c
+·                         table     abc@abc_c_idx  ·                         ·
+·                         spans     ALL            ·                         ·

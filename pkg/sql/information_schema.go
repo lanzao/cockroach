@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -200,6 +201,9 @@ func validateInformationSchemaTable(table *sqlbase.TableDescriptor) error {
 }
 
 var informationSchemaAdministrableRoleAuthorizations = virtualSchemaTable{
+	comment: `roles for which the current user has admin option
+` + base.DocsURL("information-schema.html#administrable_role_authorizations") + `
+https://www.postgresql.org/docs/9.5/infoschema-administrable-role-authorizations.html`,
 	schema: vtable.InformationSchemaAdministrableRoleAuthorizations,
 	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		currentUser := p.SessionData().User
@@ -229,6 +233,9 @@ var informationSchemaAdministrableRoleAuthorizations = virtualSchemaTable{
 }
 
 var informationSchemaApplicableRoles = virtualSchemaTable{
+	comment: `roles available to the current user
+` + base.DocsURL("information-schema.html#applicable_roles") + `
+https://www.postgresql.org/docs/9.5/infoschema-applicable-roles.html`,
 	schema: vtable.InformationSchemaApplicableRoles,
 	populate: func(ctx context.Context, p *planner, _ *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		currentUser := p.SessionData().User
@@ -254,6 +261,9 @@ var informationSchemaApplicableRoles = virtualSchemaTable{
 }
 
 var informationSchemaColumnPrivileges = virtualSchemaTable{
+	comment: `column privilege grants (incomplete)
+` + base.DocsURL("information-schema.html#column_privileges") + `
+https://www.postgresql.org/docs/9.5/infoschema-column-privileges.html`,
 	schema: vtable.InformationSchemaColumnPrivileges,
 	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return forEachTableDesc(ctx, p, dbContext, virtualMany, func(db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor) error {
@@ -286,6 +296,9 @@ var informationSchemaColumnPrivileges = virtualSchemaTable{
 }
 
 var informationSchemaColumnsTable = virtualSchemaTable{
+	comment: `table and view columns (incomplete)
+` + base.DocsURL("information-schema.html#columns") + `
+https://www.postgresql.org/docs/9.5/infoschema-columns.html`,
 	schema: vtable.InformationSchemaColumns,
 	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return forEachTableDesc(ctx, p, dbContext, virtualMany, func(db *sqlbase.DatabaseDescriptor, scName string, table *sqlbase.TableDescriptor) error {
@@ -325,9 +338,10 @@ var informationSchemaColumnsTable = virtualSchemaTable{
 	},
 }
 
-// Postgres: https://www.postgresql.org/docs/9.6/static/infoschema-enabled-roles.html
-// MySQL:    missing
 var informationSchemaEnabledRoles = virtualSchemaTable{
+	comment: `roles for the current user
+` + base.DocsURL("information-schema.html#enabled_roles") + `
+https://www.postgresql.org/docs/9.5/infoschema-enabled-roles.html`,
 	schema: `
 CREATE TABLE information_schema.enabled_roles (
 	ROLE_NAME STRING NOT NULL
@@ -383,9 +397,9 @@ func datetimePrecision(colType sqlbase.ColumnType) tree.Datum {
 	return tree.DNull
 }
 
-// Postgres: https://www.postgresql.org/docs/9.6/static/infoschema-constraint-column-usage.html
-// MySQL:    missing
 var informationSchemaConstraintColumnUsageTable = virtualSchemaTable{
+	comment: `columns usage by constraints
+https://www.postgresql.org/docs/9.5/infoschema-constraint-column-usage.html`,
 	schema: `
 CREATE TABLE information_schema.constraint_column_usage (
 	TABLE_CATALOG      STRING NOT NULL,
@@ -441,9 +455,11 @@ CREATE TABLE information_schema.constraint_column_usage (
 	},
 }
 
-// Postgres: https://www.postgresql.org/docs/9.6/static/infoschema-key-column-usage.html
 // MySQL:    https://dev.mysql.com/doc/refman/5.7/en/key-column-usage-table.html
 var informationSchemaKeyColumnUsageTable = virtualSchemaTable{
+	comment: `column usage by indexes and key constraints
+` + base.DocsURL("information-schema.html#key_column_usage") + `
+https://www.postgresql.org/docs/9.5/infoschema-key-column-usage.html`,
 	schema: `
 CREATE TABLE information_schema.key_column_usage (
 	CONSTRAINT_CATALOG STRING NOT NULL,
@@ -511,6 +527,8 @@ CREATE TABLE information_schema.key_column_usage (
 // Postgres: https://www.postgresql.org/docs/9.6/static/infoschema-parameters.html
 // MySQL:    https://dev.mysql.com/doc/refman/5.7/en/parameters-table.html
 var informationSchemaParametersTable = virtualSchemaTable{
+	comment: `built-in function parameters (empty - introspection not yet supported)
+https://www.postgresql.org/docs/9.5/infoschema-parameters.html`,
 	schema: `
 CREATE TABLE information_schema.parameters (
 	SPECIFIC_CATALOG STRING,
@@ -546,9 +564,6 @@ CREATE TABLE information_schema.parameters (
 	DTD_IDENTIFIER STRING,
 	PARAMETER_DEFAULT STRING
 )`,
-	// This is the same as information_schema.table_privileges. In postgres, this virtual table does
-	// not show tables with grants provided through PUBLIC, but table_privileges does.
-	// Since we don't have the PUBLIC concept, the two virtual tables are identical.
 	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return nil
 	},
@@ -559,9 +574,11 @@ var (
 	matchOptionPartial = tree.NewDString("PARTIAL")
 	matchOptionNone    = tree.NewDString("NONE")
 
-	// Avoid unused warning for constants.
-	_ = matchOptionPartial
-	_ = matchOptionNone
+	matchOptionMap = map[sqlbase.ForeignKeyReference_Match]tree.Datum{
+		sqlbase.ForeignKeyReference_SIMPLE:  matchOptionNone,
+		sqlbase.ForeignKeyReference_FULL:    matchOptionFull,
+		sqlbase.ForeignKeyReference_PARTIAL: matchOptionPartial,
+	}
 
 	refConstraintRuleNoAction   = tree.NewDString("NO ACTION")
 	refConstraintRuleRestrict   = tree.NewDString("RESTRICT")
@@ -586,9 +603,11 @@ func dStringForFKAction(action sqlbase.ForeignKeyReference_Action) tree.Datum {
 	panic(errors.Errorf("unexpected ForeignKeyReference_Action: %v", action))
 }
 
-// Postgres: https://www.postgresql.org/docs/9.6/static/infoschema-referential-constraints.html
 // MySQL:    https://dev.mysql.com/doc/refman/5.7/en/referential-constraints-table.html
 var informationSchemaReferentialConstraintsTable = virtualSchemaTable{
+	comment: `foreign key constraints
+` + base.DocsURL("information-schema.html#referential_constraints") + `
+https://www.postgresql.org/docs/9.5/infoschema-referential-constraints.html`,
 	schema: `
 CREATE TABLE information_schema.referential_constraints (
 	CONSTRAINT_CATALOG        STRING NOT NULL,
@@ -627,7 +646,10 @@ CREATE TABLE information_schema.referential_constraints (
 				if err != nil {
 					return err
 				}
-
+				var matchType tree.Datum = tree.DNull
+				if r, ok := matchOptionMap[fk.Match]; ok {
+					matchType = r
+				}
 				return addRow(
 					dbNameStr,                       // constraint_catalog
 					scNameStr,                       // constraint_schema
@@ -635,7 +657,7 @@ CREATE TABLE information_schema.referential_constraints (
 					dbNameStr,                       // unique_constraint_catalog
 					scNameStr,                       // unique_constraint_schema
 					tree.NewDString(refIndex.Name),  // unique_constraint_name
-					matchOptionFull,                 // match_option
+					matchType,                       // match_option
 					dStringForFKAction(fk.OnUpdate), // update_rule
 					dStringForFKAction(fk.OnDelete), // delete_rule
 					tbNameStr,                       // table_name
@@ -649,6 +671,9 @@ CREATE TABLE information_schema.referential_constraints (
 // Postgres: https://www.postgresql.org/docs/9.6/static/infoschema-role-table-grants.html
 // MySQL:    missing
 var informationSchemaRoleTableGrants = virtualSchemaTable{
+	comment: `privileges granted on table or views (incomplete; see also information_schema.table_privileges; may contain excess users or roles)
+` + base.DocsURL("information-schema.html#role_table_grants") + `
+https://www.postgresql.org/docs/9.5/infoschema-role-table-grants.html`,
 	schema: `
 CREATE TABLE information_schema.role_table_grants (
 	GRANTOR        STRING,
@@ -666,9 +691,10 @@ CREATE TABLE information_schema.role_table_grants (
 	populate: populateTablePrivileges,
 }
 
-// Postgres: https://www.postgresql.org/docs/9.6/static/infoschema-routines.html
 // MySQL:    https://dev.mysql.com/doc/mysql-infoschema-excerpt/5.7/en/routines-table.html
 var informationSchemaRoutineTable = virtualSchemaTable{
+	comment: `built-in functions (empty - introspection not yet supported)
+https://www.postgresql.org/docs/9.5/infoschema-routines.html`,
 	schema: `
 CREATE TABLE information_schema.routines (
 	SPECIFIC_CATALOG STRING,
@@ -758,9 +784,11 @@ CREATE TABLE information_schema.routines (
 	},
 }
 
-// Postgres: https://www.postgresql.org/docs/9.6/static/infoschema-schemata.html
 // MySQL:    https://dev.mysql.com/doc/refman/5.7/en/schemata-table.html
 var informationSchemaSchemataTable = virtualSchemaTable{
+	comment: `database schemas (may contain schemata without permission)
+` + base.DocsURL("information-schema.html#schemata") + `
+https://www.postgresql.org/docs/9.5/infoschema-schemata.html`,
 	schema: vtable.InformationSchemaSchemata,
 	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return forEachDatabaseDesc(ctx, p, dbContext, func(db *sqlbase.DatabaseDescriptor) error {
@@ -776,9 +804,10 @@ var informationSchemaSchemataTable = virtualSchemaTable{
 	},
 }
 
-// Postgres: missing
 // MySQL:    https://dev.mysql.com/doc/refman/5.7/en/schema-privileges-table.html
 var informationSchemaSchemataTablePrivileges = virtualSchemaTable{
+	comment: `schema privileges (incomplete; may contain excess users or roles)
+` + base.DocsURL("information-schema.html#schema_privileges"),
 	schema: `
 CREATE TABLE information_schema.schema_privileges (
 	GRANTEE         STRING NOT NULL,
@@ -793,6 +822,8 @@ CREATE TABLE information_schema.schema_privileges (
 				privs := db.Privileges.Show()
 				dbNameStr := tree.NewDString(db.Name)
 				scNameStr := tree.NewDString(scName)
+				// TODO(knz): This should filter for the current user, see
+				// https://github.com/cockroachdb/cockroach/issues/35572
 				for _, u := range privs {
 					userNameStr := tree.NewDString(u.User)
 					for _, priv := range u.Privileges {
@@ -829,9 +860,10 @@ func dStringForIndexDirection(dir sqlbase.IndexDescriptor_Direction) tree.Datum 
 	panic("unreachable")
 }
 
-// Postgres: https://www.postgresql.org/docs/9.6/static/infoschema-sequences.html
-// MySQL:    missing
 var informationSchemaSequences = virtualSchemaTable{
+	comment: `sequences
+` + base.DocsURL("information-schema.html#sequences") + `
+https://www.postgresql.org/docs/9.5/infoschema-sequences.html`,
 	schema: `
 CREATE TABLE information_schema.sequences (
     SEQUENCE_CATALOG         STRING NOT NULL,
@@ -857,7 +889,7 @@ CREATE TABLE information_schema.sequences (
 					tree.NewDString(db.GetName()),    // catalog
 					tree.NewDString(scName),          // schema
 					tree.NewDString(table.GetName()), // name
-					tree.NewDString("integer"),       // type
+					tree.NewDString("bigint"),        // type
 					tree.NewDInt(64),                 // numeric precision
 					tree.NewDInt(2),                  // numeric precision radix
 					tree.NewDInt(0),                  // numeric scale
@@ -874,6 +906,8 @@ CREATE TABLE information_schema.sequences (
 // Postgres: missing
 // MySQL:    https://dev.mysql.com/doc/refman/5.7/en/statistics-table.html
 var informationSchemaStatisticsTable = virtualSchemaTable{
+	comment: `index metadata and statistics (incomplete)
+` + base.DocsURL("information-schema.html#statistics"),
 	schema: `
 CREATE TABLE information_schema.statistics (
 	TABLE_CATALOG STRING NOT NULL,
@@ -970,9 +1004,11 @@ CREATE TABLE information_schema.statistics (
 	},
 }
 
-// Postgres: https://www.postgresql.org/docs/9.6/static/infoschema-table-constraints.html
 // MySQL:    https://dev.mysql.com/doc/refman/5.7/en/table-constraints-table.html
 var informationSchemaTableConstraintTable = virtualSchemaTable{
+	comment: `table constraints
+` + base.DocsURL("information-schema.html#table_constraints") + `
+https://www.postgresql.org/docs/9.5/infoschema-table-constraints.html`,
 	schema: `
 CREATE TABLE information_schema.table_constraints (
 	CONSTRAINT_CATALOG STRING NOT NULL,
@@ -1022,9 +1058,11 @@ CREATE TABLE information_schema.table_constraints (
 	},
 }
 
-// Postgres: missing
+// Postgres: not provided
 // MySQL:    https://dev.mysql.com/doc/refman/5.7/en/user-privileges-table.html
+// TODO(knz): this introspection facility is of dubious utility.
 var informationSchemaUserPrivileges = virtualSchemaTable{
+	comment: `grantable privileges (incomplete)`,
 	schema: `
 CREATE TABLE information_schema.user_privileges (
 	GRANTEE        STRING NOT NULL,
@@ -1053,9 +1091,11 @@ CREATE TABLE information_schema.user_privileges (
 	},
 }
 
-// Postgres: https://www.postgresql.org/docs/9.6/static/infoschema-table-privileges.html
 // MySQL:    https://dev.mysql.com/doc/refman/5.7/en/table-privileges-table.html
 var informationSchemaTablePrivileges = virtualSchemaTable{
+	comment: `privileges granted on table or views (incomplete; may contain excess users or roles)
+` + base.DocsURL("information-schema.html#table_privileges") + `
+https://www.postgresql.org/docs/9.5/infoschema-table-privileges.html`,
 	schema: `
 CREATE TABLE information_schema.table_privileges (
 	GRANTOR        STRING,
@@ -1065,7 +1105,7 @@ CREATE TABLE information_schema.table_privileges (
 	TABLE_NAME     STRING NOT NULL,
 	PRIVILEGE_TYPE STRING NOT NULL,
 	IS_GRANTABLE   STRING,
-	WITH_HIERARCHY STRING
+	WITH_HIERARCHY STRING NOT NULL
 )`,
 	populate: populateTablePrivileges,
 }
@@ -1079,17 +1119,19 @@ func populateTablePrivileges(
 			dbNameStr := tree.NewDString(db.Name)
 			scNameStr := tree.NewDString(scName)
 			tbNameStr := tree.NewDString(table.Name)
+			// TODO(knz): This should filter for the current user, see
+			// https://github.com/cockroachdb/cockroach/issues/35572
 			for _, u := range table.Privileges.Show() {
 				for _, priv := range u.Privileges {
 					if err := addRow(
-						tree.DNull,              // grantor
-						tree.NewDString(u.User), // grantee
-						dbNameStr,               // table_catalog
-						scNameStr,               // table_schema
-						tbNameStr,               // table_name
-						tree.NewDString(priv),   // privilege_type
-						tree.DNull,              // is_grantable
-						tree.DNull,              // with_hierarchy
+						tree.DNull,                     // grantor
+						tree.NewDString(u.User),        // grantee
+						dbNameStr,                      // table_catalog
+						scNameStr,                      // table_schema
+						tbNameStr,                      // table_name
+						tree.NewDString(priv),          // privilege_type
+						tree.DNull,                     // is_grantable
+						yesOrNoDatum(priv == "SELECT"), // with_hierarchy
 					); err != nil {
 						return err
 					}
@@ -1106,6 +1148,9 @@ var (
 )
 
 var informationSchemaTablesTable = virtualSchemaTable{
+	comment: `tables and views
+` + base.DocsURL("information-schema.html#tables") + `
+https://www.postgresql.org/docs/9.5/infoschema-tables.html`,
 	schema: vtable.InformationSchemaTables,
 	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return forEachTableDesc(ctx, p, dbContext, virtualMany,
@@ -1140,6 +1185,9 @@ var informationSchemaTablesTable = virtualSchemaTable{
 // Postgres: https://www.postgresql.org/docs/9.6/static/infoschema-views.html
 // MySQL:    https://dev.mysql.com/doc/refman/5.7/en/views-table.html
 var informationSchemaViewsTable = virtualSchemaTable{
+	comment: `views (incomplete)
+` + base.DocsURL("information-schema.html#views") + `
+https://www.postgresql.org/docs/9.5/infoschema-views.html`,
 	schema: `
 CREATE TABLE information_schema.views (
     TABLE_CATALOG              STRING NOT NULL,
@@ -1147,11 +1195,11 @@ CREATE TABLE information_schema.views (
     TABLE_NAME                 STRING NOT NULL,
     VIEW_DEFINITION            STRING NOT NULL,
     CHECK_OPTION               STRING,
-    IS_UPDATABLE               STRING,
-    IS_INSERTABLE_INTO         STRING,
-    IS_TRIGGER_UPDATABLE       STRING,
-    IS_TRIGGER_DELETABLE       STRING,
-    IS_TRIGGER_INSERTABLE_INTO STRING
+    IS_UPDATABLE               STRING NOT NULL,
+    IS_INSERTABLE_INTO         STRING NOT NULL,
+    IS_TRIGGER_UPDATABLE       STRING NOT NULL,
+    IS_TRIGGER_DELETABLE       STRING NOT NULL,
+    IS_TRIGGER_INSERTABLE_INTO STRING NOT NULL
 )`,
 	populate: func(ctx context.Context, p *planner, dbContext *DatabaseDescriptor, addRow func(...tree.Datum) error) error {
 		return forEachTableDesc(ctx, p, dbContext, hideVirtual, /* virtual schemas have no views */
@@ -1173,11 +1221,11 @@ CREATE TABLE information_schema.views (
 					tree.NewDString(table.Name),      // table_name
 					tree.NewDString(table.ViewQuery), // view_definition
 					tree.DNull,                       // check_option
-					tree.DNull,                       // is_updatable
-					tree.DNull,                       // is_insertable_into
-					tree.DNull,                       // is_trigger_updatable
-					tree.DNull,                       // is_trigger_deletable
-					tree.DNull,                       // is_trigger_insertable_into
+					noString,                         // is_updatable
+					noString,                         // is_insertable_into
+					noString,                         // is_trigger_updatable
+					noString,                         // is_trigger_deletable
+					noString,                         // is_trigger_insertable_into
 				)
 			})
 	},

@@ -78,7 +78,7 @@ var ClusterSecret = func() *settings.StringSetting {
 		"cluster specific secret",
 		"",
 	)
-	s.Hide()
+	s.SetConfidential()
 	return s
 }()
 
@@ -187,7 +187,7 @@ var (
 	}
 	MetaTxnAbort = metric.Metadata{
 		Name:        "sql.txn.abort.count",
-		Help:        "Number of SQL transaction ABORT statements",
+		Help:        "Number of SQL transaction abort errors",
 		Measurement: "SQL Statements",
 		Unit:        metric.Unit_COUNT,
 	}
@@ -275,6 +275,30 @@ var (
 		Measurement: "SQL Statements",
 		Unit:        metric.Unit_COUNT,
 	}
+	MetaSavepoint = metric.Metadata{
+		Name:        "sql.savepoint.count",
+		Help:        "Number of SQL SAVEPOINT statements",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaRestartSavepoint = metric.Metadata{
+		Name:        "sql.restart_savepoint.count",
+		Help:        "Number of `SAVEPOINT cockroach_restart` statements",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaReleaseRestartSavepoint = metric.Metadata{
+		Name:        "sql.restart_savepoint.release.count",
+		Help:        "Number of `RELEASE SAVEPOINT cockroach_restart` statements",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
+	MetaRollbackToRestartSavepoint = metric.Metadata{
+		Name:        "sql.restart_savepoint.rollback.count",
+		Help:        "Number of `ROLLBACK TO SAVEPOINT cockroach_restart` statements",
+		Measurement: "SQL Statements",
+		Unit:        metric.Unit_COUNT,
+	}
 	MetaDdl = metric.Metadata{
 		Name:        "sql.ddl.count",
 		Help:        "Number of SQL DDL statements",
@@ -331,6 +355,7 @@ type nodeStatusGenerator interface {
 type ExecutorConfig struct {
 	Settings *cluster.Settings
 	NodeInfo
+	Locality         roachpb.Locality
 	AmbientCtx       log.AmbientContext
 	DB               *client.DB
 	Gossip           *gossip.Gossip
@@ -352,7 +377,7 @@ type ExecutorConfig struct {
 	InternalExecutor *InternalExecutor
 	QueryCache       *querycache.C
 
-	TestingKnobs              *ExecutorTestingKnobs
+	TestingKnobs              ExecutorTestingKnobs
 	SchemaChangerTestingKnobs *SchemaChangerTestingKnobs
 	DistSQLRunTestingKnobs    *distsqlrun.TestingKnobs
 	EvalContextTestingKnobs   tree.EvalContextTestingKnobs
@@ -619,6 +644,8 @@ func golangFillQueryArguments(args ...interface{}) tree.Datums {
 	return res
 }
 
+// checkResultType verifies that a table result can be returned to the
+// client.
 func checkResultType(typ types.T) error {
 	// Compare all types that can rely on == equality.
 	switch types.UnwrapType(typ) {
@@ -651,7 +678,13 @@ func checkResultType(typ types.T) error {
 		switch {
 		case istype(types.FamArray):
 			if istype(types.UnwrapType(typ).(types.TArray).Typ) {
-				return pgerror.Unimplemented("nested arrays", "arrays cannot have arrays as element type")
+				// Technically we could probably return arrays of arrays to a
+				// client (the encoding exists) but we don't want to give
+				// mixed signals -- that nested arrays appear to be supported
+				// in this case, and not in other cases (eg. CREATE). So we
+				// reject them in every case instead.
+				return pgerror.UnimplementedWithIssueDetailError(32552,
+					"result", "arrays cannot have arrays as element type")
 			}
 		case istype(types.FamCollatedString):
 		case istype(types.FamTuple):
@@ -667,7 +700,15 @@ func checkResultType(typ types.T) error {
 // EvalAsOfTimestamp evaluates and returns the timestamp from an AS OF SYSTEM
 // TIME clause.
 func (p *planner) EvalAsOfTimestamp(asOf tree.AsOfClause) (_ hlc.Timestamp, err error) {
-	return tree.EvalAsOfTimestamp(asOf, &p.semaCtx, p.EvalContext())
+	ts, err := tree.EvalAsOfTimestamp(asOf, &p.semaCtx, p.EvalContext())
+	if err != nil {
+		return hlc.Timestamp{}, err
+	}
+	if now := p.execCfg.Clock.Now(); now.Less(ts) {
+		return hlc.Timestamp{}, errors.Errorf(
+			"AS OF SYSTEM TIME: cannot specify timestamp in the future (%s > %s)", ts, now)
+	}
+	return ts, nil
 }
 
 // ParseHLC parses a string representation of an `hlc.Timestamp`.
@@ -1595,8 +1636,8 @@ type sessionDataMutator struct {
 	data     *sessiondata.SessionData
 	defaults SessionDefaults
 	settings *cluster.Settings
-	// curTxnReadOnly is a value to be mutated through SET transaction_read_only = ...
-	curTxnReadOnly *bool
+	// setCurTxnReadOnly is called when we execute SET transaction_read_only = ...
+	setCurTxnReadOnly func(val bool)
 	// applicationNamedChanged, if set, is called when the "application name"
 	// variable is updated.
 	applicationNameChanged func(newName string)
@@ -1675,7 +1716,7 @@ func (m *sessionDataMutator) SetLocation(loc *time.Location) {
 }
 
 func (m *sessionDataMutator) SetReadOnly(val bool) {
-	*m.curTxnReadOnly = val
+	m.setCurTxnReadOnly(val)
 }
 
 func (m *sessionDataMutator) SetStmtTimeout(timeout time.Duration) {

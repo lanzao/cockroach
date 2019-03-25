@@ -16,17 +16,19 @@ package execbuilder
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/ordering"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/pkg/errors"
 )
 
@@ -86,7 +88,7 @@ func (ep *execPlan) makeBuildScalarCtx() buildScalarCtx {
 func (ep *execPlan) getColumnOrdinal(col opt.ColumnID) exec.ColumnOrdinal {
 	ord, ok := ep.outputCols.Get(int(col))
 	if !ok {
-		panic(fmt.Sprintf("column %d not in input", col))
+		panic(pgerror.NewAssertionErrorf("column %d not in input", log.Safe(col)))
 	}
 	return exec.ColumnOrdinal(ord)
 }
@@ -136,8 +138,8 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 	isDDL := opt.IsDDLOp(e)
 	if isDDL {
 		if err := b.evalCtx.Txn.SetSystemConfigTrigger(); err != nil {
-			return execPlan{}, errors.Wrap(err,
-				"schema change statement cannot follow a statement that has written in the same transaction")
+			return execPlan{}, pgerror.UnimplementedWithIssueErrorf(26508,
+				"schema change statement cannot follow a statement that has written in the same transaction: %v", err)
 		}
 	}
 
@@ -233,11 +235,26 @@ func (b *Builder) buildRelational(e memo.RelExpr) (execPlan, error) {
 			break
 		}
 		if opt.IsJoinApplyOp(e) {
-			return execPlan{}, b.decorrelationError()
+			ep, err = b.buildApplyJoin(e)
+			break
 		}
 	}
 	if err != nil {
 		return execPlan{}, err
+	}
+
+	// In race builds, assert that the exec plan output columns match the opt
+	// plan output columns.
+	if util.RaceEnabled {
+		optCols := e.Relational().OutputCols
+		var execCols opt.ColSet
+		ep.outputCols.ForEach(func(key, val int) {
+			execCols.Add(key)
+		})
+		if !execCols.Equals(optCols) {
+			return execPlan{}, pgerror.NewAssertionErrorf(
+				"exec columns do not match opt columns: expected %v, got %v", optCols, execCols)
+		}
 	}
 
 	// Wrap the expression in a render expression if presentation requires it.
@@ -472,7 +489,144 @@ func (b *Builder) buildProject(prj *memo.ProjectExpr) (execPlan, error) {
 	return res, nil
 }
 
+// ReplaceVars replaces the VariableExprs within a RelExpr with constant Datums
+// provided by the vars map, which maps opt column id for each VariableExpr to
+// replace to the Datum that should replace it. The memo within the input
+// norm.Factory will be replaced with the result.
+// requiredPhysical is the set of physical properties that are required of the
+// root of the new expression.
+func ReplaceVars(
+	f *norm.Factory,
+	applyInput memo.RelExpr,
+	requiredPhysical *physical.Required,
+	vars map[opt.ColumnID]tree.Datum,
+) {
+	var replaceFn norm.ReplaceFunc
+	replaceFn = func(e opt.Expr) opt.Expr {
+		switch t := e.(type) {
+		case *memo.VariableExpr:
+			if d, ok := vars[t.Col]; ok {
+				return f.ConstructConstVal(d, t.Typ)
+			}
+		}
+		return f.CopyAndReplaceDefault(e, replaceFn)
+	}
+	f.CopyAndReplace(applyInput, requiredPhysical, replaceFn)
+}
+
+func (b *Builder) buildApplyJoin(join memo.RelExpr) (execPlan, error) {
+	switch join.Op() {
+	case opt.InnerJoinApplyOp, opt.LeftJoinApplyOp, opt.SemiJoinApplyOp, opt.AntiJoinApplyOp:
+	default:
+		return execPlan{}, fmt.Errorf("couldn't execute correlated subquery with op %s", join.Op())
+	}
+	joinType := joinOpToJoinType(join.Op())
+	leftExpr := join.Child(0).(memo.RelExpr)
+	rightExpr := join.Child(1).(memo.RelExpr)
+	filters := join.Child(2).(*memo.FiltersExpr)
+
+	// Create a fake version of the right-side plan that contains NULL for all
+	// outer columns, so that we can figure out the output columns and various
+	// other attributes.
+	var f norm.Factory
+	f.Init(b.evalCtx)
+	fakeBindings := make(map[opt.ColumnID]tree.Datum)
+	rightExpr.Relational().OuterCols.ForEach(func(k int) {
+		fakeBindings[opt.ColumnID(k)] = tree.DNull
+	})
+	ReplaceVars(&f, rightExpr, rightExpr.RequiredPhysical(), fakeBindings)
+
+	// We increment nullifyMissingVarExprs here to instruct the scalar builder to
+	// replace the outer column VariableExprs with null for the current scope.
+	b.nullifyMissingVarExprs++
+	fakeRight, err := b.buildRelational(rightExpr)
+	b.nullifyMissingVarExprs--
+	if err != nil {
+		return execPlan{}, err
+	}
+
+	// Make a copy of the required props.
+	requiredProps := *rightExpr.RequiredPhysical()
+	requiredProps.Presentation = make(physical.Presentation, fakeRight.outputCols.Len())
+	fakeRight.outputCols.ForEach(func(k, v int) {
+		requiredProps.Presentation[opt.ColumnID(v)] = opt.AliasedColumn{
+			ID:    opt.ColumnID(k),
+			Alias: join.Memo().Metadata().ColumnMeta(opt.ColumnID(k)).Alias,
+		}
+	})
+
+	left, err := b.buildRelational(leftExpr)
+	if err != nil {
+		return execPlan{}, err
+	}
+
+	// leftBoundCols is the set of columns that this apply join binds.
+	leftBoundCols := leftExpr.Relational().OutputCols.Intersection(rightExpr.Relational().OuterCols)
+	// leftBoundColMap is a map from opt.ColumnID to opt.ColumnOrdinal that maps
+	// a column bound by the left side of this apply join to the column ordinal
+	// in the left side that contains the binding.
+	var leftBoundColMap opt.ColMap
+	for k, ok := leftBoundCols.Next(0); ok; k, ok = leftBoundCols.Next(k + 1) {
+		v, ok := left.outputCols.Get(k)
+		if !ok {
+			return execPlan{}, fmt.Errorf("couldn't find binding column %d in output columns", k)
+		}
+		leftBoundColMap.Set(k, v)
+	}
+
+	allCols := joinOutputMap(left.outputCols, fakeRight.outputCols)
+
+	ctx := buildScalarCtx{
+		ivh:     tree.MakeIndexedVarHelper(nil /* container */, allCols.Len()),
+		ivarMap: allCols,
+	}
+
+	var onExpr tree.TypedExpr
+	if len(*filters) != 0 {
+		onExpr, err = b.buildScalar(&ctx, filters)
+		if err != nil {
+			return execPlan{}, nil
+		}
+	}
+
+	var outputCols opt.ColMap
+	if joinType == sqlbase.LeftSemiJoin || joinType == sqlbase.LeftAntiJoin {
+		// For semi and anti join, only the left columns are output.
+		outputCols = left.outputCols
+	} else {
+		outputCols = allCols
+	}
+
+	ep := execPlan{outputCols: outputCols}
+
+	ep.root, err = b.factory.ConstructApplyJoin(
+		joinType,
+		left.root,
+		leftBoundColMap,
+		b.mem,
+		&requiredProps,
+		fakeRight.root,
+		rightExpr,
+		onExpr,
+	)
+	if err != nil {
+		return execPlan{}, err
+	}
+	return ep, nil
+}
+
 func (b *Builder) buildHashJoin(join memo.RelExpr) (execPlan, error) {
+	if f := join.Private().(*memo.JoinPrivate).Flags; f.DisallowHashJoin {
+		hint := tree.AstLookup
+		if !f.DisallowMergeJoin {
+			hint = tree.AstMerge
+		}
+
+		return execPlan{}, errors.Errorf(
+			"could not produce a query plan conforming to the %s JOIN hint", hint,
+		)
+	}
+
 	joinType := joinOpToJoinType(join.Op())
 	leftExpr := join.Child(0).(memo.RelExpr)
 	rightExpr := join.Child(1).(memo.RelExpr)
@@ -592,26 +746,26 @@ func joinOutputMap(left, right opt.ColMap) opt.ColMap {
 
 func joinOpToJoinType(op opt.Operator) sqlbase.JoinType {
 	switch op {
-	case opt.InnerJoinOp:
+	case opt.InnerJoinOp, opt.InnerJoinApplyOp:
 		return sqlbase.InnerJoin
 
-	case opt.LeftJoinOp:
+	case opt.LeftJoinOp, opt.LeftJoinApplyOp:
 		return sqlbase.LeftOuterJoin
 
-	case opt.RightJoinOp:
+	case opt.RightJoinOp, opt.RightJoinApplyOp:
 		return sqlbase.RightOuterJoin
 
-	case opt.FullJoinOp:
+	case opt.FullJoinOp, opt.FullJoinApplyOp:
 		return sqlbase.FullOuterJoin
 
-	case opt.SemiJoinOp:
+	case opt.SemiJoinOp, opt.SemiJoinApplyOp:
 		return sqlbase.LeftSemiJoin
 
-	case opt.AntiJoinOp:
+	case opt.AntiJoinOp, opt.AntiJoinApplyOp:
 		return sqlbase.LeftAntiJoin
 
 	default:
-		panic(fmt.Sprintf("not a join op %s", op))
+		panic(pgerror.NewAssertionErrorf("not a join op %s", log.Safe(op)))
 	}
 }
 
@@ -724,7 +878,17 @@ func (b *Builder) buildDistinct(distinct *memo.DistinctOnExpr) (execPlan, error)
 	if err != nil {
 		return execPlan{}, err
 	}
-	return execPlan{root: node, outputCols: input.outputCols}, nil
+	ep := execPlan{root: node, outputCols: input.outputCols}
+
+	// buildGroupByInput can add extra sort column(s), so discard those if they
+	// are present by using an additional projection.
+	outCols := distinct.Relational().OutputCols
+	if input.outputCols.Len() == outCols.Len() {
+		return ep, nil
+	}
+	return b.ensureColumns(
+		ep, opt.ColSetToList(outCols), nil /* colNames */, distinct.ProvidedPhysical().Ordering,
+	)
 }
 
 func (b *Builder) buildGroupByInput(groupBy memo.RelExpr) (execPlan, error) {
@@ -749,6 +913,14 @@ func (b *Builder) buildGroupByInput(groupBy memo.RelExpr) (execPlan, error) {
 		neededCols.UnionWith(memo.ExtractAggInputColumns(aggs[i].Agg))
 	}
 
+	// In rare cases, we might need a column only for its ordering, for example:
+	//   SELECT concat_agg(s) FROM (SELECT s FROM kv ORDER BY k)
+	// In this case we can't project the column away as it is still needed by
+	// distsql to maintain the desired ordering.
+	for _, c := range groupByInput.ProvidedPhysical().Ordering {
+		neededCols.Add(int(c.ID()))
+	}
+
 	if neededCols.Equals(groupByInput.Relational().OutputCols) {
 		// All columns produced by the input are used.
 		return input, nil
@@ -764,14 +936,14 @@ func (b *Builder) buildGroupByInput(groupBy memo.RelExpr) (execPlan, error) {
 		}
 	})
 
-	reqOrdering := input.reqOrdering(groupBy)
+	input.outputCols = newOutputCols
+	reqOrdering := input.reqOrdering(groupByInput)
 	input.root, err = b.factory.ConstructSimpleProject(
 		input.root, cols, nil /* colNames */, reqOrdering,
 	)
 	if err != nil {
 		return execPlan{}, err
 	}
-	input.outputCols = newOutputCols
 	return input, nil
 }
 
@@ -837,7 +1009,7 @@ func (b *Builder) buildSetOp(set memo.RelExpr) (execPlan, error) {
 	case opt.ExceptAllOp:
 		typ, all = tree.ExceptOp, true
 	default:
-		panic(fmt.Sprintf("invalid operator %s", set.Op()))
+		panic(pgerror.NewAssertionErrorf("invalid operator %s", log.Safe(set.Op())))
 	}
 
 	node, err := b.factory.ConstructSetOp(typ, all, left.root, right.root)
@@ -1150,7 +1322,7 @@ func (b *Builder) buildInsert(ins *memo.InsertExpr) (execPlan, error) {
 	colList := make(opt.ColList, 0, len(ins.InsertCols)+len(ins.CheckCols))
 	colList = appendColsWhenPresent(colList, ins.InsertCols)
 	colList = appendColsWhenPresent(colList, ins.CheckCols)
-	input, err = b.ensureColumns(input, colList, nil, ins.ProvidedPhysical().Ordering)
+	input, err = b.ensureColumns(input, colList, nil, ins.Input.ProvidedPhysical().Ordering)
 	if err != nil {
 		return execPlan{}, err
 	}
@@ -1201,7 +1373,7 @@ func (b *Builder) buildUpdate(upd *memo.UpdateExpr) (execPlan, error) {
 	colList = appendColsWhenPresent(colList, upd.FetchCols)
 	colList = appendColsWhenPresent(colList, upd.UpdateCols)
 	colList = appendColsWhenPresent(colList, upd.CheckCols)
-	input, err = b.ensureColumns(input, colList, nil, upd.ProvidedPhysical().Ordering)
+	input, err = b.ensureColumns(input, colList, nil, upd.Input.ProvidedPhysical().Ordering)
 	if err != nil {
 		return execPlan{}, err
 	}
@@ -1267,7 +1439,7 @@ func (b *Builder) buildUpsert(ups *memo.UpsertExpr) (execPlan, error) {
 		colList = append(colList, ups.CanaryCol)
 	}
 	colList = appendColsWhenPresent(colList, ups.CheckCols)
-	input, err = b.ensureColumns(input, colList, nil, ups.ProvidedPhysical().Ordering)
+	input, err = b.ensureColumns(input, colList, nil, ups.Input.ProvidedPhysical().Ordering)
 	if err != nil {
 		return execPlan{}, err
 	}
@@ -1326,7 +1498,7 @@ func (b *Builder) buildDelete(del *memo.DeleteExpr) (execPlan, error) {
 	// Upgrade execution engine to not require this.
 	colList := make(opt.ColList, 0, len(del.FetchCols))
 	colList = appendColsWhenPresent(colList, del.FetchCols)
-	input, err = b.ensureColumns(input, colList, nil, del.ProvidedPhysical().Ordering)
+	input, err = b.ensureColumns(input, colList, nil, del.Input.ProvidedPhysical().Ordering)
 	if err != nil {
 		return execPlan{}, err
 	}
@@ -1389,15 +1561,13 @@ func (b *Builder) buildDeleteRange(del *memo.DeleteExpr) (execPlan, error) {
 	// canUseDeleteRange has already validated that input is a Scan operator.
 	scan := del.Input.(*memo.ScanExpr)
 	tab := b.mem.Metadata().Table(scan.Table)
-	needed, output := b.getColumns(scan.Cols, scan.Table)
-	res := execPlan{outputCols: output}
+	needed, _ := b.getColumns(scan.Cols, scan.Table)
 
 	root, err := b.factory.ConstructDeleteRange(tab, needed, scan.Constraint)
 	if err != nil {
 		return execPlan{}, err
 	}
-	res.root = root
-	return res, nil
+	return execPlan{root: root}, nil
 }
 
 func (b *Builder) buildCreateTable(ct *memo.CreateTableExpr) (execPlan, error) {
@@ -1507,10 +1677,42 @@ func (b *Builder) applyPresentation(input execPlan, p *physical.Required) (execP
 	return b.ensureColumns(input, colList, colNames, nil /* provided */)
 }
 
+// getEnvData consolidates the information that must be presented in
+// EXPLAIN (opt, env).
+func (b *Builder) getEnvData() exec.ExplainEnvData {
+	envOpts := exec.ExplainEnvData{ShowEnv: true}
+	// Catalog objects can show up multiple times in these lists, so
+	// deduplicate them.
+	seen := make(map[tree.TableName]bool)
+	for _, t := range b.mem.Metadata().AllTables() {
+		tn := *t.Table.Name()
+		if !seen[tn] {
+			seen[tn] = true
+			envOpts.Tables = append(envOpts.Tables, tn)
+		}
+	}
+	for _, s := range b.mem.Metadata().AllSequences() {
+		tn := *s.Name()
+		if !seen[tn] {
+			seen[tn] = true
+			envOpts.Sequences = append(envOpts.Sequences, tn)
+		}
+	}
+	for _, v := range b.mem.Metadata().AllViews() {
+		tn := *v.Name()
+		if !seen[tn] {
+			seen[tn] = true
+			envOpts.Views = append(envOpts.Views, tn)
+		}
+	}
+
+	return envOpts
+}
+
 func (b *Builder) buildExplain(explain *memo.ExplainExpr) (execPlan, error) {
+	var node exec.Node
+
 	if explain.Options.Mode == tree.ExplainOpt {
-		// Special case: EXPLAIN (OPT). Put the formatted expression in
-		// a valuesNode.
 		fmtFlags := memo.ExprFmtHideAll
 		switch {
 		case explain.Options.Flags.Contains(tree.ExplainFlagVerbose):
@@ -1519,29 +1721,42 @@ func (b *Builder) buildExplain(explain *memo.ExplainExpr) (execPlan, error) {
 		case explain.Options.Flags.Contains(tree.ExplainFlagTypes):
 			fmtFlags = memo.ExprFmtHideQualifications
 		}
+
+		// Format the plan here and pass it through to the exec factory.
 		f := memo.MakeExprFmtCtx(fmtFlags, b.mem)
 		f.FormatExpr(explain.Input)
-		textRows := strings.Split(strings.Trim(f.Buffer.String(), "\n"), "\n")
-		rows := make([][]tree.TypedExpr, len(textRows))
-		for i := range textRows {
-			rows[i] = []tree.TypedExpr{tree.NewDString(textRows[i])}
+		planText := f.Buffer.String()
+
+		// If we're going to display the environment, there's a bunch of queries we
+		// need to run to get that information, and we can't run them from here, so
+		// tell the exec factory what information it needs to fetch.
+		var envOpts exec.ExplainEnvData
+		if explain.Options.Flags.Contains(tree.ExplainFlagEnv) {
+			envOpts = b.getEnvData()
 		}
-		return b.constructValues(rows, explain.ColList)
+
+		var err error
+		node, err = b.factory.ConstructExplainOpt(planText, envOpts)
+		if err != nil {
+			return execPlan{}, err
+		}
+	} else {
+		input, err := b.buildRelational(explain.Input)
+		if err != nil {
+			return execPlan{}, err
+		}
+
+		plan, err := b.factory.ConstructPlan(input.root, b.subqueries)
+		if err != nil {
+			return execPlan{}, err
+		}
+
+		node, err = b.factory.ConstructExplain(&explain.Options, explain.StmtType, plan)
+		if err != nil {
+			return execPlan{}, err
+		}
 	}
 
-	input, err := b.buildRelational(explain.Input)
-	if err != nil {
-		return execPlan{}, err
-	}
-
-	plan, err := b.factory.ConstructPlan(input.root, b.subqueries)
-	if err != nil {
-		return execPlan{}, err
-	}
-	node, err := b.factory.ConstructExplain(&explain.Options, explain.StmtType, plan)
-	if err != nil {
-		return execPlan{}, err
-	}
 	ep := execPlan{root: node}
 	for i := range explain.ColList {
 		ep.outputCols.Set(int(explain.ColList[i]), i)

@@ -218,22 +218,22 @@ export default function Debug() {
         <DebugTableRow title="Stopper">
           <DebugTableLink name="Active Tasks" url="/debug/stopper" />
         </DebugTableRow>
-        <DebugTableRow title="Profiling UI">
+        <DebugTableRow title="Profiling UI/pprof">
           <DebugTableLink name="Heap" url="/debug/pprof/ui/heap/" />
           <DebugTableLink name="Profile" url="/debug/pprof/ui/profile/?seconds=5" />
+          <DebugTableLink name="Profile (w/ Labels)" url="/debug/pprof/ui/profile/?seconds=5&amp;labels=true" />
           <DebugTableLink name="Block" url="/debug/pprof/ui/block/" />
           <DebugTableLink name="Mutex" url="/debug/pprof/ui/mutex/" />
           <DebugTableLink name="Thread Create" url="/debug/pprof/ui/threadcreate/" />
           <DebugTableLink name="Goroutines" url="/debug/pprof/ui/goroutine/" />
         </DebugTableRow>
-        <DebugTableRow title="Profiling Raw">
-          <DebugTableLink name="Heap" url="/debug/pprof/heap?debug=1" />
-          <DebugTableLink name="Profile" url="/debug/pprof/profile?debug=1" />
-          <DebugTableLink name="Block" url="/debug/pprof/block?debug=1" />
-          <DebugTableLink name="Mutex" url="/debug/pprof/mutex?debug=1" />
-          <DebugTableLink name="Thread Create" url="/debug/pprof/threadcreate?debug=1" />
-          <DebugTableLink name="Goroutines" url="/debug/pprof/goroutine?debug=1" />
-          <DebugTableLink name="All Goroutines" url="/debug/pprof/goroutine?debug=2" />
+        <DebugTableRow title="Goroutines">
+          <DebugTableLink name="UI" url="/debug/pprof/goroutineui" />
+          <DebugTableLink name="UI (count)" url="/debug/pprof/goroutineui?sort=count" />
+          <DebugTableLink name="UI (wait)" url="/debug/pprof/goroutineui?sort=wait" />
+          <DebugTableLink name="Raw" url="/debug/pprof/goroutine?debug=2" />
+        </DebugTableRow>
+        <DebugTableRow title="Runtime Trace">
           <DebugTableLink name="Trace" url="/debug/pprof/trace?debug=1" />
         </DebugTableRow>
       </DebugTable>

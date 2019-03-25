@@ -16,91 +16,53 @@ package sqlsmith
 
 import (
 	gosql "database/sql"
-	"math/rand"
+	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
+	// Import builtins so they are reflected in tree.FunDefs.
+	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/lib/pq"
 	"github.com/lib/pq/oid"
 )
 
-type operator struct {
-	name  string
-	left  types.T
-	right types.T
-	out   types.T
+// tableRef represents a table and its columns.
+type tableRef struct {
+	TableName *tree.TableName
+	Columns   []*tree.ColumnTableDef
 }
 
-type function struct {
-	name   string
-	inputs []types.T
-	out    types.T
+type tableRefs []*tableRef
+
+func (t tableRefs) Pop() (*tableRef, tableRefs) {
+	return t[0], t[1:]
 }
 
-// schema represents the state of the database as sqlsmith-go understands it, including
-// not only the tables present but also things like what operator overloads exist.
-type schema struct {
-	db        *gosql.DB
-	rnd       *rand.Rand
-	lock      syncutil.Mutex
-	tables    []namedRelation
-	operators map[oid.Oid][]operator
-	functions map[oid.Oid][]function
-}
-
-func (s *schema) makeScope() *scope {
-	return &scope{
-		namer:  &namer{make(map[string]int)},
-		schema: s,
-	}
-}
-
-func (s *schema) GetOperatorsByOutputType(outTyp types.T) []operator {
-	return s.operators[outTyp.Oid()]
-}
-
-func (s *schema) GetFunctionsByOutputType(outTyp types.T) []function {
-	return s.functions[outTyp.Oid()]
-}
-
-func makeSchema(db *gosql.DB, rnd *rand.Rand) (*schema, error) {
-	s := &schema{
-		db:  db,
-		rnd: rnd,
-	}
-	return s, s.ReloadSchemas()
-}
-
-func (s *schema) ReloadSchemas() error {
+// ReloadSchemas loads tables from the database. Not safe to use concurrently
+// with Generate.
+func (s *Smither) ReloadSchemas(db *gosql.DB) error {
 	var err error
-	s.tables, err = s.extractTables()
-	if err != nil {
-		return err
-	}
-	s.operators, err = s.extractOperators()
-	if err != nil {
-		return err
-	}
-	s.functions, err = s.extractFunctions()
+	s.tables, err = extractTables(db)
 	return err
 }
 
-func (s *schema) extractTables() ([]namedRelation, error) {
-	rows, err := s.db.Query(`
-	SELECT
-		table_catalog,
-		table_schema,
-		table_name,
-		column_name,
-		crdb_sql_type,
-		generation_expression != '' AS computed,
-		is_nullable = 'YES' AS nullable
-	FROM
-		information_schema.columns
-	WHERE
-		table_schema = 'public'
-	ORDER BY
-		table_catalog, table_schema, table_name
+func extractTables(db *gosql.DB) ([]*tableRef, error) {
+	rows, err := db.Query(`
+SELECT
+	table_catalog,
+	table_schema,
+	table_name,
+	column_name,
+	crdb_sql_type,
+	generation_expression != '' AS computed,
+	is_nullable = 'YES' AS nullable,
+	is_hidden = 'YES' AS hidden
+FROM
+	information_schema.columns
+WHERE
+	table_schema = 'public'
+ORDER BY
+	table_catalog, table_schema, table_name
 	`)
 	// TODO(justin): have a flag that includes system tables?
 	if err != nil {
@@ -113,20 +75,27 @@ func (s *schema) extractTables() ([]namedRelation, error) {
 	// or something for a cleaner processing step?
 
 	firstTime := true
-	var lastCatalog, lastSchema, lastName string
-	var tables []namedRelation
-	var currentCols []column
+	var lastCatalog, lastSchema, lastName tree.Name
+	var tables []*tableRef
+	var currentCols []*tree.ColumnTableDef
 	emit := func() {
-		tables = append(tables, namedRelation{
-			cols: currentCols,
-			name: lastName,
+		if lastSchema != "public" {
+			return
+		}
+		tables = append(tables, &tableRef{
+			TableName: tree.NewTableName(lastCatalog, lastName),
+			Columns:   currentCols,
 		})
 	}
 	for rows.Next() {
-		var catalog, schema, name, col, typ string
-		var computed, nullable bool
-		if err := rows.Scan(&catalog, &schema, &name, &col, &typ, &computed, &nullable); err != nil {
+		var catalog, schema, name, col tree.Name
+		var typ string
+		var computed, nullable, hidden bool
+		if err := rows.Scan(&catalog, &schema, &name, &col, &typ, &computed, &nullable, &hidden); err != nil {
 			return nil, err
+		}
+		if hidden {
+			continue
 		}
 
 		if firstTime {
@@ -141,20 +110,21 @@ func (s *schema) extractTables() ([]namedRelation, error) {
 			currentCols = nil
 		}
 
-		writability := writable
-		if computed {
-			writability = notWritable
+		coltyp, err := coltypes.DatumTypeToColumnType(typeFromName(typ))
+		if err != nil {
+			return nil, err
 		}
-
-		currentCols = append(
-			currentCols,
-			column{
-				name:        col,
-				typ:         typeFromName(typ),
-				nullable:    nullable,
-				writability: writability,
-			},
-		)
+		column := tree.ColumnTableDef{
+			Name: col,
+			Type: coltyp,
+		}
+		if nullable {
+			column.Nullable.Nullability = tree.Null
+		}
+		if computed {
+			column.Computed.Computed = true
+		}
+		currentCols = append(currentCols, &column)
 		lastCatalog = catalog
 		lastSchema = schema
 		lastName = name
@@ -165,103 +135,69 @@ func (s *schema) extractTables() ([]namedRelation, error) {
 	return tables, rows.Err()
 }
 
-func (s *schema) extractOperators() (map[oid.Oid][]operator, error) {
-	rows, err := s.db.Query(`
-SELECT
-	oprname, oprleft, oprright, oprresult
-FROM
-	pg_catalog.pg_operator
-WHERE
-	0 NOT IN (oprresult, oprright, oprleft)
-`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	result := map[oid.Oid][]operator{}
-	for rows.Next() {
-		var name string
-		var left, right, out oid.Oid
-		if err := rows.Scan(&name, &left, &right, &out); err != nil {
-			return nil, err
-		}
-		leftTyp, ok := types.OidToType[left]
-		if !ok {
-			continue
-		}
-		rightTyp, ok := types.OidToType[right]
-		if !ok {
-			continue
-		}
-		outTyp, ok := types.OidToType[out]
-		if !ok {
-			continue
-		}
-		result[out] = append(
-			result[out],
-			operator{
-				name:  name,
-				left:  leftTyp,
-				right: rightTyp,
-				out:   outTyp,
-			},
-		)
-	}
-	return result, rows.Err()
+type operator struct {
+	*tree.BinOp
+	Operator tree.BinaryOperator
 }
 
-func (s *schema) extractFunctions() (map[oid.Oid][]function, error) {
-	rows, err := s.db.Query(`
-SELECT
-	proname, proargtypes::INT[], prorettype
-FROM
-	pg_catalog.pg_proc
-WHERE
-	NOT proisagg
-	AND NOT proiswindow
-	AND NOT proretset
-	AND proname NOT LIKE 'crdb_internal.force_%'
-`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	result := map[oid.Oid][]function{}
-	for rows.Next() {
-		var name string
-		var inputs []int64
-		var returnType oid.Oid
-		if err := rows.Scan(&name, pq.Array(&inputs), &returnType); err != nil {
-			return nil, err
+var operators = func() map[oid.Oid][]operator {
+	m := map[oid.Oid][]operator{}
+	for BinaryOperator, overload := range tree.BinOps {
+		for _, ov := range overload {
+			bo := ov.(*tree.BinOp)
+			m[bo.ReturnType.Oid()] = append(m[bo.ReturnType.Oid()], operator{
+				BinOp:    bo,
+				Operator: BinaryOperator,
+			})
 		}
+	}
+	return m
+}()
 
-		typs := make([]types.T, len(inputs))
-		unsupported := false
-		for i, id := range inputs {
-			t, ok := types.OidToType[oid.Oid(id)]
-			if !ok {
-				unsupported = true
-				break
+type function struct {
+	def      *tree.FunctionDefinition
+	overload *tree.Overload
+}
+
+var functions = func() map[oid.Oid][]function {
+	m := map[oid.Oid][]function{}
+	for _, def := range tree.FunDefs {
+		switch def.Name {
+		case "pg_sleep":
+			continue
+		}
+		if strings.Contains(def.Name, "crdb_internal.force_") {
+			continue
+		}
+		// Skip aggregate, window, and generator functions.
+		if def.Class != tree.NormalClass {
+			continue
+		}
+		// Ignore pg compat functions since many are unimplemented.
+		if def.Category == "Compatibility" {
+			continue
+		}
+		for _, ov := range def.Definition {
+			ov := ov.(*tree.Overload)
+			// Ignore documented unusable functions.
+			if strings.Contains(ov.Info, "Not usable") {
+				continue
 			}
-			typs[i] = t
+			typ := ov.FixedReturnType()
+			found := false
+			for _, nonArrayTyp := range types.AnyNonArray {
+				if typ == nonArrayTyp {
+					found = true
+				}
+			}
+			if !found {
+				continue
+			}
+			m[typ.Oid()] = append(m[typ.Oid()], function{
+				def:      def,
+				overload: ov,
+			})
 		}
-
-		if unsupported {
-			continue
-		}
-
-		out, ok := types.OidToType[returnType]
-		if !ok {
-			continue
-		}
-
-		result[returnType] = append(result[returnType], function{
-			name,
-			typs,
-			out,
-		})
 	}
-	return result, rows.Err()
-}
+	return m
+}()

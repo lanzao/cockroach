@@ -19,7 +19,6 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
-	"math/rand"
 	"net/url"
 	"strings"
 	"sync"
@@ -28,17 +27,21 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uint128"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/cockroach/pkg/workload"
+	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
 	"github.com/jackc/pgx"
 	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
+	"golang.org/x/exp/rand"
 )
 
 type tpcc struct {
 	flags     workload.Flags
 	connFlags *workload.ConnFlags
 
-	seed             int64
+	seed             uint64
 	warehouses       int
 	activeWarehouses int
 	interleaved      bool
@@ -56,7 +59,7 @@ type tpcc struct {
 
 	auditor *auditor
 
-	reg *workload.HistogramRegistry
+	reg *histogram.Registry
 
 	split   bool
 	scatter bool
@@ -76,7 +79,7 @@ type tpcc struct {
 		syncutil.Mutex
 		values [][]int
 	}
-	rngPool *sync.Pool
+	localsPool *sync.Pool
 }
 
 func init() {
@@ -95,7 +98,8 @@ var tpccMeta = workload.Meta{
 		` using a rich schema of multiple tables`,
 	// TODO(anyone): when bumping this version and regenerating fixtures, please
 	// address the TODO in PostLoad.
-	Version: `2.0.1`,
+	Version:      `2.0.1`,
+	PublicFacing: true,
 	New: func() workload.Generator {
 		g := &tpcc{}
 		g.flags.FlagSet = pflag.NewFlagSet(`tpcc`, pflag.ContinueOnError)
@@ -115,7 +119,7 @@ var tpccMeta = workload.Meta{
 			`expensive-checks`:   {RuntimeOnly: true, CheckConsistencyOnly: true},
 		}
 
-		g.flags.Int64Var(&g.seed, `seed`, 1, `Random number generator seed`)
+		g.flags.Uint64Var(&g.seed, `seed`, 1, `Random number generator seed`)
 		g.flags.IntVar(&g.warehouses, `warehouses`, 1, `Number of warehouses for loading`)
 		g.flags.BoolVar(&g.interleaved, `interleaved`, false, `Use interleaved tables`)
 		// Hardcode this since it doesn't seem like anyone will want to change
@@ -258,13 +262,13 @@ func (w *tpcc) Hooks() workload.Hooks {
 			fmt.Println(totalHeader)
 
 			const newOrderName = `newOrder`
-			w.reg.Tick(func(t workload.HistogramTick) {
+			w.reg.Tick(func(t histogram.Tick) {
 				if newOrderName == t.Name {
 					tpmC := float64(t.Cumulative.TotalCount()) / startElapsed.Seconds() * 60
 					fmt.Printf("%7.1fs %10.1f %5.1f%% %8.1f %8.1f %8.1f %8.1f %8.1f %8.1f\n",
 						startElapsed.Seconds(),
 						tpmC,
-						100*tpmC/(12.86*float64(w.activeWarehouses)),
+						100*tpmC/(SpecWarehouseFactor*float64(w.activeWarehouses)),
 						time.Duration(t.Cumulative.Mean()).Seconds()*1000,
 						time.Duration(t.Cumulative.ValueAtQuantile(50)).Seconds()*1000,
 						time.Duration(t.Cumulative.ValueAtQuantile(90)).Seconds()*1000,
@@ -297,12 +301,34 @@ func (w *tpcc) Hooks() workload.Hooks {
 
 // Tables implements the Generator interface.
 func (w *tpcc) Tables() []workload.Table {
-	if w.rngPool == nil {
-		w.rngPool = &sync.Pool{
-			New: func() interface{} { return rand.New(rand.NewSource(timeutil.Now().UnixNano())) },
+	if w.localsPool == nil {
+		w.localsPool = &sync.Pool{
+			New: func() interface{} {
+				return &generateLocals{
+					rng: rand.New(rand.NewSource(uint64(timeutil.Now().UnixNano()))),
+				}
+			},
 		}
 	}
 
+	// splits is a convenience method for constructing table splits that returns
+	// a zero value if the workload does not have splits enabled.
+	splits := func(t workload.BatchedTuples) workload.BatchedTuples {
+		if w.split {
+			return t
+		}
+		return workload.BatchedTuples{}
+	}
+
+	// numBatches is a helper to calculate how many split batches exist exist given
+	// the total number of rows and the desired number of rows per split.
+	numBatches := func(total, per int) int {
+		batches := total / per
+		if total%per == 0 {
+			batches--
+		}
+		return batches
+	}
 	warehouse := workload.Table{
 		Name:   `warehouse`,
 		Schema: tpccWarehouseSchema,
@@ -310,6 +336,14 @@ func (w *tpcc) Tables() []workload.Table {
 			w.warehouses,
 			w.tpccWarehouseInitialRow,
 		),
+		Splits: splits(workload.BatchedTuples{
+			NumBatches: numBatches(w.warehouses, numWarehousesPerRange),
+			NumTotal:   w.warehouses,
+			Batch: func(i int) [][]interface{} {
+				return [][]interface{}{{(i + 1) * numWarehousesPerRange}}
+			},
+		}),
+		Stats: w.tpccWarehouseStats(),
 	}
 	district := workload.Table{
 		Name:   `district`,
@@ -318,6 +352,14 @@ func (w *tpcc) Tables() []workload.Table {
 			numDistrictsPerWarehouse*w.warehouses,
 			w.tpccDistrictInitialRow,
 		),
+		Splits: splits(workload.BatchedTuples{
+			NumBatches: numBatches(w.warehouses, numWarehousesPerRange),
+			NumTotal:   w.warehouses,
+			Batch: func(i int) [][]interface{} {
+				return [][]interface{}{{(i + 1) * numWarehousesPerRange, 0}}
+			},
+		}),
+		Stats: w.tpccDistrictStats(),
 	}
 	customer := workload.Table{
 		Name:   `customer`,
@@ -326,6 +368,7 @@ func (w *tpcc) Tables() []workload.Table {
 			numCustomersPerWarehouse*w.warehouses,
 			w.tpccCustomerInitialRow,
 		),
+		Stats: w.tpccCustomerStats(),
 	}
 	history := workload.Table{
 		Name:   `history`,
@@ -334,6 +377,16 @@ func (w *tpcc) Tables() []workload.Table {
 			numCustomersPerWarehouse*w.warehouses,
 			w.tpccHistoryInitialRow,
 		),
+		Splits: splits(workload.BatchedTuples{
+			NumBatches: historyRanges - 1,
+			Batch: func(i int) [][]interface{} {
+				at := uint128.FromInts(uint64(i+1)*numHistoryValsPerRange, 0)
+				return [][]interface{}{
+					{uuid.FromUint128(at).String()},
+				}
+			},
+		}),
+		Stats: w.tpccHistoryStats(),
 	}
 	order := workload.Table{
 		Name:   `order`,
@@ -342,6 +395,7 @@ func (w *tpcc) Tables() []workload.Table {
 			numOrdersPerWarehouse*w.warehouses,
 			w.tpccOrderInitialRow,
 		),
+		Stats: w.tpccOrderStats(),
 	}
 	newOrder := workload.Table{
 		Name:   `new_order`,
@@ -350,6 +404,7 @@ func (w *tpcc) Tables() []workload.Table {
 			numNewOrdersPerWarehouse*w.warehouses,
 			w.tpccNewOrderInitialRow,
 		),
+		Stats: w.tpccNewOrderStats(),
 	}
 	item := workload.Table{
 		Name:   `item`,
@@ -358,6 +413,14 @@ func (w *tpcc) Tables() []workload.Table {
 			numItems,
 			w.tpccItemInitialRow,
 		),
+		Splits: splits(workload.BatchedTuples{
+			NumBatches: numBatches(numItems, numItemsPerRange),
+			NumTotal:   numItems,
+			Batch: func(i int) [][]interface{} {
+				return [][]interface{}{{numItemsPerRange * (i + 1)}}
+			},
+		}),
+		Stats: w.tpccItemStats(),
 	}
 	stock := workload.Table{
 		Name:   `stock`,
@@ -366,6 +429,7 @@ func (w *tpcc) Tables() []workload.Table {
 			numStockPerWarehouse*w.warehouses,
 			w.tpccStockInitialRow,
 		),
+		Stats: w.tpccStockStats(),
 	}
 	orderLine := workload.Table{
 		Name:   `order_line`,
@@ -374,6 +438,7 @@ func (w *tpcc) Tables() []workload.Table {
 			NumBatches: numOrdersPerWarehouse * w.warehouses,
 			Batch:      w.tpccOrderLineInitialRowBatch,
 		},
+		Stats: w.tpccOrderLineStats(),
 	}
 	if w.interleaved {
 		district.Schema += tpccDistrictSchemaInterleave
@@ -392,7 +457,7 @@ func (w *tpcc) Tables() []workload.Table {
 }
 
 // Ops implements the Opser interface.
-func (w *tpcc) Ops(urls []string, reg *workload.HistogramRegistry) (workload.QueryLoad, error) {
+func (w *tpcc) Ops(urls []string, reg *histogram.Registry) (workload.QueryLoad, error) {
 	sqlDatabase, err := workload.SanitizeUrls(w, w.dbOverride, urls)
 	if err != nil {
 		return workload.QueryLoad{}, err
@@ -442,15 +507,9 @@ func (w *tpcc) Ops(urls []string, reg *workload.HistogramRegistry) (workload.Que
 		return workload.QueryLoad{}, err
 	}
 
-	if !alreadyPartitioned {
-		if w.split {
-			splitTables(dbs[0].Get(), w.warehouses)
-
-			if w.partitions > 1 {
-				partitionTables(dbs[0].Get(), w.wPart, w.zones)
-			}
-		}
-	} else {
+	if shouldPartition := w.split && w.partitions > 1; shouldPartition && !alreadyPartitioned {
+		partitionTables(dbs[0].Get(), w.wPart, w.zones)
+	} else if shouldPartition {
 		fmt.Println("Tables are not being partitioned because they've been previously partitioned.")
 	}
 

@@ -592,6 +592,7 @@ func errPriority(err error) errorPriority {
 	if err == nil {
 		return scoreNoError
 	}
+	err = errors.Cause(err)
 	if retryErr, ok := err.(*roachpb.UnhandledRetryableError); ok {
 		pErr := retryErr.PErr
 		switch pErr.GetDetail().(type) {
@@ -667,7 +668,7 @@ func (dsp *DistSQLPlanner) PlanAndRunSubqueries(
 			planIdx,
 			subqueryPlan,
 			planner,
-			evalCtxFactory,
+			evalCtxFactory(),
 			subqueryPlans,
 			recv,
 			maybeDistribute,
@@ -685,13 +686,11 @@ func (dsp *DistSQLPlanner) planAndRunSubquery(
 	planIdx int,
 	subqueryPlan subquery,
 	planner *planner,
-	evalCtxFactory func() *extendedEvalContext,
+	evalCtx *extendedEvalContext,
 	subqueryPlans []subquery,
 	recv *DistSQLReceiver,
 	maybeDistribute bool,
 ) error {
-	evalCtx := evalCtxFactory()
-
 	subqueryMonitor := mon.MakeMonitor(
 		"subquery",
 		mon.MemoryResource,

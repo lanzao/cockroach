@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -36,9 +37,45 @@ import (
 // AutomaticStatisticsClusterMode controls the cluster setting for enabling
 // automatic table statistics collection.
 var AutomaticStatisticsClusterMode = settings.RegisterBoolSetting(
-	"sql.stats.experimental_automatic_collection.enabled",
-	"experimental automatic statistics collection mode",
-	false,
+	"sql.stats.automatic_collection.enabled",
+	"automatic statistics collection mode",
+	true,
+)
+
+// AutomaticStatisticsMaxIdleTime controls the maximum fraction of time that
+// the sampler processors will be idle when scanning large tables for automatic
+// statistics (in high load scenarios). This value can be tuned to trade off
+// the runtime vs performance impact of automatic stats.
+var AutomaticStatisticsMaxIdleTime = settings.RegisterValidatedFloatSetting(
+	"sql.stats.automatic_collection.max_fraction_idle",
+	"maximum fraction of time that automatic statistics sampler processors are idle",
+	0.9,
+	func(val float64) error {
+		if val < 0 || val >= 1 {
+			return pgerror.NewErrorf(pgerror.CodeInvalidParameterValueError,
+				"sql.stats.automatic_collection.max_fraction_idle must be >= 0 and < 1 but found: %v", val)
+		}
+		return nil
+	},
+)
+
+// AutomaticStatisticsFractionStaleRows controls the cluster setting for
+// the target fraction of rows in a table that should be stale before
+// statistics on that table are refreshed, in addition to the constant value
+// AutomaticStatisticsMinStaleRows.
+var AutomaticStatisticsFractionStaleRows = settings.RegisterNonNegativeFloatSetting(
+	"sql.stats.automatic_collection.fraction_stale_rows",
+	"target fraction of stale rows per table that will trigger a statistics refresh",
+	0.2,
+)
+
+// AutomaticStatisticsMinStaleRows controls the cluster setting for the target
+// number of rows that should be updated before a table is refreshed, in
+// addition to the fraction AutomaticStatisticsFractionStaleRows.
+var AutomaticStatisticsMinStaleRows = settings.RegisterNonNegativeIntSetting(
+	"sql.stats.automatic_collection.min_stale_rows",
+	"target minimum number of stale rows per table that will trigger a statistics refresh",
+	500,
 )
 
 // DefaultRefreshInterval is the frequency at which the Refresher will check if
@@ -61,11 +98,6 @@ const (
 	// running CREATE STATISTICS manually.
 	AutoStatsName = "__auto__"
 
-	// targetFractionOfRowsUpdatedBeforeRefresh indicates the target fraction
-	// of rows in a table that should be updated before statistics on that table
-	// are refreshed.
-	targetFractionOfRowsUpdatedBeforeRefresh = 0.05
-
 	// defaultAverageTimeBetweenRefreshes is the default time to use as the
 	// "average" time between refreshes when there is no information for a given
 	// table.
@@ -86,7 +118,7 @@ const (
 //
 // The Refresher is designed to schedule a CREATE STATISTICS refresh job after
 // approximately X% of total rows have been updated/inserted/deleted in a given
-// table. Currently, X is hardcoded to be 5%.
+// table. Currently, X is hardcoded to be 20%.
 //
 // The decision to refresh is based on a percentage rather than a fixed number
 // of rows because if a table is huge and rarely updated, we don't want to
@@ -94,10 +126,10 @@ const (
 // updated, we want to update stats more often.
 //
 // To avoid contention on row update counters, we use a statistical approach.
-// For example, suppose we want to refresh stats after 5% of rows are updated
+// For example, suppose we want to refresh stats after 20% of rows are updated
 // and there are currently 1M rows in the table. If a user updates 10 rows,
 // we use random number generation to refresh stats with probability
-// 10/(1M * 0.05) = 0.0002. The general formula is:
+// 10/(1M * 0.2) = 0.00005. The general formula is:
 //
 //                            # rows updated/inserted/deleted
 //    p =  --------------------------------------------------------------------
@@ -105,6 +137,9 @@ const (
 //
 // The existing statistics in the stats cache are used to get the number of
 // rows in the table.
+//
+// In order to prevent small tables from being constantly refreshed, we also
+// require that approximately 500 rows have changed in addition to the 20%.
 //
 // Refresher also implements some heuristic limits designed to corral
 // statistical outliers. If we haven't refreshed stats in 2x the average time
@@ -128,6 +163,7 @@ const (
 // sent.
 //
 type Refresher struct {
+	st      *cluster.Settings
 	ex      sqlutil.InternalExecutor
 	cache   *TableStatisticsCache
 	randGen autoStatsRand
@@ -160,11 +196,15 @@ type mutation struct {
 
 // MakeRefresher creates a new Refresher.
 func MakeRefresher(
-	ex sqlutil.InternalExecutor, cache *TableStatisticsCache, asOfTime time.Duration,
+	st *cluster.Settings,
+	ex sqlutil.InternalExecutor,
+	cache *TableStatisticsCache,
+	asOfTime time.Duration,
 ) *Refresher {
 	randSource := rand.NewSource(rand.Int63())
 
 	return &Refresher{
+		st:             st,
 		ex:             ex,
 		cache:          cache,
 		randGen:        makeAutoStatsRand(randSource),
@@ -179,24 +219,53 @@ func MakeRefresher(
 // new SQL mutations and refreshes the table statistics with probability
 // proportional to the percentage of rows affected.
 func (r *Refresher) Start(
-	ctx context.Context, st *settings.Values, stopper *stop.Stopper, refreshInterval time.Duration,
+	ctx context.Context, stopper *stop.Stopper, refreshInterval time.Duration,
 ) error {
 	stopper.RunWorker(context.Background(), func(ctx context.Context) {
-		// Ensure that read-only tables will have stats created at least once
-		// on startup.
-		r.ensureAllTables(ctx, st)
+		// We always sleep for r.asOfTime at the beginning of each refresh, so
+		// subtract it from the refreshInterval.
+		refreshInterval -= r.asOfTime
+		if refreshInterval < 0 {
+			refreshInterval = 0
+		}
 
 		timer := time.NewTimer(refreshInterval)
 		defer timer.Stop()
 
+		// Ensure that read-only tables will have stats created at least
+		// once on startup.
+		const initialTableCollectionDelay = time.Second
+		initialTableCollection := time.After(initialTableCollectionDelay)
+
 		for {
 			select {
+			case <-initialTableCollection:
+				r.ensureAllTables(ctx, &r.st.SV, initialTableCollectionDelay)
+
 			case <-timer.C:
 				mutationCounts := r.mutationCounts
 				if err := stopper.RunAsyncTask(
 					ctx, "stats.Refresher: maybeRefreshStats", func(ctx context.Context) {
+						// Wait so that the latest changes will be reflected according to the
+						// AS OF time.
+						timerAsOf := time.NewTimer(r.asOfTime)
+						defer timerAsOf.Stop()
+						select {
+						case <-timerAsOf.C:
+							break
+						case <-stopper.ShouldQuiesce():
+							return
+						}
+
 						for tableID, rowsAffected := range mutationCounts {
+							// Check the cluster setting before each refresh in case it was
+							// disabled recently.
+							if !AutomaticStatisticsClusterMode.Get(&r.st.SV) {
+								break
+							}
+
 							r.maybeRefreshStats(ctx, stopper, tableID, rowsAffected, r.asOfTime)
+
 							select {
 							case <-stopper.ShouldQuiesce():
 								// Don't bother trying to refresh the remaining tables if we
@@ -224,17 +293,24 @@ func (r *Refresher) Start(
 
 // ensureAllTables ensures that an entry exists in r.mutationCounts for each
 // table in the database.
-func (r *Refresher) ensureAllTables(ctx context.Context, settings *settings.Values) {
+func (r *Refresher) ensureAllTables(
+	ctx context.Context, settings *settings.Values, initialTableCollectionDelay time.Duration,
+) {
 	if !AutomaticStatisticsClusterMode.Get(settings) {
 		// Automatic stats are disabled.
 		return
 	}
 
+	// Use a historical read so as to disable txn contention resolution.
+	getAllTablesQuery := fmt.Sprintf(
+		`SELECT table_id FROM crdb_internal.tables AS OF SYSTEM TIME '-%s' WHERE schema_name = 'public'`,
+		initialTableCollectionDelay)
+
 	rows, err := r.ex.Query(
 		ctx,
 		"get-tables",
 		nil, /* txn */
-		`SELECT table_id FROM crdb_internal.tables;`,
+		getAllTablesQuery,
 	)
 	if err != nil {
 		log.Errorf(ctx, "failed to get tables for automatic stats: %v", err)
@@ -330,7 +406,8 @@ func (r *Refresher) maybeRefreshStats(
 		mustRefresh = true
 	}
 
-	targetRows := int64(rowCount*targetFractionOfRowsUpdatedBeforeRefresh) + 1
+	targetRows := int64(rowCount*AutomaticStatisticsFractionStaleRows.Get(&r.st.SV)) +
+		AutomaticStatisticsMinStaleRows.Get(&r.st.SV)
 	if !mustRefresh && rowsAffected < math.MaxInt32 && r.randGen.randInt(targetRows) >= rowsAffected {
 		// No refresh is happening this time.
 		return
@@ -338,48 +415,32 @@ func (r *Refresher) maybeRefreshStats(
 
 	if err := r.refreshStats(ctx, tableID, asOf); err != nil {
 		pgerr, ok := errors.Cause(err).(*pgerror.Error)
-		if ok && pgerr.Code == pgerror.CodeUndefinedTableError {
-			// Wait so that the latest changes will be reflected according to the
-			// AS OF time, then try again.
-			timer := time.NewTimer(asOf)
-			defer timer.Stop()
-			select {
-			case <-timer.C:
-				break
-			case <-stopper.ShouldQuiesce():
-				return
+		if ok && pgerr.Code == pgerror.CodeLockNotAvailableError {
+			// Another stats job was already running. Attempt to reschedule this
+			// refresh.
+			if mustRefresh {
+				// For the cases where mustRefresh=true (stats don't yet exist or it
+				// has been 2x the average time since a refresh), we want to make sure
+				// that maybeRefreshStats is called on this table during the next
+				// cycle so that we have another chance to trigger a refresh. We pass
+				// rowsAffected=0 so that we don't force a refresh if another node has
+				// already done it.
+				r.mutations <- mutation{tableID: tableID, rowsAffected: 0}
+			} else {
+				// If this refresh was caused by a "dice roll", we want to make sure
+				// that the refresh is rescheduled so that we adhere to the
+				// AutomaticStatisticsFractionStaleRows statistical ideal. We
+				// ensure that the refresh is triggered during the next cycle by
+				// passing a very large number for rowsAffected.
+				r.mutations <- mutation{tableID: tableID, rowsAffected: math.MaxInt32}
 			}
-			err = r.refreshStats(ctx, tableID, asOf)
-		}
-		if err != nil {
-			pgerr, ok := errors.Cause(err).(*pgerror.Error)
-			if ok && pgerr.Code == pgerror.CodeLockNotAvailableError {
-				// Another stats job was already running. Attempt to reschedule this
-				// refresh.
-				if mustRefresh {
-					// For the cases where mustRefresh=true (stats don't yet exist or it
-					// has been 2x the average time since a refresh), we want to make sure
-					// that maybeRefreshStats is called on this table during the next
-					// cycle so that we have another chance to trigger a refresh. We pass
-					// rowsAffected=0 so that we don't force a refresh if another node has
-					// already done it.
-					r.mutations <- mutation{tableID: tableID, rowsAffected: 0}
-				} else {
-					// If this refresh was caused by a "dice roll", we want to make sure
-					// that the refresh is rescheduled so that we adhere to the
-					// targetFractionOfRowsUpdatedBeforeRefresh statistical ideal. We
-					// ensure that the refresh is triggered during the next cycle by
-					// passing a very large number for rowsAffected.
-					r.mutations <- mutation{tableID: tableID, rowsAffected: math.MaxInt32}
-				}
-				return
-			}
-
-			// Log other errors but don't automatically reschedule the refresh, since
-			// that could lead to endless retries.
-			log.Errorf(ctx, "failed to create statistics on table %d: %v", tableID, err)
 			return
 		}
+
+		// Log other errors but don't automatically reschedule the refresh, since
+		// that could lead to endless retries.
+		log.Warningf(ctx, "failed to create statistics on table %d: %v", tableID, err)
+		return
 	}
 }
 

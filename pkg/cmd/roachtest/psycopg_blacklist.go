@@ -18,23 +18,26 @@ package main
 import "strings"
 
 var psycopgBlacklists = []struct {
-	versionPrefix string
-	name          string
-	list          blacklist
+	versionPrefix  string
+	blacklistname  string
+	blacklist      blacklist
+	ignorelistname string
+	ignorelist     blacklist
 }{
-	{"v2.2", "psycopgBlackList2_2", psycopgBlackList2_2},
+	{"v2.2", "psycopgBlackList19_1", psycopgBlackList19_1, "psycopgIgnoreList19_1", psycopgIgnoreList19_1},
+	{"v19.1", "psycopgBlackList19_1", psycopgBlackList19_1, "psycopgIgnoreList19_1", psycopgIgnoreList19_1},
 }
 
-// getPsycopgBlacklistForVersion returns the appropriate psycopg blacklist
-// based on the cockroach version. This check only looks to ensure that the
-// prefix that matches.
-func getPsycopgBlacklistForVersion(version string) (string, blacklist) {
+// getPsycopgBlacklistForVersion returns the appropriate psycopg blacklist and
+// ignorelist based on the cockroach version. This check only looks to ensure
+// that the prefix that matches.
+func getPsycopgBlacklistForVersion(version string) (string, blacklist, string, blacklist) {
 	for _, info := range psycopgBlacklists {
 		if strings.HasPrefix(version, info.versionPrefix) {
-			return info.name, info.list
+			return info.blacklistname, info.blacklist, info.ignorelistname, info.ignorelist
 		}
 	}
-	return "", nil
+	return "", nil, "", nil
 }
 
 // These are lists of known psycopg test errors and failures.
@@ -48,7 +51,7 @@ func getPsycopgBlacklistForVersion(version string) (string, blacklist) {
 // Please keep these lists alphabetized for easy diffing.
 // After a failed run, an updated version of this blacklist should be available
 // in the test log.
-var psycopgBlackList2_2 = blacklist{
+var psycopgBlackList19_1 = blacklist{
 	"psycopg2.tests.test_async.AsyncTests.test_async_after_async":                                                 "5807",
 	"psycopg2.tests.test_async.AsyncTests.test_async_callproc":                                                    "5807",
 	"psycopg2.tests.test_async.AsyncTests.test_async_connection_error_message":                                    "5807",
@@ -376,9 +379,12 @@ var psycopgBlackList2_2 = blacklist{
 	"psycopg2.tests.test_types_extras.RangeCasterTestCase.test_cast_timestamp":                                    "unknown",
 	"psycopg2.tests.test_types_extras.RangeCasterTestCase.test_cast_timestamptz":                                  "unknown",
 	"psycopg2.tests.test_types_extras.RangeCasterTestCase.test_range_escaping":                                    "27791",
-	"psycopg2.tests.test_types_extras.RangeCasterTestCase.test_range_not_found":                                   "unknown",
 	"psycopg2.tests.test_types_extras.RangeCasterTestCase.test_register_range_adapter":                            "27791",
 	"psycopg2.tests.test_types_extras.RangeCasterTestCase.test_schema_range":                                      "26443",
 	"psycopg2.tests.test_with.WithCursorTestCase.test_exception_swallow":                                          "unknown",
 	"psycopg2.tests.test_with.WithCursorTestCase.test_named_with_noop":                                            "unknown",
+}
+
+var psycopgIgnoreList19_1 = blacklist{
+	"psycopg2.tests.test_green.GreenTestCase.test_flush_on_write": "unknown",
 }

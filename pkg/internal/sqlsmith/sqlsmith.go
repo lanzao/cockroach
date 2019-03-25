@@ -15,9 +15,12 @@
 package sqlsmith
 
 import (
-	"bytes"
 	gosql "database/sql"
+	"fmt"
 	"math/rand"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
 
 // sqlsmith-go
@@ -54,27 +57,57 @@ const retryCount = 20
 
 // Smither is a sqlsmith generator.
 type Smither struct {
-	schema *schema
+	rnd                     *rand.Rand
+	lock                    syncutil.Mutex
+	tables                  []*tableRef
+	nameCounts              map[string]int
+	stmts                   *WeightedSampler
+	scalars, bools          *WeightedSampler
+	tableExprs, selectStmts *WeightedSampler
 }
 
-// NewSmither creates a new Smither.
+// NewSmither creates a new Smither. db is used to populate existing tables
+// for use as column references. It can be nil to skip table population.
 func NewSmither(db *gosql.DB, rnd *rand.Rand) (*Smither, error) {
-	schema, err := makeSchema(db, rnd)
-	return &Smither{
-		schema: schema,
-	}, err
+	s := &Smither{
+		rnd:         rnd,
+		nameCounts:  map[string]int{},
+		stmts:       NewWeightedSampler(statementWeights, rnd.Int63()),
+		scalars:     NewWeightedSampler(scalarWeights, rnd.Int63()),
+		bools:       NewWeightedSampler(boolWeights, rnd.Int63()),
+		tableExprs:  NewWeightedSampler(tableExprWeights, rnd.Int63()),
+		selectStmts: NewWeightedSampler(selectStmtWeights, rnd.Int63()),
+	}
+	var err error
+	if db != nil {
+		err = s.ReloadSchemas(db)
+	}
+	return s, err
 }
+
+var prettyCfg = func() tree.PrettyCfg {
+	cfg := tree.DefaultPrettyCfg()
+	cfg.LineWidth = 120
+	cfg.Simplify = false
+	return cfg
+}()
 
 // Generate returns a random SQL string.
 func (s *Smither) Generate() string {
 	for {
-		scope := s.schema.makeScope()
+		scope := s.makeScope()
 		stmt, ok := scope.makeStmt()
 		if !ok {
 			continue
 		}
-		var buf bytes.Buffer
-		stmt.expr.Format(&buf)
-		return buf.String()
+		return prettyCfg.Pretty(stmt)
 	}
+}
+
+func (s *Smither) name(prefix string) tree.Name {
+	s.lock.Lock()
+	s.nameCounts[prefix]++
+	count := s.nameCounts[prefix]
+	s.lock.Unlock()
+	return tree.Name(fmt.Sprintf("%s_%d", prefix, count))
 }

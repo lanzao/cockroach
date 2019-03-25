@@ -146,7 +146,7 @@ count                            ·              ·
                 │                render 6       b
                 │                render 7       c
                 │                render 8       d
-                └── join         ·              ·
+                └── hash-join    ·              ·
                      │           type           left outer
                      ├── values  ·              ·
                      │           size           4 columns, 1 row
@@ -204,12 +204,11 @@ SET tracing = on,kv,results; UPSERT INTO tu VALUES (1, NULL, NULL, NULL); SET tr
 
 query T
 SELECT message FROM [SHOW KV TRACE FOR SESSION]
+ WHERE operation != 'dist sender send'
 ----
 Put /Table/55/1/1/0 -> /TUPLE/
 Del /Table/55/1/1/1/1
 Del /Table/55/1/1/2/1
-querying next range at /Table/55/1/1/0
-r20: sending batch 1 Put, 2 Del, 1 EndTxn to (n1,s1):1
 fast path completed
 rows affected: 1
 
@@ -225,32 +224,26 @@ SET tracing = on,kv,results; UPSERT INTO t.kv(k, v) VALUES (2,3); SET tracing = 
 
 query TT
 SELECT operation, message FROM [SHOW KV TRACE FOR SESSION]
+ WHERE operation != 'dist sender send'
 ----
-table reader      Scan /Table/57/1/2{-/#}
-dist sender send  querying next range at /Table/57/1/2
-dist sender send  r20: sending batch 1 Scan to (n1,s1):1
-flow              CPut /Table/57/1/2/0 -> /TUPLE/2:2:Int/3
-flow              InitPut /Table/57/2/3/0 -> /BYTES/0x8a
-dist sender send  querying next range at /Table/57/1/2/0
-dist sender send  r20: sending batch 1 CPut, 1 EndTxn, 1 InitPut to (n1,s1):1
-flow              fast path completed
-sql txn           rows affected: 1
+table reader  Scan /Table/57/1/2{-/#}
+flow          CPut /Table/57/1/2/0 -> /TUPLE/2:2:Int/3
+flow          InitPut /Table/57/2/3/0 -> /BYTES/0x8a
+flow          fast path completed
+sql txn       rows affected: 1
 
 statement ok
 SET tracing = on,kv,results; UPSERT INTO t.kv(k, v) VALUES (1,2); SET tracing = off
 
 query TT
 SELECT operation, message FROM [SHOW KV TRACE FOR SESSION]
+ WHERE operation != 'dist sender send'
 ----
-table reader      Scan /Table/57/1/1{-/#}
-dist sender send  querying next range at /Table/57/1/1
-dist sender send  r20: sending batch 1 Scan to (n1,s1):1
-flow              CPut /Table/57/1/1/0 -> /TUPLE/2:2:Int/2
-flow              InitPut /Table/57/2/2/0 -> /BYTES/0x89
-dist sender send  querying next range at /Table/57/1/1/0
-dist sender send  r20: sending batch 1 CPut, 1 EndTxn, 1 InitPut to (n1,s1):1
-flow              fast path completed
-sql txn           rows affected: 1
+table reader  Scan /Table/57/1/1{-/#}
+flow          CPut /Table/57/1/1/0 -> /TUPLE/2:2:Int/2
+flow          InitPut /Table/57/2/2/0 -> /BYTES/0x89
+flow          fast path completed
+sql txn       rows affected: 1
 
 statement error duplicate key value
 SET tracing = on,kv,results; UPSERT INTO t.kv(k, v) VALUES (2,2); SET tracing = off
@@ -258,19 +251,14 @@ SET tracing = on,kv,results; UPSERT INTO t.kv(k, v) VALUES (2,2); SET tracing = 
 query TT
 set tracing=off;
 SELECT operation, message FROM [SHOW KV TRACE FOR SESSION]
+ WHERE operation != 'dist sender send'
 ----
-table reader      Scan /Table/57/1/2{-/#}
-dist sender send  querying next range at /Table/57/1/2
-dist sender send  r20: sending batch 1 Scan to (n1,s1):1
-table reader      fetched: /kv/primary/2/v -> /3
-flow              Put /Table/57/1/2/0 -> /TUPLE/2:2:Int/2
-flow              Del /Table/57/2/3/0
-flow              CPut /Table/57/2/2/0 -> /BYTES/0x8a
-dist sender send  querying next range at /Table/57/1/2/0
-dist sender send  r20: sending batch 1 Put, 1 CPut, 1 Del, 1 EndTxn to (n1,s1):1
-sql txn           execution failed after 0 rows: duplicate key value (v)=(2) violates unique constraint "woo"
-dist sender send  querying next range at /Table/57/1/2/0
-dist sender send  r20: sending batch 1 EndTxn to (n1,s1):1
+table reader  Scan /Table/57/1/2{-/#}
+table reader  fetched: /kv/primary/2/v -> /3
+flow          Put /Table/57/1/2/0 -> /TUPLE/2:2:Int/2
+flow          Del /Table/57/2/3/0
+flow          CPut /Table/57/2/2/0 -> /BYTES/0x8a (expecting does not exist)
+sql txn       execution failed after 0 rows: duplicate key value (v)=(2) violates unique constraint "woo"
 
 
 subtest regression_32473
@@ -319,3 +307,38 @@ INSERT INTO t5 VALUES (1, 10, 9) ON CONFLICT (k) DO NOTHING
 
 statement ok
 INSERT INTO t5 VALUES (1, 10, 20) ON CONFLICT (k) DO NOTHING
+
+# Regression test for #35564: make sure we use the Upsert's input required
+# ordering for the internal projection.
+
+statement ok
+CREATE TABLE abc (a INT, b INT, c INT, INDEX(c) STORING(a,b))
+
+statement ok
+CREATE TABLE xyz (x INT, y INT, z INT)
+
+query TTTTT
+EXPLAIN (VERBOSE) SELECT * FROM [UPSERT INTO xyz SELECT a, b, c FROM abc RETURNING z] ORDER BY z
+----
+render                         ·         ·                    (z)                          +z
+ │                             render 0  z                    ·                            ·
+ └── run                       ·         ·                    (x, y, z, rowid[hidden])     ·
+      └── upsert               ·         ·                    (x, y, z, rowid[hidden])     ·
+           │                   into      xyz(x, y, z, rowid)  ·                            ·
+           │                   strategy  opt upserter         ·                            ·
+           └── render          ·         ·                    (a, b, c, column9, a, b, c)  +c
+                │              render 0  a                    ·                            ·
+                │              render 1  b                    ·                            ·
+                │              render 2  c                    ·                            ·
+                │              render 3  column9              ·                            ·
+                │              render 4  a                    ·                            ·
+                │              render 5  b                    ·                            ·
+                │              render 6  c                    ·                            ·
+                └── render     ·         ·                    (column9, a, b, c)           +c
+                     │         render 0  unique_rowid()       ·                            ·
+                     │         render 1  a                    ·                            ·
+                     │         render 2  b                    ·                            ·
+                     │         render 3  c                    ·                            ·
+                     └── scan  ·         ·                    (a, b, c)                    +c
+·                              table     abc@abc_c_idx        ·                            ·
+·                              spans     ALL                  ·                            ·

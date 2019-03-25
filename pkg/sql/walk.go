@@ -259,6 +259,15 @@ func (v *planVisitor) visitInternal(plan planNode, name string) {
 			}
 		}
 
+	case *applyJoinNode:
+		if v.observer.attr != nil {
+			v.observer.attr(name, "type", joinTypeStr(n.joinType))
+		}
+		if v.observer.expr != nil {
+			v.expr(name, "pred", -1, n.pred.onCond)
+		}
+		n.input.plan = v.visit(n.input.plan)
+
 	case *joinNode:
 		if v.observer.attr != nil {
 			jType := joinTypeStr(n.joinType)
@@ -642,6 +651,12 @@ func nodeName(plan planNode) string {
 		if n.emitAll {
 			return "append"
 		}
+
+	case *joinNode:
+		if len(n.mergeJoinOrdering) > 0 {
+			return "merge-join"
+		}
+		return "hash-join"
 	}
 
 	name, ok := planNodeNames[reflect.TypeOf(plan)]
@@ -701,6 +716,7 @@ var planNodeNames = map[reflect.Type]string{
 	reflect.TypeOf(&alterSequenceNode{}):        "alter sequence",
 	reflect.TypeOf(&alterTableNode{}):           "alter table",
 	reflect.TypeOf(&alterUserSetPasswordNode{}): "alter user",
+	reflect.TypeOf(&applyJoinNode{}):            "apply-join",
 	reflect.TypeOf(&commentOnColumnNode{}):      "comment on column",
 	reflect.TypeOf(&commentOnDatabaseNode{}):    "comment on database",
 	reflect.TypeOf(&commentOnTableNode{}):       "comment on table",

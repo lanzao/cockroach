@@ -1,4 +1,4 @@
-// Copyright 2018 The Cockroach Authors.
+// Copyright 2018 The Cockroach Authors.D
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,13 +17,13 @@ package sql
 import (
 	"context"
 	"fmt"
+	"runtime/pprof"
 	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -37,7 +37,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/pkg/errors"
 )
 
 // RestartSavepointName is the only savepoint ident that we accept.
@@ -90,7 +89,17 @@ func (ex *connExecutor) execStmt(
 	case stateNoTxn:
 		ev, payload = ex.execStmtInNoTxnState(ctx, stmt)
 	case stateOpen:
-		ev, payload, err = ex.execStmtInOpenState(ctx, stmt, pinfo, res)
+		if ex.server.cfg.Settings.IsCPUProfiling() {
+			labels := pprof.Labels(
+				"stmt.tag", stmt.AST.StatementTag(),
+				"stmt.anonymized", stmt.AnonymizedStr,
+			)
+			pprof.Do(ctx, labels, func(ctx context.Context) {
+				ev, payload, err = ex.execStmtInOpenState(ctx, stmt, pinfo, res)
+			})
+		} else {
+			ev, payload, err = ex.execStmtInOpenState(ctx, stmt, pinfo, res)
+		}
 		switch ev.(type) {
 		case eventNonRetriableErr:
 			ex.recordFailure()
@@ -107,7 +116,7 @@ func (ex *connExecutor) execStmt(
 }
 
 func (ex *connExecutor) recordFailure() {
-	ex.metrics.StatementCounters.FailureCount.Inc(1)
+	ex.metrics.EngineMetrics.FailureCount.Inc(1)
 }
 
 // execStmtInOpenState executes one statement in the context of the session's
@@ -136,6 +145,10 @@ func (ex *connExecutor) execStmtInOpenState(
 	// Canceling a query cancels its transaction's context so we take a reference
 	// to the cancelation function here.
 	unregisterFn := ex.addActiveQuery(stmt.queryID, stmt.AST, ex.state.cancel)
+
+	// queryDone is a cleanup function dealing with unregistering a query.
+	// It also deals with overwriting res.Error to a more user-friendly message in
+	// case of query cancelation. res can be nil to opt out of this.
 	queryDone := func(ctx context.Context, res RestrictedCommandResult) {
 		if timeoutTicker != nil {
 			if !timeoutTicker.Stop() {
@@ -152,7 +165,7 @@ func (ex *connExecutor) execStmtInOpenState(
 		// sorts of errors on the result. Rather than trying to impose discipline
 		// in that jungle, we just overwrite them all here with an error that's
 		// nicer to look at for the client.
-		if ctx.Err() != nil && res.Err() != nil {
+		if res != nil && ctx.Err() != nil && res.Err() != nil {
 			if queryTimedOut {
 				res.SetError(sqlbase.QueryTimeoutError)
 			} else {
@@ -243,7 +256,7 @@ func (ex *connExecutor) execStmtInOpenState(
 	case *tree.Savepoint:
 		// Ensure that the user isn't trying to run BEGIN; SAVEPOINT; SAVEPOINT;
 		if ex.state.activeSavepointName != "" {
-			err := fmt.Errorf("SAVEPOINT may not be nested")
+			err := pgerror.UnimplementedWithIssueDetailError(10735, "nested", "SAVEPOINT may not be nested")
 			return makeErrEvent(err)
 		}
 		if err := ex.validateSavepointName(s.Name); err != nil {
@@ -258,8 +271,9 @@ func (ex *connExecutor) execStmtInOpenState(
 		// https://github.com/cockroachdb/cockroach/issues/15012
 		meta := ex.state.mu.txn.GetTxnCoordMeta(ctx)
 		if meta.CommandCount > 0 {
-			err := fmt.Errorf("SAVEPOINT %s needs to be the first statement in a "+
-				"transaction", RestartSavepointName)
+			err := pgerror.NewErrorf(pgerror.CodeSyntaxError,
+				"SAVEPOINT %s needs to be the first statement in a "+
+					"transaction", RestartSavepointName)
 			return makeErrEvent(err)
 		}
 		ex.state.activeSavepointName = s.Name
@@ -394,9 +408,12 @@ func (ex *connExecutor) execStmtInOpenState(
 		}
 		if ts != nil {
 			if origTs := ex.state.getOrigTimestamp(); *ts != origTs {
-				return makeErrEvent(errors.Errorf("inconsistent AS OF SYSTEM TIME timestamp. Expected: %s. "+
-					"Generally AS OF SYSTEM TIME cannot be used inside a transaction.",
-					origTs))
+				return makeErrEvent(
+					pgerror.NewErrorf(pgerror.CodeSyntaxError,
+						"inconsistent AS OF SYSTEM TIME timestamp; expected: %s",
+						origTs).SetHintf(
+						"Generally AS OF SYSTEM TIME cannot be used inside a transaction."),
+				)
 			}
 			p.semaCtx.AsOfTimestamp = ts
 		}
@@ -420,8 +437,11 @@ func (ex *connExecutor) execStmtInOpenState(
 
 	if runInParallel {
 		cols, err := ex.execStmtInParallel(ctx, p, queryDone)
+		// Responsibility for calling queryDone has been passed to
+		// execStmtInParallel.
 		queryDone = nil
 		if err != nil {
+			res.SetError(err)
 			return makeErrEvent(err)
 		}
 		// Produce mocked out results for the query - the "zero value" of the
@@ -431,39 +451,40 @@ func (ex *connExecutor) execStmtInOpenState(
 		if err := ex.initStatementResult(ctx, res, p.stmt, cols); err != nil {
 			return makeErrEvent(err)
 		}
-	} else {
-		p.autoCommit = os.ImplicitTxn.Get() && !ex.server.cfg.TestingKnobs.DisableAutoCommit
-		if err := ex.dispatchToExecutionEngine(ctx, p, res); err != nil {
-			return nil, nil, err
-		}
-		if err := res.Err(); err != nil {
-			return makeErrEvent(err)
-		}
-
-		txn := ex.state.mu.txn
-		if !os.ImplicitTxn.Get() && txn.IsSerializablePushAndRefreshNotPossible() {
-			rc, canAutoRetry := ex.getRewindTxnCapability()
-			if canAutoRetry {
-				ev := eventRetriableErr{
-					IsCommit:     fsm.FromBool(isCommit(stmt.AST)),
-					CanAutoRetry: fsm.FromBool(canAutoRetry),
-				}
-				txn.ManualRestart(ctx, ex.server.cfg.Clock.Now())
-				payload := eventRetriableErrPayload{
-					err: roachpb.NewTransactionRetryWithProtoRefreshError(
-						"serializable transaction timestamp pushed (detected by connExecutor)",
-						txn.ID(),
-						// No updated transaction required; we've already manually updated our
-						// client.Txn.
-						roachpb.Transaction{},
-					),
-					rewCap: rc,
-				}
-				return ev, payload, nil
-			}
-		}
+		// No event is generated.
+		return nil, nil, nil
 	}
 
+	p.autoCommit = os.ImplicitTxn.Get() && !ex.server.cfg.TestingKnobs.DisableAutoCommit
+	if err := ex.dispatchToExecutionEngine(ctx, p, res); err != nil {
+		return nil, nil, err
+	}
+	if err := res.Err(); err != nil {
+		return makeErrEvent(err)
+	}
+
+	txn := ex.state.mu.txn
+	if !os.ImplicitTxn.Get() && txn.IsSerializablePushAndRefreshNotPossible() {
+		rc, canAutoRetry := ex.getRewindTxnCapability()
+		if canAutoRetry {
+			ev := eventRetriableErr{
+				IsCommit:     fsm.FromBool(isCommit(stmt.AST)),
+				CanAutoRetry: fsm.FromBool(canAutoRetry),
+			}
+			txn.ManualRestart(ctx, ex.server.cfg.Clock.Now())
+			payload := eventRetriableErrPayload{
+				err: roachpb.NewTransactionRetryWithProtoRefreshError(
+					"serializable transaction timestamp pushed (detected by connExecutor)",
+					txn.ID(),
+					// No updated transaction required; we've already manually updated our
+					// client.Txn.
+					roachpb.Transaction{},
+				),
+				rewCap: rc,
+			}
+			return ev, payload, nil
+		}
+	}
 	// No event was generated.
 	return nil, nil, nil
 }
@@ -652,6 +673,14 @@ func (ex *connExecutor) rollbackSQLTransaction(ctx context.Context) (fsm.Event, 
 func (ex *connExecutor) execStmtInParallel(
 	ctx context.Context, planner *planner, queryDone func(context.Context, RestrictedCommandResult),
 ) (sqlbase.ResultColumns, error) {
+	defer func() {
+		// Call the cleanup function unless responsibility has been transferred
+		// elsewhere.
+		if queryDone != nil {
+			queryDone(ctx, nil /* res */)
+		}
+	}()
+
 	params := runParams{
 		ctx:             ctx,
 		extendedEvalCtx: planner.ExtendedEvalContext(),
@@ -681,6 +710,12 @@ func (ex *connExecutor) execStmtInParallel(
 		planner.maybeLogStatement(ctx, "par-prepare" /* lbl */, 0 /* rows */, err)
 		return nil, err
 	}
+	planCleanup := planner.curPlan.close
+	defer func() {
+		if planCleanup != nil {
+			planCleanup(ctx)
+		}
+	}()
 
 	// Prepare the result set, and determine the execution parameters.
 	var cols sqlbase.ResultColumns
@@ -707,10 +742,18 @@ func (ex *connExecutor) execStmtInParallel(
 	queryMeta.isDistributed = distributePlan
 	ex.mu.Unlock()
 
+	// Responsibility for calling queryDone is taken by the closure below.
+	queryDoneCpy := queryDone
+	queryDone = nil
+	// Responsibility for calling planCleanup is taken by the closure below.
+	planCleanupCpy := planCleanup
+	planCleanup = nil
+	cleanup := func(ctx context.Context) {
+		planCleanupCpy(ctx)
+		queryDoneCpy(ctx, nil /* res */)
+	}
 	if err := ex.parallelizeQueue.Add(params, func() error {
 		res := &bufferedCommandResult{errOnly: true}
-
-		defer queryDone(ctx, res)
 
 		defer func() {
 			planner.maybeLogStatement(ctx, "par-exec" /* lbl */, res.RowsAffected(), res.Err())
@@ -767,7 +810,7 @@ func (ex *connExecutor) execStmtInParallel(
 			return err
 		}
 		return res.Err()
-	}); err != nil {
+	}, cleanup); err != nil {
 		planner.maybeLogStatement(ctx, "par-queue" /* lbl */, 0 /* rows */, err)
 		return nil, err
 	}
@@ -775,9 +818,9 @@ func (ex *connExecutor) execStmtInParallel(
 	return cols, nil
 }
 
-func enhanceErrWithCorrelation(err error, isCorrelated bool) {
+func enhanceErrWithCorrelation(err error, isCorrelated bool) error {
 	if err == nil || !isCorrelated {
-		return
+		return err
 	}
 
 	// If the query was found to be correlated by the new-gen
@@ -797,13 +840,19 @@ func enhanceErrWithCorrelation(err error, isCorrelated bool) {
 	// not supported") because perhaps there was an actual mistake in
 	// the query in addition to the unsupported correlation, and we also
 	// want to give a chance to the user to fix mistakes.
-	if pqErr, ok := err.(*pgerror.Error); ok {
-		if pqErr.Code == pgerror.CodeUndefinedColumnError ||
-			pqErr.Code == pgerror.CodeUndefinedTableError {
-			_ = pqErr.SetHintf("some correlated subqueries are not supported yet - see %s",
+	if pgErr, ok := pgerror.GetPGCause(err); ok {
+		if pgErr.Code == pgerror.CodeUndefinedColumnError ||
+			pgErr.Code == pgerror.CodeUndefinedTableError {
+			// Be careful to not modify the error in-place (via SetHintf) as
+			// the error object may be globally instantiated.
+			newErr := *pgErr
+			pgErr = &newErr
+			_ = pgErr.SetHintf("some correlated subqueries are not supported yet - see %s",
 				"https://github.com/cockroachdb/cockroach/issues/3288")
+			return pgErr
 		}
 	}
+	return err
 }
 
 // dispatchToExecutionEngine executes the statement, writes the result to res
@@ -820,10 +869,18 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 	ex.sessionTracing.TracePlanStart(ctx, stmt.AST.StatementTag())
 	planner.statsCollector.PhaseTimes()[plannerStartLogicalPlan] = timeutil.Now()
 
+	// Prepare the plan. Note, the error is processed below. Everything
+	// between here and there needs to happen even if there's an error.
 	err := ex.makeExecPlan(ctx, planner)
 	// We'll be closing the plan manually below after execution; this
 	// defer is a catch-all in case some other return path is taken.
 	defer planner.curPlan.close(ctx)
+
+	// Certain statements want their results to go to the client
+	// directly. Configure this here.
+	if planner.curPlan.avoidBuffering {
+		res.DisableBuffering()
+	}
 
 	// Ensure that the plan is collected just before closing.
 	if sampleLogicalPlans.Get(&ex.appStats.st.SV) {
@@ -836,6 +893,8 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 
 	planner.statsCollector.PhaseTimes()[plannerEndLogicalPlan] = timeutil.Now()
 	ex.sessionTracing.TracePlanEnd(ctx, err)
+
+	// Finally, process the planning error from above.
 	if err != nil {
 		res.SetError(err)
 		return nil
@@ -930,6 +989,15 @@ func (ex *connExecutor) makeExecPlan(ctx context.Context, planner *planner) erro
 			planner.curPlan = *result
 			return nil
 		}
+		if isCorrelated {
+			// Note: we are setting isCorrelated here because
+			// makeOptimizerPlan() can determine isCorrelated but fail with
+			// a non-nil error and a nil result -- for example, when it runs
+			// into an unsupported SQL feature that the HP supports, after
+			// having processed a correlated subquery (which the heuristic
+			// planner won't support).
+			planner.curPlan.flags.Set(planFlagOptIsCorrelated)
+		}
 		log.VEventf(ctx, 1, "optimizer plan failed (isCorrelated=%t): %v", isCorrelated, err)
 		if !canFallbackFromOpt(err, optMode, stmt) {
 			return err
@@ -943,7 +1011,7 @@ func (ex *connExecutor) makeExecPlan(ctx context.Context, planner *planner) erro
 	optFlags := planner.curPlan.flags
 	err := planner.makePlan(ctx)
 	planner.curPlan.flags |= optFlags
-	enhanceErrWithCorrelation(err, isCorrelated)
+	err = enhanceErrWithCorrelation(err, isCorrelated)
 	return err
 }
 
@@ -970,7 +1038,7 @@ func (ex *connExecutor) saveLogicalPlanDescription(
 // canFallbackFromOpt returns whether we can fallback on the heuristic planner
 // when the optimizer hits an error.
 func canFallbackFromOpt(err error, optMode sessiondata.OptimizerMode, stmt *Statement) bool {
-	pgerr, ok := err.(*pgerror.Error)
+	pgerr, ok := pgerror.GetPGCause(err)
 	if !ok || pgerr.Code != pgerror.CodeFeatureNotSupportedError {
 		// We only fallback on "feature not supported" errors.
 		return false
@@ -1034,12 +1102,16 @@ func (ex *connExecutor) execWithDistSQLEngine(
 	planCtx.stmtType = recv.stmtType
 
 	if len(planner.curPlan.subqueryPlans) != 0 {
+		var evalCtx extendedEvalContext
+		ex.initEvalCtx(ctx, &evalCtx, planner)
 		evalCtxFactory := func() *extendedEvalContext {
-			evalCtx := ex.evalCtx(ctx, planner, planner.ExtendedEvalContext().StmtTimestamp)
+			ex.resetEvalCtx(&evalCtx, planner.txn, planner.ExtendedEvalContext().StmtTimestamp)
 			evalCtx.Placeholders = &planner.semaCtx.Placeholders
 			return &evalCtx
 		}
-		if !ex.server.cfg.DistSQLPlanner.PlanAndRunSubqueries(ctx, planner, evalCtxFactory, planner.curPlan.subqueryPlans, recv, distribute) {
+		if !ex.server.cfg.DistSQLPlanner.PlanAndRunSubqueries(
+			ctx, planner, evalCtxFactory, planner.curPlan.subqueryPlans, recv, distribute,
+		) {
 			return recv.commErr
 		}
 	}
@@ -1303,7 +1375,7 @@ func (ex *connExecutor) runShowSyntax(
 			commErr = res.AddRow(ctx, tree.Datums{tree.NewDString(field), tree.NewDString(msg)})
 			return nil
 		},
-		telemetry.RecordError, /* reportErr */
+		ex.recordError, /* reportErr */
 	); err != nil {
 		res.SetError(err)
 	}
@@ -1326,7 +1398,7 @@ func (ex *connExecutor) runSetTracing(
 	ctx context.Context, n *tree.SetTracing, res RestrictedCommandResult,
 ) {
 	if len(n.Values) == 0 {
-		res.SetError(fmt.Errorf("set tracing missing argument"))
+		res.SetError(pgerror.NewAssertionErrorf("set tracing missing argument"))
 		return
 	}
 
@@ -1335,7 +1407,8 @@ func (ex *connExecutor) runSetTracing(
 		v = unresolvedNameToStrVal(v)
 		strVal, ok := v.(*tree.StrVal)
 		if !ok {
-			res.SetError(fmt.Errorf("expected string for set tracing argument, not %T", v))
+			res.SetError(pgerror.NewAssertionErrorf(
+				"expected string for set tracing argument, not %T", v))
 			return
 		}
 		modes[i] = strVal.RawString()
@@ -1367,7 +1440,8 @@ func (ex *connExecutor) enableTracing(modes []string) error {
 		case "cluster":
 			recordingType = tracing.SnowballRecording
 		default:
-			return errors.Errorf("set tracing: unknown mode %q", s)
+			return pgerror.NewErrorf(pgerror.CodeSyntaxError,
+				"set tracing: unknown mode %q", s)
 		}
 	}
 	if !enableMode {
@@ -1447,7 +1521,7 @@ func (ex *connExecutor) handleAutoCommit(
 }
 
 func (ex *connExecutor) incrementStmtCounter(stmt Statement) {
-	ex.metrics.StatementCounters.incrementCount(stmt.AST)
+	ex.metrics.StatementCounters.incrementCount(ex, stmt.AST)
 }
 
 // validateSavepointName validates that it is that the provided ident

@@ -16,6 +16,7 @@ package sql
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -27,7 +28,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/pkg/errors"
 )
 
 var updateNodePool = sync.Pool{
@@ -173,7 +173,7 @@ func (p *planner) Update(
 		// TODO(dan): This could be made tighter, just the rows needed for RETURNING
 		// exprs.
 		requestedCols = desc.Columns
-	} else if len(desc.AllChecks()) > 0 {
+	} else if len(desc.ActiveChecks()) > 0 {
 		// Request any columns we'll need when validating check constraints. We
 		// could be smarter and only validate check constraints which depend on
 		// columns that are being modified in the UPDATE statement, in which
@@ -188,7 +188,7 @@ func (p *planner) Update(
 		for _, col := range requestedCols {
 			requestedColSet.Add(int(col.ID))
 		}
-		for _, ck := range desc.AllChecks() {
+		for _, ck := range desc.ActiveChecks() {
 			cols, err := ck.ColumnsUsed(desc.TableDesc())
 			if err != nil {
 				return nil, err
@@ -197,7 +197,8 @@ func (p *planner) Update(
 				if !requestedColSet.Contains(int(colID)) {
 					col, err := desc.FindColumnByID(colID)
 					if err != nil {
-						return nil, errors.Wrapf(err, "error finding column %d in table %s",
+						return nil, pgerror.NewAssertionErrorWithWrappedErrf(err,
+							"error finding column %d in table %s",
 							colID, desc.Name)
 					}
 					requestedCols = append(requestedCols, *col)
@@ -643,7 +644,7 @@ func (u *updateNode) processSourceRow(params runParams, sourceVals tree.Datums) 
 			d, err := u.run.computeExprs[i].Eval(params.EvalContext())
 			if err != nil {
 				params.EvalContext().IVarContainer = nil
-				return errors.Wrapf(err,
+				return pgerror.Wrapf(err, pgerror.CodeDataExceptionError,
 					"computed column %s", tree.ErrString((*tree.Name)(&u.run.computedCols[i].Name)))
 			}
 			u.run.updateValues[u.run.updateColsIdx[u.run.computedCols[i].ID]] = d
@@ -654,21 +655,8 @@ func (u *updateNode) processSourceRow(params runParams, sourceVals tree.Datums) 
 	// Verify the schema constraints. For consistency with INSERT/UPSERT
 	// and compatibility with PostgreSQL, we must do this before
 	// processing the CHECK constraints.
-	for i, val := range u.run.updateValues {
-		col := &u.run.tu.ru.UpdateCols[i]
-		if val == tree.DNull {
-			// Verify no NULL makes it to a nullable column.
-			if !col.Nullable {
-				return sqlbase.NewNonNullViolationError(col.Name)
-			}
-		} else {
-			// Verify that the data width matches the column constraint.
-			newVal, err := sqlbase.LimitValueWidth(col.Type, val, &col.Name)
-			if err != nil {
-				return err
-			}
-			u.run.updateValues[i] = newVal
-		}
+	if err := enforceLocalColumnConstraints(u.run.updateValues, u.run.tu.ru.UpdateCols); err != nil {
+		return err
 	}
 
 	// Run the CHECK constraints, if any. CheckHelper will either evaluate the
@@ -884,8 +872,9 @@ func (p *planner) namesForExprs(
 				n = len(t.D)
 			}
 			if n < 0 {
-				return nil, nil, pgerror.NewErrorf(pgerror.CodeFeatureNotSupportedError,
-					"unsupported tuple assignment: %T", expr.Expr)
+				return nil, nil, pgerror.UnimplementedWithIssueDetailErrorf(35713,
+					fmt.Sprintf("%T", expr.Expr),
+					"source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression; not supported: %T", expr.Expr)
 			}
 			if len(expr.Names) != n {
 				return nil, nil, pgerror.NewErrorf(pgerror.CodeSyntaxError,
@@ -913,6 +902,33 @@ func checkHasNoComputedCols(cols []sqlbase.ColumnDescriptor) error {
 		if cols[i].IsComputed() {
 			return sqlbase.CannotWriteToComputedColError(cols[i].Name)
 		}
+	}
+	return nil
+}
+
+// enforceLocalColumnConstraints asserts the column constraints that
+// do not require data validation from other sources than the row data
+// itself. This includes:
+// - rejecting null values in non-nullable columns;
+// - checking width constraints from the column type;
+// - truncating results to the requested precision (not width).
+// Note: the second point is what distinguishes this operation
+// from a regular SQL cast -- here widths are checked, not
+// used to truncate the value silently.
+//
+// The row buffer is modified in-place with the result of the
+// checks.
+func enforceLocalColumnConstraints(row tree.Datums, cols []sqlbase.ColumnDescriptor) error {
+	for i := range cols {
+		col := &cols[i]
+		if !col.Nullable && row[i] == tree.DNull {
+			return sqlbase.NewNonNullViolationError(col.Name)
+		}
+		outVal, err := sqlbase.LimitValueWidth(col.Type, row[i], &col.Name)
+		if err != nil {
+			return err
+		}
+		row[i] = outVal
 	}
 	return nil
 }

@@ -169,14 +169,14 @@ func createTestStoreWithOpts(
 	// TODO(bdarnell): arrange to have the transport closed.
 	ctx := context.Background()
 	if !opts.dontBootstrap {
-		if err := storage.Bootstrap(
+		if err := storage.InitEngine(
 			ctx, eng, roachpb.StoreIdent{NodeID: 1, StoreID: 1},
 			storeCfg.Settings.Version.BootstrapVersion(),
 		); err != nil {
 			t.Fatal(err)
 		}
 	}
-	store := storage.NewStore(storeCfg, eng, nodeDesc)
+	store := storage.NewStore(ctx, storeCfg, eng, nodeDesc)
 	if !opts.dontBootstrap {
 		var kvs []roachpb.KeyValue
 		var splits []roachpb.RKey
@@ -188,11 +188,12 @@ func createTestStoreWithOpts(
 				return splits[i].Less(splits[j])
 			})
 		}
-		err := store.WriteInitialData(
+		err := storage.WriteInitialClusterData(
 			ctx,
-			kvs,
+			eng,
+			kvs, /* initialValues */
 			storeCfg.Settings.Version.BootstrapVersion().Version,
-			1 /* numStores */, splits)
+			1 /* numStores */, splits, storeCfg.Clock.PhysicalNow())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -533,22 +534,27 @@ func (t *multiTestContextKVTransport) SendNext(
 	// would happen with real RPCs.
 	t.mtc.mu.RLock()
 	s := t.mtc.stoppers[nodeIndex]
+	sender := t.mtc.senders[nodeIndex]
 	t.mtc.mu.RUnlock()
+
 	if s == nil {
 		t.setPending(rep.ReplicaID, false)
 		return nil, roachpb.NewSendError("store is stopped")
 	}
 
-	t.mtc.mu.RLock()
-	sender := t.mtc.senders[nodeIndex]
-	t.mtc.mu.RUnlock()
 	// Clone txn of ba args for sending.
 	ba.Replica = rep.ReplicaDescriptor
 	if txn := ba.Txn; txn != nil {
 		txnClone := ba.Txn.Clone()
 		ba.Txn = &txnClone
 	}
-	br, pErr := sender.Send(ctx, ba)
+	var br *roachpb.BatchResponse
+	var pErr *roachpb.Error
+	if err := s.RunTask(ctx, "mtc send", func(ctx context.Context) {
+		br, pErr = sender.Send(ctx, ba)
+	}); err != nil {
+		pErr = roachpb.NewError(err)
+	}
 	if br == nil {
 		br = &roachpb.BatchResponse{}
 	}
@@ -824,16 +830,15 @@ func (m *multiTestContext) addStore(idx int) {
 
 	ctx := context.Background()
 	if needBootstrap {
-		if err := storage.Bootstrap(ctx, eng, roachpb.StoreIdent{
+		if err := storage.InitEngine(ctx, eng, roachpb.StoreIdent{
 			NodeID:  roachpb.NodeID(idx + 1),
 			StoreID: roachpb.StoreID(idx + 1),
 		}, cfg.Settings.Version.BootstrapVersion()); err != nil {
 			m.t.Fatal(err)
 		}
 	}
-	store := storage.NewStore(cfg, eng, &roachpb.NodeDescriptor{NodeID: nodeID})
 	if needBootstrap && idx == 0 {
-		// Bootstrap the initial range on the first store.
+		// Bootstrap the initial range on the first engine.
 		var splits []roachpb.RKey
 		kvs, tableSplits := sqlbase.MakeMetadataSchema().GetInitialValues()
 		if !m.startWithSingleRange {
@@ -843,15 +848,17 @@ func (m *multiTestContext) addStore(idx int) {
 				return splits[i].Less(splits[j])
 			})
 		}
-		err := store.WriteInitialData(
+		err := storage.WriteInitialClusterData(
 			ctx,
-			kvs,
+			eng,
+			kvs, /* initialValues */
 			cfg.Settings.Version.BootstrapVersion().Version,
-			len(m.engines), splits)
+			len(m.engines), splits, cfg.Clock.PhysicalNow())
 		if err != nil {
 			m.t.Fatal(err)
 		}
 	}
+	store := storage.NewStore(ctx, cfg, eng, &roachpb.NodeDescriptor{NodeID: nodeID})
 	if err := store.Start(ctx, stopper); err != nil {
 		m.t.Fatal(err)
 	}
@@ -995,10 +1002,9 @@ func (m *multiTestContext) restartStoreWithoutHeartbeat(i int) {
 	cfg.DB = m.dbs[i]
 	cfg.NodeLiveness = m.nodeLivenesses[i]
 	cfg.StorePool = m.storePools[i]
-	store := storage.NewStore(cfg, m.engines[i], &roachpb.NodeDescriptor{NodeID: roachpb.NodeID(i + 1)})
-	m.stores[i] = store
-
 	ctx := context.Background()
+	store := storage.NewStore(ctx, cfg, m.engines[i], &roachpb.NodeDescriptor{NodeID: roachpb.NodeID(i + 1)})
+	m.stores[i] = store
 
 	// Need to start the store before adding it so that the store ID is initialized.
 	if err := store.Start(ctx, stopper); err != nil {

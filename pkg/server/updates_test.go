@@ -190,7 +190,7 @@ func TestReportUsage(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	const elemName = "somestring"
-	const internalAppName = sql.InternalAppNamePrefix + "foo"
+	const internalAppName = sql.ReportableAppNamePrefix + "foo"
 	ctx := context.TODO()
 
 	r := makeMockRecorder(t)
@@ -275,6 +275,12 @@ func TestReportUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if _, err := db.Exec(
+		fmt.Sprintf(`CREATE TABLE %[1]s.%[1]s_s (%[1]s SERIAL2)`, elemName),
+	); err != nil {
+		t.Fatal(err)
+	}
+
 	// Run some queries so we have some query statistics collected.
 	for i := 0; i < 10; i++ {
 		// Run some sample queries. Each are passed a string and int by Exec.
@@ -330,7 +336,7 @@ func TestReportUsage(t *testing.T) {
 		) {
 			t.Fatal(err)
 		}
-		if _, err := db.Exec(`ALTER TABLE foo RENAME CONSTRAINT x TO y`); !testutils.IsError(
+		if _, err := db.Exec(`ALTER TABLE foo ALTER COLUMN x SET NOT NULL`); !testutils.IsError(
 			err, "unimplemented",
 		) {
 			t.Fatal(err)
@@ -378,13 +384,25 @@ func TestReportUsage(t *testing.T) {
 		if _, err := db.Exec(`RESET application_name`); err != nil {
 			t.Fatal(err)
 		}
+		// Try some esoteric operators unlikely to be executed in background activity.
+		if _, err := db.Exec(`SELECT '1.2.3.4'::STRING::INET, '{"a":"b","c":123}'::JSON - 'a', ARRAY (SELECT 1)[1]`); err != nil {
+			t.Fatal(err)
+		}
+		// Try a CTE to check CTE feature reporting.
+		if _, err := db.Exec(`WITH a AS (SELECT 1) SELECT * FROM a`); err != nil {
+			t.Fatal(err)
+		}
+		// Try a correlated subquery to check that feature reporting.
+		if _, err := db.Exec(`SELECT x	FROM (VALUES (1)) AS b(x) WHERE EXISTS(SELECT * FROM (VALUES (1)) AS a(x) WHERE a.x = b.x)`); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	tables, err := ts.collectSchemaInfo(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if actual := len(tables); actual != 1 {
+	if actual := len(tables); actual != 2 {
 		t.Fatalf("unexpected table count %d", actual)
 	}
 	for _, table := range tables {
@@ -517,15 +535,8 @@ func TestReportUsage(t *testing.T) {
 
 	// This test would be infuriating if it had to be updated on every
 	// edit to the Go code that changed the line number of the trace
-	// produced by force_assertion_error, so just scrub the trace
+	// produced by force_error, so just scrub the trace
 	// here.
-	for k := range r.last.FeatureUsage {
-		if strings.HasPrefix(k, "internalerror.") {
-			r.last.FeatureUsage["internalerror."] = r.last.FeatureUsage[k]
-			delete(r.last.FeatureUsage, k)
-			break
-		}
-	}
 	for k := range r.last.FeatureUsage {
 		if strings.HasPrefix(k, "othererror.builtins.go") {
 			r.last.FeatureUsage["othererror.builtins.go"] = r.last.FeatureUsage[k]
@@ -539,12 +550,30 @@ func TestReportUsage(t *testing.T) {
 		"test.b": 2,
 		"test.c": 3,
 
+		// SERIAL normalization.
+		"sql.schema.serial.rowid.SERIAL2": 1,
+
+		// Although the query is executed 10 times, due to plan caching
+		// keyed by the SQL text, the planning only occurs once.
+		"sql.plan.ops.cast.string::inet":                                            1,
+		"sql.plan.ops.bin.jsonb - string":                                           1,
+		"sql.plan.builtins.crdb_internal.force_assertion_error(msg: string) -> int": 1,
+		"sql.plan.ops.array.ind":                                                    1,
+		"sql.plan.ops.array.cons":                                                   1,
+		"sql.plan.ops.array.flatten":                                                1,
+
+		// The subquery counter is exercised by `(1, 20, 30, 40) = (SELECT ...)`.
+		"sql.plan.subquery": 1,
+		// The correlated sq counter is exercised by `WHERE EXISTS ( ... )` above.
+		"sql.plan.subquery.correlated": 1,
+		// The CTE counter is exercised by `WITH a AS (SELECT 1) ...`.
+		"sql.plan.cte": 10,
+
 		"unimplemented.#33285.json_object_agg":          10,
 		"unimplemented.pg_catalog.pg_stat_wal_receiver": 10,
-		"unimplemented.syntax.#32555":                   10,
+		"unimplemented.syntax.#28751":                   10,
 		"unimplemented.syntax.#32564":                   10,
 		"unimplemented.#9148":                           10,
-		"internalerror.":                                10,
 		"othererror.builtins.go":                        10,
 		"othererror." +
 			pgerror.CodeDataExceptionError +
@@ -557,8 +586,8 @@ func TestReportUsage(t *testing.T) {
 		"errorcodes." + pgerror.CodeDivisionByZeroError:      10,
 	}
 
-	if expected, actual := len(expectedFeatureUsage), len(r.last.FeatureUsage); expected != actual {
-		t.Fatalf("expected %d feature usage counts, got %d: %v", expected, actual, r.last.FeatureUsage)
+	if expected, actual := len(expectedFeatureUsage), len(r.last.FeatureUsage); actual < expected {
+		t.Fatalf("expected at least %d feature usage counts, got %d: %v", expected, actual, r.last.FeatureUsage)
 	}
 	for key, expected := range expectedFeatureUsage {
 		if got, ok := r.last.FeatureUsage[key]; !ok {
@@ -662,7 +691,7 @@ func TestReportUsage(t *testing.T) {
 
 	var foundKeys []string
 	for _, s := range r.last.SqlStats {
-		if strings.HasPrefix(s.Key.App, sql.InternalAppNamePrefix+"internal") {
+		if strings.HasPrefix(s.Key.App, sql.InternalAppNamePrefix) {
 			// Let's ignore all internal queries for this test.
 			continue
 		}
@@ -680,13 +709,17 @@ func TestReportUsage(t *testing.T) {
 		`[false,false,false] SET application_name = $1`,
 		`[false,false,false] SET application_name = DEFAULT`,
 		`[false,false,false] SET application_name = _`,
+		`[true,false,false] CREATE TABLE _ (_ INT8 NOT NULL DEFAULT unique_rowid())`,
 		`[true,false,false] CREATE TABLE _ (_ INT8, CONSTRAINT _ CHECK (_ > _))`,
 		`[true,false,false] INSERT INTO _ SELECT unnest(ARRAY[_, _, __more2__])`,
 		`[true,false,false] INSERT INTO _ VALUES (_), (__more2__)`,
 		`[true,false,false] INSERT INTO _ VALUES (length($1::STRING)), (__more1__)`,
 		`[true,false,false] INSERT INTO _(_, _) VALUES (_, _)`,
 		`[true,false,false] SELECT (_, _, __more2__) = (SELECT _, _, _, _ FROM _ LIMIT _)`,
+		`[true,false,false] SELECT _ FROM (VALUES (_)) AS _ (_) WHERE EXISTS (SELECT * FROM (VALUES (_)) AS _ (_) WHERE _._ = _._)`,
+		"[true,false,false] SELECT _::STRING::INET, _::JSONB - _, ARRAY (SELECT _)[_]",
 		`[true,false,false] UPDATE _ SET _ = _ + _`,
+		"[true,false,false] WITH _ AS (SELECT _) SELECT * FROM _",
 		`[true,false,true] CREATE TABLE _ (_ INT8 PRIMARY KEY, _ INT8, INDEX (_) INTERLEAVE IN PARENT _ (_))`,
 		`[true,false,true] SELECT _ / $1`,
 		`[true,false,true] SELECT _ / _`,
@@ -712,7 +745,7 @@ func TestReportUsage(t *testing.T) {
 
 	bucketByApp := make(map[string][]roachpb.CollectedStatementStatistics)
 	for _, s := range r.last.SqlStats {
-		if strings.HasPrefix(s.Key.App, sql.InternalAppNamePrefix+"internal") {
+		if strings.HasPrefix(s.Key.App, sql.InternalAppNamePrefix) {
 			// Let's ignore all internal queries for this test.
 			continue
 		}
@@ -729,12 +762,15 @@ func TestReportUsage(t *testing.T) {
 			`ALTER TABLE _ CONFIGURE ZONE = _`,
 			`CREATE DATABASE _`,
 			`CREATE TABLE _ (_ INT8, CONSTRAINT _ CHECK (_ > _))`,
+			`CREATE TABLE _ (_ INT8 NOT NULL DEFAULT unique_rowid())`,
 			`CREATE TABLE _ (_ INT8 PRIMARY KEY, _ INT8, INDEX (_) INTERLEAVE IN PARENT _ (_))`,
 			`INSERT INTO _ VALUES (length($1::STRING)), (__more1__)`,
 			`INSERT INTO _ VALUES (_), (__more2__)`,
 			`INSERT INTO _ SELECT unnest(ARRAY[_, _, __more2__])`,
 			`INSERT INTO _(_, _) VALUES (_, _)`,
 			`SELECT (_, _, __more2__) = (SELECT _, _, _, _ FROM _ LIMIT _)`,
+			`SELECT _ FROM (VALUES (_)) AS _ (_) WHERE EXISTS (SELECT * FROM (VALUES (_)) AS _ (_) WHERE _._ = _._)`,
+			`SELECT _::STRING::INET, _::JSONB - _, ARRAY (SELECT _)[_]`,
 			`SELECT * FROM _ WHERE (_ = length($1::STRING)) OR (_ = $2)`,
 			`SELECT * FROM _ WHERE (_ = _) AND (_ = _)`,
 			`SELECT _ / $1`,
@@ -745,6 +781,7 @@ func TestReportUsage(t *testing.T) {
 			`SET CLUSTER SETTING "server.time_until_store_dead" = _`,
 			`SET CLUSTER SETTING "diagnostics.reporting.send_crash_reports" = _`,
 			`SET application_name = _`,
+			`WITH _ AS (SELECT _) SELECT * FROM _`,
 		},
 		elemName: {
 			`SELECT _ FROM _ WHERE (_ = _) AND (lower(_) = lower(_))`,

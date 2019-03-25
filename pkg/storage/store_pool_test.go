@@ -160,7 +160,8 @@ func verifyStoreList(
 	expectedThrottledStoreCount int,
 ) error {
 	var actual []int
-	sl, aliveStoreCount, throttledStoreCount := sp.getStoreList(rangeID, filter)
+	sl, aliveStoreCount, throttled := sp.getStoreList(rangeID, filter)
+	throttledStoreCount := len(throttled)
 	sl = sl.filter(constraints)
 	if aliveStoreCount != expectedAliveStoreCount {
 		return errors.Errorf("expected AliveStoreCount %d does not match actual %d",
@@ -514,13 +515,14 @@ func TestStorePoolUpdateLocalStore(t *testing.T) {
 // the local copy of store before that store has been gossiped will be a no-op.
 func TestStorePoolUpdateLocalStoreBeforeGossip(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
 	manual := hlc.NewManualClock(123)
 	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
 	stopper, _, _, sp, _ := createTestStorePool(
 		TestTimeUntilStoreDead, false, /* deterministic */
 		func() int { return 10 }, /* nodeCount */
 		storagepb.NodeLivenessStatus_DEAD)
-	defer stopper.Stop(context.TODO())
+	defer stopper.Stop(ctx)
 
 	// Create store.
 	node := roachpb.NodeDescriptor{NodeID: roachpb.NodeID(1)}
@@ -528,7 +530,7 @@ func TestStorePoolUpdateLocalStoreBeforeGossip(t *testing.T) {
 	stopper.AddCloser(eng)
 	cfg := TestStoreConfig(clock)
 	cfg.Transport = NewDummyRaftTransport(cfg.Settings)
-	store := NewStore(cfg, eng, &node)
+	store := NewStore(ctx, cfg, eng, &node)
 	// Fake an ident because this test doesn't want to start the store
 	// but without an Ident there will be NPEs.
 	store.Ident = &roachpb.StoreIdent{
@@ -705,8 +707,8 @@ func TestStorePoolDefaultState(t *testing.T) {
 	if alive != 0 {
 		t.Errorf("expected no live stores; got a live count of %d", alive)
 	}
-	if throttled != 0 {
-		t.Errorf("expected no live stores; got a throttled count of %d", throttled)
+	if len(throttled) != 0 {
+		t.Errorf("expected no live stores; got throttled %v", throttled)
 	}
 }
 
@@ -723,7 +725,7 @@ func TestStorePoolThrottle(t *testing.T) {
 
 	{
 		expected := sp.clock.Now().GoTime().Add(DeclinedReservationsTimeout.Get(&sp.st.SV))
-		sp.throttle(throttleDeclined, 1)
+		sp.throttle(throttleDeclined, "", 1)
 
 		sp.detailsMu.Lock()
 		detail := sp.getStoreDetailLocked(1)
@@ -736,7 +738,7 @@ func TestStorePoolThrottle(t *testing.T) {
 
 	{
 		expected := sp.clock.Now().GoTime().Add(FailedReservationsTimeout.Get(&sp.st.SV))
-		sp.throttle(throttleFailed, 1)
+		sp.throttle(throttleFailed, "", 1)
 
 		sp.detailsMu.Lock()
 		detail := sp.getStoreDetailLocked(1)

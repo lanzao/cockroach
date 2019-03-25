@@ -106,6 +106,9 @@ var fixturesImportFilesPerNode = fixturesImportCmd.PersistentFlags().Int(
 var fixturesRunChecks = fixturesLoadImportShared.Bool(
 	`checks`, true, `Run validity checks on the loaded fixture`)
 
+var fixturesImportInjectStats = fixturesImportCmd.PersistentFlags().Bool(
+	`inject-stats`, true, `Inject pre-calculated statistics if they are available`)
+
 var gcsBucketOverride, gcsPrefixOverride, gcsBillingProjectOverride *string
 
 func init() {
@@ -135,7 +138,7 @@ func getStorage(ctx context.Context) (*storage.Client, error) {
 }
 
 func init() {
-	workloadcli.AddSubCmd(func() *cobra.Command {
+	workloadcli.AddSubCmd(func(userFacing bool) *cobra.Command {
 		for _, meta := range workload.Registered() {
 			gen := meta.New()
 			var genFlags *pflag.FlagSet
@@ -288,9 +291,13 @@ func fixturesLoad(gen workload.Generator, urls []string, dbName string) error {
 	if err != nil {
 		return errors.Wrap(err, `finding fixture`)
 	}
-	if err := workloadccl.RestoreFixture(ctx, sqlDB, fixture, dbName); err != nil {
+
+	log.Infof(ctx, "starting load of %d tables", len(gen.Tables()))
+	bytes, err := workloadccl.RestoreFixture(ctx, sqlDB, fixture, dbName)
+	if err != nil {
 		return errors.Wrap(err, `restoring fixture`)
 	}
+	log.Infof(ctx, "loaded %s bytes in %d tables", humanizeutil.IBytes(bytes), len(gen.Tables()))
 
 	if hooks, ok := gen.(workload.Hookser); *fixturesRunChecks && ok {
 		if consistencyCheckFn := hooks.Hooks().CheckConsistency; consistencyCheckFn != nil {
@@ -314,9 +321,13 @@ func fixturesImport(gen workload.Generator, urls []string, dbName string) error 
 		return err
 	}
 
+	log.Infof(ctx, "starting import of %d tables", len(gen.Tables()))
 	directIngestion := *fixturesImportDirectIngestionTable
 	filesPerNode := *fixturesImportFilesPerNode
-	bytes, err := workloadccl.ImportFixture(ctx, sqlDB, gen, dbName, directIngestion, filesPerNode)
+	injectStats := *fixturesImportInjectStats
+	bytes, err := workloadccl.ImportFixture(
+		ctx, sqlDB, gen, dbName, directIngestion, filesPerNode, injectStats,
+	)
 	if err != nil {
 		return errors.Wrap(err, `importing fixture`)
 	}

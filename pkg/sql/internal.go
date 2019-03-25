@@ -35,7 +35,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/pkg/errors"
 )
 
 var _ sqlutil.InternalExecutor = &InternalExecutor{}
@@ -74,14 +73,8 @@ type internalExecutorImpl struct {
 
 	// sessionData, if not nil, represents the session variables used by
 	// statements executed on this internalExecutor. This field supports the
-	// implementation of SessionBoundInternalExecutor. Note that different
-	// executors never share sessionData; instead they make copies. Updating the
-	// sessionData through an internalExecutor doesn't affect the real client
-	// session from whence it came (and thus updating this data is probably not
-	// what you want).
-	// NOTE: We could consider allowing an internalExecutor to share/update the
-	// parent session state if need be, but then we'd need to share a
-	// sessionDataMutator.
+	// implementation of SessionBoundInternalExecutor. Note that a session bound
+	// internal executor cannot modify session data.
 	sessionData *sessiondata.SessionData
 
 	// The internal executor uses its own TableCollection. A TableCollection
@@ -116,14 +109,14 @@ func MakeInternalExecutor(
 	}
 }
 
-// MakeSessionBoundInternalExecutor creates a SessionBoundInternalExecutor.
-func MakeSessionBoundInternalExecutor(
+// NewSessionBoundInternalExecutor creates a SessionBoundInternalExecutor.
+func NewSessionBoundInternalExecutor(
 	ctx context.Context,
 	sessionData *sessiondata.SessionData,
 	s *Server,
 	memMetrics MemoryMetrics,
 	settings *cluster.Settings,
-) SessionBoundInternalExecutor {
+) *SessionBoundInternalExecutor {
 	monitor := mon.MakeUnlimitedMonitor(
 		ctx,
 		"internal SQL executor",
@@ -133,15 +126,12 @@ func MakeSessionBoundInternalExecutor(
 		math.MaxInt64, /* noteworthy */
 		settings,
 	)
-	dataCopy := sessionData.Copy()
-	return SessionBoundInternalExecutor{
+	return &SessionBoundInternalExecutor{
 		impl: internalExecutorImpl{
-			s:          s,
-			mon:        &monitor,
-			memMetrics: memMetrics,
-			// The internal executor gets a copy of the session data, so it can't
-			// update the parent session.
-			sessionData: &dataCopy,
+			s:           s,
+			mon:         &monitor,
+			memMetrics:  memMetrics,
+			sessionData: sessionData,
 		},
 	}
 }
@@ -168,17 +158,19 @@ func (ie *internalExecutorImpl) initConnEx(
 		lastDelivered: -1,
 	}
 
-	var sp sessionParams
+	var sd *sessiondata.SessionData
+	var sdMut *sessionDataMutator
 	if sargs.isDefined() {
 		if ie.sessionData != nil {
 			log.Fatal(ctx, "sargs used on a session bound executor")
 		}
-		sp.args = sargs
+		sd, sdMut = ie.s.newSessionDataAndMutator(sargs)
 	} else {
 		if ie.sessionData == nil {
 			log.Fatal(ctx, "initConnEx called with no sargs, and the executor is also not session bound")
 		}
-		sp.data = ie.sessionData
+		sd = ie.sessionData
+		// sdMut stays nil for session bound executors.
 	}
 
 	stmtBuf := NewStmtBuf()
@@ -187,7 +179,7 @@ func (ie *internalExecutorImpl) initConnEx(
 	if txn == nil {
 		ex, err = ie.s.newConnExecutor(
 			ctx,
-			sp,
+			sd, sdMut,
 			stmtBuf,
 			clientComm,
 			ie.memMetrics,
@@ -195,7 +187,7 @@ func (ie *internalExecutorImpl) initConnEx(
 	} else {
 		ex, err = ie.s.newConnExecutorWithTxn(
 			ctx,
-			sp,
+			sd, sdMut,
 			stmtBuf,
 			clientComm,
 			ie.mon,
@@ -212,6 +204,7 @@ func (ie *internalExecutorImpl) initConnEx(
 	wg.Add(1)
 	go func() {
 		if err := ex.run(ctx, ie.mon, mon.BoundAccount{} /*reserved*/, nil /* cancel */); err != nil {
+			ex.recordError(err)
 			errCallback(err)
 		}
 		closeMode := normalClose
@@ -468,7 +461,7 @@ func (ie *internalExecutorImpl) execInternal(
 	case internalExecRootSession:
 		sargs.SessionDefaults = map[string]string{
 			"database":         "system",
-			"application_name": InternalAppNamePrefix + "internal-" + opName,
+			"application_name": InternalAppNamePrefix + "-" + opName,
 		}
 	}
 
@@ -477,10 +470,10 @@ func (ie *internalExecutorImpl) execInternal(
 		// case we need to leave the error intact so that it can be retried at a
 		// higher level.
 		if retErr != nil && !errIsRetriable(retErr) {
-			retErr = errors.Wrap(retErr, opName)
+			retErr = pgerror.Wrapf(retErr, pgerror.CodeDataExceptionError, opName)
 		}
 		if retRes.err != nil && !errIsRetriable(retRes.err) {
-			retRes.err = errors.Wrap(retRes.err, opName)
+			retRes.err = pgerror.Wrapf(retRes.err, pgerror.CodeDataExceptionError, opName)
 		}
 	}()
 

@@ -15,13 +15,13 @@
 package execbuilder
 
 import (
-	"fmt"
-
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/pkg/errors"
 )
 
@@ -142,7 +142,10 @@ func (b *Builder) indexedVar(
 ) tree.TypedExpr {
 	idx, ok := ctx.ivarMap.Get(int(colID))
 	if !ok {
-		panic(fmt.Sprintf("cannot map variable %d to an indexed var", colID))
+		if b.nullifyMissingVarExprs > 0 {
+			return tree.DNull
+		}
+		panic(pgerror.NewAssertionErrorf("cannot map variable %d to an indexed var", log.Safe(colID)))
 	}
 	return ctx.ivh.IndexedVarWithType(idx, md.ColumnMeta(colID).Type)
 }
@@ -208,8 +211,11 @@ func (b *Builder) buildBoolean(ctx *buildScalarCtx, scalar opt.ScalarExpr) (tree
 	case opt.FiltersItemOp:
 		return b.buildScalar(ctx, scalar.Child(0).(opt.ScalarExpr))
 
+	case opt.RangeOp:
+		return b.buildScalar(ctx, scalar.Child(0).(opt.ScalarExpr))
+
 	default:
-		panic(fmt.Sprintf("invalid op %s", scalar.Op()))
+		panic(pgerror.NewAssertionErrorf("invalid op %s", log.Safe(scalar.Op())))
 	}
 }
 
@@ -422,7 +428,7 @@ func (b *Builder) buildArrayFlatten(
 	// The subquery here should always be uncorrelated: if it were not, we would
 	// have converted it to an aggregation.
 	if !af.Input.Relational().OuterCols.Empty() {
-		panic("input to ArrayFlatten should be uncorrelated")
+		panic(pgerror.NewAssertionErrorf("input to ArrayFlatten should be uncorrelated"))
 	}
 
 	root, err := b.buildRelational(af.Input)
@@ -554,8 +560,12 @@ func (b *Builder) buildSubquery(
 func (b *Builder) addSubquery(
 	mode exec.SubqueryMode, typ types.T, root exec.Node, originalExpr *tree.Subquery,
 ) *tree.Subquery {
+	var originalSelect tree.SelectStatement
+	if originalExpr != nil {
+		originalSelect = originalExpr.Select
+	}
 	exprNode := &tree.Subquery{
-		Select: originalExpr.Select,
+		Select: originalSelect,
 		Exists: mode == exec.SubqueryExists,
 	}
 	exprNode.SetType(typ)
@@ -646,7 +656,7 @@ func isVar(expr tree.Expr) bool {
 	case tree.VariableExpr:
 		return true
 	case *tree.Placeholder:
-		panic("placeholder should have been replaced")
+		panic(pgerror.NewAssertionErrorf("placeholder should have been replaced"))
 	}
 	return false
 }

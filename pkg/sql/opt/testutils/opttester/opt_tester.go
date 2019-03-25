@@ -24,6 +24,7 @@ import (
 	"testing"
 	"text/tabwriter"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
@@ -122,6 +123,15 @@ type Flags struct {
 	// ReorderJoinsLimit is the maximum number of joins in a query which the optimizer
 	// should attempt to reorder.
 	JoinLimit int
+
+	// Locality specifies the location of the planning node as a set of user-
+	// defined key/value pairs, ordered from most inclusive to least inclusive.
+	// If there are no tiers, then the node's location is not known. Examples:
+	//
+	//   [region=eu]
+	//   [region=us,dc=east]
+	//
+	Locality roachpb.Locality
 }
 
 // New constructs a new instance of the OptTester for the given SQL statement.
@@ -223,6 +233,10 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 //    expression in the query tree for the purpose of creating alternate query
 //    plans in the optimizer.
 //
+//  - locality: used to set the locality of the node that plans the query. This
+//    can affect costing when there are multiple possible indexes to choose
+//    from, each in different localities.
+//
 func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 	// Allow testcases to override the flags.
 	for _, a := range d.CmdArgs {
@@ -240,6 +254,7 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 
 	ot.Flags.Verbose = testing.Verbose()
 	ot.evalCtx.TestingKnobs.OptimizerCostPerturbation = ot.Flags.PerturbCost
+	ot.evalCtx.Locality = ot.Flags.Locality
 
 	switch d.Cmd {
 	case "exec-ddl":
@@ -257,7 +272,7 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 		e, err := ot.OptBuild()
 		if err != nil {
 			text := strings.TrimSpace(err.Error())
-			if pgerr, ok := err.(*pgerror.Error); ok {
+			if pgerr, ok := pgerror.GetPGCause(err); ok {
 				// Output Postgres error code if it's available.
 				return fmt.Sprintf("error (%s): %s\n", pgerr.Code, text)
 			}
@@ -270,7 +285,7 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 		e, err := ot.OptNorm()
 		if err != nil {
 			text := strings.TrimSpace(err.Error())
-			if pgerr, ok := err.(*pgerror.Error); ok {
+			if pgerr, ok := pgerror.GetPGCause(err); ok {
 				// Output Postgres error code if it's available.
 				return fmt.Sprintf("error (%s): %s\n", pgerr.Code, text)
 			}
@@ -317,6 +332,14 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 
 	case "expr":
 		e, err := ot.Expr()
+		if err != nil {
+			d.Fatalf(tb, "%v", err)
+		}
+		ot.postProcess(tb, d, e)
+		return memo.FormatExpr(e, ot.Flags.ExprFormat)
+
+	case "exprnorm":
+		e, err := ot.ExprNorm()
 		if err != nil {
 			d.Fatalf(tb, "%v", err)
 		}
@@ -501,6 +524,14 @@ func (f *Flags) Set(arg datadriven.CmdArg) error {
 			return err
 		}
 
+	case "locality":
+		// Recombine multiple arguments, separated by commas.
+		locality := strings.Join(arg.Vals, ",")
+		err := f.Locality.Set(locality)
+		if err != nil {
+			return err
+		}
+
 	default:
 		return fmt.Errorf("unknown argument: %s", arg.Key)
 	}
@@ -565,6 +596,26 @@ func (ot *OptTester) Expr() (opt.Expr, error) {
 	var f norm.Factory
 	f.Init(&ot.evalCtx)
 	f.DisableOptimizations()
+
+	return exprgen.Build(ot.catalog, &f, ot.sql)
+}
+
+// ExprNorm parses the input directly into an expression and runs
+// normalization; see exprgen.Build.
+func (ot *OptTester) ExprNorm() (opt.Expr, error) {
+	var f norm.Factory
+	f.Init(&ot.evalCtx)
+
+	f.NotifyOnMatchedRule(func(ruleName opt.RuleName) bool {
+		// exprgen.Build doesn't run optimization, so we don't need to explicitly
+		// disallow exploration rules here.
+
+		if ot.Flags.DisableRules.Contains(int(ruleName)) {
+			return false
+		}
+		ot.seenRules.Add(int(ruleName))
+		return true
+	})
 
 	return exprgen.Build(ot.catalog, &f, ot.sql)
 }
@@ -875,7 +926,10 @@ func (ot *OptTester) optimizeExpr(o *xform.Optimizer) (opt.Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	root := o.Optimize()
+	root, err := o.Optimize()
+	if err != nil {
+		return nil, err
+	}
 	if ot.Flags.PerturbCost != 0 {
 		o.RecomputeCost()
 	}

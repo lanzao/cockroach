@@ -26,6 +26,9 @@ package tree
 import (
 	"errors"
 	"fmt"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // SelectStatement represents any SELECT statement.
@@ -402,20 +405,27 @@ func StripTableParens(expr TableExpr) TableExpr {
 
 // JoinTableExpr represents a TableExpr that's a JOIN operation.
 type JoinTableExpr struct {
-	Join  string
-	Left  TableExpr
-	Right TableExpr
-	Cond  JoinCond
+	JoinType string
+	Left     TableExpr
+	Right    TableExpr
+	Cond     JoinCond
+	Hint     string
 }
 
 // JoinTableExpr.Join
 const (
-	AstJoin      = "JOIN"
-	AstFullJoin  = "FULL JOIN"
-	AstLeftJoin  = "LEFT JOIN"
-	AstRightJoin = "RIGHT JOIN"
-	AstCrossJoin = "CROSS JOIN"
-	AstInnerJoin = "INNER JOIN"
+	AstFull  = "FULL"
+	AstLeft  = "LEFT"
+	AstRight = "RIGHT"
+	AstCross = "CROSS"
+	AstInner = "INNER"
+)
+
+// JoinTableExpr.Hint
+const (
+	AstHash   = "HASH"
+	AstLookup = "LOOKUP"
+	AstMerge  = "MERGE"
 )
 
 // Format implements the NodeFormatter interface.
@@ -426,13 +436,27 @@ func (node *JoinTableExpr) Format(ctx *FmtCtx) {
 		// Natural joins have a different syntax: "<a> NATURAL <join_type> <b>"
 		ctx.FormatNode(node.Cond)
 		ctx.WriteByte(' ')
-		ctx.WriteString(node.Join)
-		ctx.WriteByte(' ')
+		if node.JoinType != "" {
+			ctx.WriteString(node.JoinType)
+			ctx.WriteByte(' ')
+			if node.Hint != "" {
+				ctx.WriteString(node.Hint)
+				ctx.WriteByte(' ')
+			}
+		}
+		ctx.WriteString("JOIN ")
 		ctx.FormatNode(node.Right)
 	} else {
-		// General syntax: "<a> <join_type> <b> <condition>"
-		ctx.WriteString(node.Join)
-		ctx.WriteByte(' ')
+		// General syntax: "<a> <join_type> [<join_hint>] JOIN <b> <condition>"
+		if node.JoinType != "" {
+			ctx.WriteString(node.JoinType)
+			ctx.WriteByte(' ')
+			if node.Hint != "" {
+				ctx.WriteString(node.Hint)
+				ctx.WriteByte(' ')
+			}
+		}
+		ctx.WriteString("JOIN ")
 		ctx.FormatNode(node.Right)
 		if node.Cond != nil {
 			ctx.WriteByte(' ')
@@ -774,7 +798,7 @@ func (node *WindowFrameBound) Format(ctx *FmtCtx) {
 	case UnboundedFollowing:
 		ctx.WriteString("UNBOUNDED FOLLOWING")
 	default:
-		panic(fmt.Sprintf("unhandled case: %d", node.BoundType))
+		panic(pgerror.NewAssertionErrorf("unhandled case: %d", log.Safe(node.BoundType)))
 	}
 }
 
@@ -788,7 +812,7 @@ func (node *WindowFrame) Format(ctx *FmtCtx) {
 	case GROUPS:
 		ctx.WriteString("GROUPS ")
 	default:
-		panic(fmt.Sprintf("unhandled case: %d", node.Mode))
+		panic(pgerror.NewAssertionErrorf("unhandled case: %d", log.Safe(node.Mode)))
 	}
 	if node.Bounds.EndBound != nil {
 		ctx.WriteString("BETWEEN ")

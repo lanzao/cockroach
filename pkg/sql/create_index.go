@@ -16,7 +16,6 @@ package sql
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -85,7 +84,8 @@ func (n *createIndexNode) startExec(params runParams) error {
 	_, dropped, err := n.tableDesc.FindIndexByName(string(n.n.Name))
 	if err == nil {
 		if dropped {
-			return fmt.Errorf("index %q being dropped, try again later", string(n.n.Name))
+			return pgerror.NewErrorf(pgerror.CodeObjectNotInPrerequisiteStateError,
+				"index %q being dropped, try again later", string(n.n.Name))
 		}
 		if n.n.IfNotExists {
 			return nil
@@ -114,8 +114,12 @@ func (n *createIndexNode) startExec(params runParams) error {
 		return err
 	}
 
+	// The index name may have changed as a result of
+	// AllocateIDs(). Retrieve it for the event log below.
+	index := n.tableDesc.Mutations[mutationIdx].GetIndex()
+	indexName := index.Name
+
 	if n.n.Interleave != nil {
-		index := n.tableDesc.Mutations[mutationIdx].GetIndex()
 		if err := params.p.addInterleave(params.ctx, n.tableDesc, index, n.n.Interleave); err != nil {
 			return err
 		}
@@ -149,7 +153,7 @@ func (n *createIndexNode) startExec(params runParams) error {
 			User       string
 			MutationID uint32
 		}{
-			n.n.Table.FQString(), n.n.Name.String(), n.n.String(),
+			n.n.Table.FQString(), indexName, n.n.String(),
 			params.SessionData().User, uint32(mutationID),
 		},
 	)

@@ -35,7 +35,7 @@ new engineers.
      - On GNU/Linux, the terminfo development libraries, which may be
        part of a ncurses development package (e.g. `libncurses-dev` on
        Debian/Ubuntu, but `ncurses-devel` on CentOS).
-     - A Go 1.9+ environment with a recent 64-bit version of the toolchain. Note that
+     - A Go 1.11.4 environment with a recent 64-bit version of the toolchain. Note that
        the Makefile enforces the specific version required, as it is updated
        frequently.
      - Git 1.9+
@@ -44,6 +44,7 @@ new engineers.
      - CMake 3.1+
      - Autoconf 2.68+
      - NodeJS 6.x and Yarn 1.7+
+     - Yacc or Bison
 
    Note that at least 4GB of RAM is required to build from source and run tests.
 

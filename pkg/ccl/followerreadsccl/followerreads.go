@@ -35,22 +35,24 @@ import (
 // which the implementation of the follower read capable replica policy ought
 // to use to determine if a request can be used for reading.
 // FollowerReadMultiple is a hidden setting.
-var followerReadMultiple = settings.RegisterValidatedFloatSetting(
-	"kv.follower_read.target_multiple",
-	"if above 1, encourages the distsender to perform a read against the "+
-		"closest replica if a request is older than kv.closed_timestamp.target_duration"+
-		" * (1 + kv.closed_timestamp.close_fraction * this) less a clock uncertainty "+
-		"interval. This value also is used to create follower_timestamp().",
-	3,
-	func(v float64) error {
-		if v < 1 {
-			return fmt.Errorf("%v is not >= 1", v)
-		}
-		return nil
-	},
-)
-
-func init() { followerReadMultiple.Hide() }
+var followerReadMultiple = func() *settings.FloatSetting {
+	s := settings.RegisterValidatedFloatSetting(
+		"kv.follower_read.target_multiple",
+		"if above 1, encourages the distsender to perform a read against the "+
+			"closest replica if a request is older than kv.closed_timestamp.target_duration"+
+			" * (1 + kv.closed_timestamp.close_fraction * this) less a clock uncertainty "+
+			"interval. This value also is used to create follower_timestamp().",
+		3,
+		func(v float64) error {
+			if v < 1 {
+				return fmt.Errorf("%v is not >= 1", v)
+			}
+			return nil
+		},
+	)
+	s.SetSensitive()
+	return s
+}()
 
 // getFollowerReadOffset returns the offset duration which should be used to as
 // the offset from now to request a follower read. The same value less the clock
@@ -91,7 +93,7 @@ func canUseFollowerRead(clusterID uuid.UUID, st *cluster.Settings, ts hlc.Timest
 // canSendToFollower implements the logic for checking whether a batch request
 // may be sent to a follower.
 func canSendToFollower(clusterID uuid.UUID, st *cluster.Settings, ba roachpb.BatchRequest) bool {
-	return ba.IsReadOnly() && ba.Txn != nil &&
+	return ba.IsReadOnly() && ba.Txn != nil && !ba.Txn.IsWriting() &&
 		canUseFollowerRead(clusterID, st, ba.Txn.OrigTimestamp)
 }
 

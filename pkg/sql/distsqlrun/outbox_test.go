@@ -179,7 +179,7 @@ func TestOutbox(t *testing.T) {
 	}
 	for i, m := range metas {
 		expectedStr := fmt.Sprintf("meta %d", i)
-		if m.Err.Error() != expectedStr {
+		if !testutils.IsError(m.Err, expectedStr) {
 			t.Fatalf("expected: %q, got: %q", expectedStr, m.Err.Error())
 		}
 	}
@@ -442,6 +442,64 @@ func TestOutboxCancelsFlowOnError(t *testing.T) {
 	if !ctxCanceled {
 		t.Fatal("flow ctx was not canceled")
 	}
+}
+
+// Test that the outbox unblocks its producers if it fails to connect during
+// startup.
+func TestOutboxUnblocksProducers(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	stopper := stop.NewStopper()
+	ctx := context.TODO()
+	defer stopper.Stop(ctx)
+
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := tree.MakeTestingEvalContext(st)
+	defer evalCtx.Stop(ctx)
+	flowCtx := FlowCtx{
+		Settings: st,
+		stopper:  stopper,
+		EvalCtx:  &evalCtx,
+		// a nil nodeDialer will always fail to connect.
+		nodeDialer: nil,
+	}
+	flowID := distsqlpb.FlowID{UUID: uuid.MakeV4()}
+	streamID := distsqlpb.StreamID(42)
+	var outbox *outbox
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	outbox = newOutbox(&flowCtx, staticNodeID, flowID, streamID)
+	outbox.init(sqlbase.OneIntCol)
+
+	// Fill up the outbox.
+	for i := 0; i < outboxBufRows; i++ {
+		outbox.Push(nil, &ProducerMetadata{})
+	}
+
+	var blockedPusherWg sync.WaitGroup
+	blockedPusherWg.Add(1)
+	go func() {
+		// Push to the outbox one last time, which will block since the channel
+		// is full.
+		outbox.Push(nil, &ProducerMetadata{})
+		// We should become unblocked once outbox.start fails.
+		blockedPusherWg.Done()
+	}()
+
+	// This outbox will fail to connect, because it has a nil nodeDialer.
+	outbox.start(ctx, &wg, cancel)
+
+	wg.Wait()
+	// Also, make sure that pushing to the outbox after its failed shows that
+	// it's been correctly ConsumerClosed.
+	status := outbox.RowChannel.Push(nil, &ProducerMetadata{})
+	if status != ConsumerClosed {
+		t.Fatalf("expected status=ConsumerClosed, got %s", status)
+	}
+
+	blockedPusherWg.Wait()
 }
 
 func BenchmarkOutbox(b *testing.B) {

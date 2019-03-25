@@ -36,11 +36,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/types"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/arith"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -74,6 +76,10 @@ type UnaryOp struct {
 
 	types   TypeList
 	retType ReturnTyper
+
+	// counter, if non-nil, should be incremented every time the
+	// operator is type checked.
+	counter telemetry.Counter
 }
 
 func (op *UnaryOp) params() TypeList {
@@ -88,22 +94,23 @@ func (*UnaryOp) preferred() bool {
 	return false
 }
 
-func init() {
-	for op, overload := range UnaryOps {
+func unaryOpFixups(ops map[UnaryOperator]unaryOpOverload) map[UnaryOperator]unaryOpOverload {
+	for op, overload := range ops {
 		for i, impl := range overload {
 			casted := impl.(*UnaryOp)
 			casted.types = ArgTypes{{"arg", casted.Typ}}
 			casted.retType = FixedReturnType(casted.ReturnType)
-			UnaryOps[op][i] = casted
+			ops[op][i] = casted
 		}
 	}
+	return ops
 }
 
 // unaryOpOverload is an overloaded set of unary operator implementations.
 type unaryOpOverload []overloadImpl
 
 // UnaryOps contains the unary operations indexed by operation type.
-var UnaryOps = map[UnaryOperator]unaryOpOverload{
+var UnaryOps = unaryOpFixups(map[UnaryOperator]unaryOpOverload{
 	UnaryMinus: {
 		&UnaryOp{
 			Typ:        types.Int,
@@ -171,7 +178,7 @@ var UnaryOps = map[UnaryOperator]unaryOpOverload{
 			},
 		},
 	},
-}
+})
 
 // BinOp is a binary operator.
 type BinOp struct {
@@ -183,6 +190,10 @@ type BinOp struct {
 
 	types   TypeList
 	retType ReturnTyper
+
+	// counter, if non-nil, should be incremented every time the
+	// operator is type checked.
+	counter telemetry.Counter
 }
 
 func (op *BinOp) params() TypeList {
@@ -1330,7 +1341,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				rval := MustBeDInt(right)
 				if rval < 0 || rval >= 64 {
-					telemetry.Count("sql.large_lshift_argument")
+					telemetry.Inc(sqltelemetry.LargeLShiftArgumentCounter)
 					return nil, pgerror.NewErrorf(pgerror.CodeInvalidParameterValueError, "shift argument out of range")
 				}
 				return NewDInt(MustBeDInt(left) << uint(rval)), nil
@@ -1368,7 +1379,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				rval := MustBeDInt(right)
 				if rval < 0 || rval >= 64 {
-					telemetry.Count("sql.large_rshift_argument")
+					telemetry.Inc(sqltelemetry.LargeRShiftArgumentCounter)
 					return nil, pgerror.NewErrorf(pgerror.CodeInvalidParameterValueError, "shift argument out of range")
 				}
 				return NewDInt(MustBeDInt(left) >> uint(rval)), nil
@@ -1602,6 +1613,10 @@ type CmpOp struct {
 
 	types       TypeList
 	isPreferred bool
+
+	// counter, if non-nil, should be incremented every time the
+	// operator is type checked.
+	counter telemetry.Counter
 }
 
 func (op *CmpOp) params() TypeList {
@@ -1622,32 +1637,32 @@ func (op *CmpOp) preferred() bool {
 	return op.isPreferred
 }
 
-func init() {
+func cmpOpFixups(cmpOps map[ComparisonOperator]cmpOpOverload) map[ComparisonOperator]cmpOpOverload {
 	// Array equality comparisons.
 	for _, t := range types.AnyNonArray {
-		CmpOps[EQ] = append(CmpOps[EQ], &CmpOp{
+		cmpOps[EQ] = append(cmpOps[EQ], &CmpOp{
 			LeftType:  types.TArray{Typ: t},
 			RightType: types.TArray{Typ: t},
 			Fn:        cmpOpScalarEQFn,
 		})
 
-		CmpOps[IsNotDistinctFrom] = append(CmpOps[IsNotDistinctFrom], &CmpOp{
+		cmpOps[IsNotDistinctFrom] = append(cmpOps[IsNotDistinctFrom], &CmpOp{
 			LeftType:     types.TArray{Typ: t},
 			RightType:    types.TArray{Typ: t},
 			Fn:           cmpOpScalarIsFn,
 			NullableArgs: true,
 		})
 	}
-}
 
-func init() {
-	for op, overload := range CmpOps {
+	for op, overload := range cmpOps {
 		for i, impl := range overload {
 			casted := impl.(*CmpOp)
 			casted.types = ArgTypes{{"left", casted.LeftType}, {"right", casted.RightType}}
-			CmpOps[op][i] = casted
+			cmpOps[op][i] = casted
 		}
 	}
+
+	return cmpOps
 }
 
 // cmpOpOverload is an overloaded set of comparison operator implementations.
@@ -1688,7 +1703,7 @@ func makeIsFn(a, b types.T) *CmpOp {
 }
 
 // CmpOps contains the comparison operations indexed by operation type.
-var CmpOps = map[ComparisonOperator]cmpOpOverload{
+var CmpOps = cmpOpFixups(map[ComparisonOperator]cmpOpOverload{
 	EQ: {
 		// Single-type comparisons.
 		makeEqFn(types.Bool, types.Bool),
@@ -2039,7 +2054,7 @@ var CmpOps = map[ComparisonOperator]cmpOpOverload{
 			},
 		},
 	},
-}
+})
 
 // This map contains the inverses for operators in the CmpOps map that have
 // inverses.
@@ -2066,7 +2081,7 @@ func boolFromCmp(cmp int, op ComparisonOperator) *DBool {
 	case LE:
 		return MakeDBool(cmp <= 0)
 	default:
-		panic(fmt.Sprintf("unexpected ComparisonOperator in boolFromCmp: %v", op))
+		panic(pgerror.NewAssertionErrorf("unexpected ComparisonOperator in boolFromCmp: %v", log.Safe(op)))
 	}
 }
 
@@ -2397,6 +2412,18 @@ type EvalPlanner interface {
 	EvalSubquery(expr *Subquery) (Datum, error)
 }
 
+// EvalSessionAccessor is a limited interface to access session variables.
+type EvalSessionAccessor interface {
+	// SetConfig sets a session variable to a new value.
+	//
+	// This interface only supports strings as this is sufficient for
+	// pg_catalog.set_config().
+	SetSessionVar(ctx context.Context, settingName, newValue string) error
+
+	// GetSessionVar retrieves the current value of a session variable.
+	GetSessionVar(ctx context.Context, settingName string, missingOk bool) (bool, string, error)
+}
+
 // SessionBoundInternalExecutor is a subset of sqlutil.InternalExecutor used by
 // this sem/tree package which can't even import sqlutil. Executor used through
 // this interface are always "session-bound" - they inherit session variables
@@ -2489,6 +2516,15 @@ type EvalContext struct {
 	Settings  *cluster.Settings
 	ClusterID uuid.UUID
 	NodeID    roachpb.NodeID
+
+	// Locality contains the location of the current node as a set of user-defined
+	// key/value pairs, ordered from most inclusive to least inclusive. If there
+	// are no tiers, then the node's location is not known. Example:
+	//
+	//   [region=us,dc=east]
+	//
+	Locality roachpb.Locality
+
 	// The statement timestamp. May be different for every statement.
 	// Used for statement_timestamp().
 	StmtTimestamp time.Time
@@ -2522,6 +2558,8 @@ type EvalContext struct {
 	InternalExecutor SessionBoundInternalExecutor
 
 	Planner EvalPlanner
+
+	SessionAccessor EvalSessionAccessor
 
 	Sequence SequenceOperators
 
@@ -2612,7 +2650,7 @@ func (ctx *EvalContext) GetStmtTimestamp() time.Time {
 	// TODO(knz): a zero timestamp should never be read, even during
 	// Prepare. This will need to be addressed.
 	if !ctx.PrepareOnly && ctx.StmtTimestamp.IsZero() {
-		panic("zero statement timestamp in EvalContext")
+		panic(pgerror.NewAssertionErrorf("zero statement timestamp in EvalContext"))
 	}
 	return ctx.StmtTimestamp
 }
@@ -2622,7 +2660,7 @@ func (ctx *EvalContext) GetStmtTimestamp() time.Time {
 func (ctx *EvalContext) GetClusterTimestamp() *DDecimal {
 	ts := ctx.Txn.CommitTimestamp()
 	if ts == (hlc.Timestamp{}) {
-		panic("zero cluster timestamp in txn")
+		panic(pgerror.NewAssertionErrorf("zero cluster timestamp in txn"))
 	}
 	return TimestampToDecimal(ts)
 }
@@ -2667,7 +2705,7 @@ func (ctx *EvalContext) GetTxnTimestamp(precision time.Duration) *DTimestampTZ {
 	// TODO(knz): a zero timestamp should never be read, even during
 	// Prepare. This will need to be addressed.
 	if !ctx.PrepareOnly && ctx.TxnTimestamp.IsZero() {
-		panic("zero transaction timestamp in EvalContext")
+		panic(pgerror.NewAssertionErrorf("zero transaction timestamp in EvalContext"))
 	}
 	return MakeDTimestampTZ(ctx.TxnTimestamp, precision)
 }
@@ -2678,7 +2716,7 @@ func (ctx *EvalContext) GetTxnTimestampNoZone(precision time.Duration) *DTimesta
 	// TODO(knz): a zero timestamp should never be read, even during
 	// Prepare. This will need to be addressed.
 	if !ctx.PrepareOnly && ctx.TxnTimestamp.IsZero() {
-		panic("zero transaction timestamp in EvalContext")
+		panic(pgerror.NewAssertionErrorf("zero transaction timestamp in EvalContext"))
 	}
 	return MakeDTimestamp(ctx.TxnTimestamp, precision)
 }
@@ -2768,7 +2806,8 @@ func (expr *BinaryExpr) Eval(ctx *EvalContext) (Datum, error) {
 	}
 	if ctx.TestingKnobs.AssertBinaryExprReturnTypes {
 		if err := ensureExpectedType(expr.fn.ReturnType, res); err != nil {
-			return nil, errors.Wrapf(err, "binary op %q", expr.String())
+			return nil, pgerror.NewAssertionErrorWithWrappedErrf(err,
+				"binary op %q", expr)
 		}
 	}
 	return res, err
@@ -2867,7 +2906,7 @@ func queryOidWithJoin(
 	case *DString:
 		queryCol = info.nameCol
 	default:
-		panic(fmt.Sprintf("invalid argument to OID cast: %s", d))
+		return nil, pgerror.NewAssertionErrorf("invalid argument to OID cast: %s", d)
 	}
 	results, err := ctx.InternalExecutor.QueryRow(
 		ctx.Ctx(), "queryOidWithJoin",
@@ -2877,7 +2916,7 @@ func queryOidWithJoin(
 			info.tableName, info.nameCol, info.tableName, joinClause, queryCol, additionalWhere),
 		d)
 	if err != nil {
-		if _, ok := err.(*MultipleResultsError); ok {
+		if _, ok := errors.Cause(err).(*MultipleResultsError); ok {
 			return nil, pgerror.NewErrorf(pgerror.CodeAmbiguousAliasError,
 				"more than one %s named %s", info.objName, d)
 		}
@@ -3449,11 +3488,8 @@ func PerformCast(ctx *EvalContext, d Datum, t coltypes.CastTargetType) (Datum, e
 func (expr *IndirectionExpr) Eval(ctx *EvalContext) (Datum, error) {
 	var subscriptIdx int
 	for i, t := range expr.Indirection {
-		if t.Slice {
-			return nil, pgerror.UnimplementedWithIssueErrorf(32551, "ARRAY slicing in %s", expr)
-		}
-		if i > 0 {
-			return nil, pgerror.UnimplementedWithIssueErrorf(32552, "multidimensional ARRAY %s", expr)
+		if t.Slice || i > 0 {
+			return nil, pgerror.NewAssertionErrorf("unsupported feature should have been rejected during planning")
 		}
 
 		d, err := t.Begin.(TypedExpr).Eval(ctx)
@@ -3614,22 +3650,27 @@ func (expr *FuncExpr) Eval(ctx *EvalContext) (Datum, error) {
 
 	res, err := expr.fn.Fn(ctx, args)
 	if err != nil {
-		// If we are facing a retry error, in particular those generated
-		// by crdb_internal.force_retry(), propagate it unchanged, so that
-		// the executor can see it with the right type.
-		if _, ok := err.(*roachpb.TransactionRetryWithProtoRefreshError); ok {
-			return nil, err
-		}
 		// If we are facing an explicit error, propagate it unchanged.
 		fName := expr.Func.String()
 		if fName == `crdb_internal.force_error` {
 			return nil, err
 		}
-		return nil, pgerror.Wrap(err, pgerror.CodeDataExceptionError, fName+"()")
+		// Otherwise, wrap it with context.
+		newErr := pgerror.Wrapf(err, pgerror.CodeDataExceptionError, "%s()", log.Safe(fName))
+		if pgErr, ok := pgerror.GetPGCause(newErr); ok {
+			// Count function errors as it flows out of the system.  We need
+			// to have this inside a if because if we are facing a retry
+			// error, in particular those generated by
+			// crdb_internal.force_retry(), Wrap() will propagate it as a
+			// non-pgerror error (so that the executor can see it with the
+			// right type).
+			pgErr.TelemetryKey = fName + "()"
+		}
+		return nil, newErr
 	}
 	if ctx.TestingKnobs.AssertFuncExprReturnTypes {
 		if err := ensureExpectedType(expr.fn.FixedReturnType(), res); err != nil {
-			return nil, errors.Wrapf(err, "function %q", expr.String())
+			return nil, pgerror.NewAssertionErrorWithWrappedErrf(err, "function %q", expr)
 		}
 	}
 	return res, nil
@@ -3641,7 +3682,8 @@ func (expr *FuncExpr) Eval(ctx *EvalContext) (Datum, error) {
 func ensureExpectedType(exp types.T, d Datum) error {
 	if !(exp.FamilyEqual(types.Any) || d.ResolvedType().Equivalent(types.Unknown) ||
 		d.ResolvedType().Equivalent(exp)) {
-		return errors.Errorf("expected return type %q, got: %q", exp, d.ResolvedType())
+		return pgerror.NewAssertionErrorf(
+			"expected return type %q, got: %q", log.Safe(exp), log.Safe(d.ResolvedType()))
 	}
 	return nil
 }
@@ -3796,7 +3838,7 @@ func (expr *UnaryExpr) Eval(ctx *EvalContext) (Datum, error) {
 	}
 	if ctx.TestingKnobs.AssertUnaryExprReturnTypes {
 		if err := ensureExpectedType(expr.fn.ReturnType, res); err != nil {
-			return nil, errors.Wrapf(err, "unary op %q", expr.String())
+			return nil, pgerror.NewAssertionErrorWithWrappedErrf(err, "unary op %q", expr)
 		}
 	}
 	return res, err
@@ -3851,8 +3893,9 @@ func arrayOfType(typ types.T) (*DArray, error) {
 	if !ok {
 		return nil, pgerror.NewAssertionErrorf("array node type (%v) is not types.TArray", typ)
 	}
-	if !types.IsValidArrayElementType(arrayTyp.Typ) {
-		return nil, pgerror.NewErrorf(pgerror.CodeFeatureNotSupportedError, "arrays of %s not allowed", arrayTyp.Typ)
+	if ok, issueNum := types.IsValidArrayElementType(arrayTyp.Typ); !ok {
+		return nil, pgerror.UnimplementedWithIssueDetailErrorf(issueNum, arrayTyp.Typ.String(),
+			"arrays of %s not allowed", arrayTyp.Typ)
 	}
 	return NewDArray(arrayTyp.Typ), nil
 }
@@ -4479,7 +4522,8 @@ func replaceCustomEscape(s string, escape rune) (string, error) {
 			} else {
 				// Escape character is the last character in s which is an error
 				// that must have been caught in calculateLengthAfterReplacingCustomEscape.
-				panic("unexpected: escape character is the last one in replaceCustomEscape.")
+				return "", pgerror.NewAssertionErrorf(
+					"unexpected: escape character is the last one in replaceCustomEscape.")
 			}
 		} else if s[sIndex] == '\\' {
 			// We encountered a backslash, so we need to look ahead to figure out how
@@ -4487,7 +4531,8 @@ func replaceCustomEscape(s string, escape rune) (string, error) {
 			if sIndex+1 == sLen {
 				// This case should never be reached since it should
 				// have been caught in calculateLengthAfterReplacingCustomEscape.
-				panic("unexpected: a single backslash encountered in replaceCustomEscape.")
+				return "", pgerror.NewAssertionErrorf(
+					"unexpected: a single backslash encountered in replaceCustomEscape.")
 			} else if s[sIndex+1] == '\\' {
 				// We want to escape '\\' to `\\\\` for correct processing later by unescapePattern. See (3).
 				// Since we've added four characters to ret, we advance retIndex by 4.
@@ -4509,7 +4554,8 @@ func replaceCustomEscape(s string, escape rune) (string, error) {
 					if sIndex+2 == sLen {
 						// Escape character is the last character in s which is an error
 						// that must have been caught in calculateLengthAfterReplacingCustomEscape.
-						panic("unexpected: escape character is the last one in replaceCustomEscape.")
+						return "", pgerror.NewAssertionErrorf(
+							"unexpected: escape character is the last one in replaceCustomEscape.")
 					}
 					if sIndex+4 <= sLen {
 						if s[sIndex+2] == '\\' && string(s[sIndex+3]) == string(escape) {

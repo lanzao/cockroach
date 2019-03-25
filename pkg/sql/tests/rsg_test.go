@@ -387,6 +387,7 @@ var ignoredErrorPatterns = []string{
 	"out of int64 range",
 	"underflow, subnormal",
 	"overflow",
+	"requested length too large",
 	// Type checking
 	"value type .* doesn't match type .* of column",
 	"incompatible value type",
@@ -418,6 +419,7 @@ var ignoredErrorPatterns = []string{
 	"cannot get array length of a non-array",
 	"cannot be called on a non-array",
 	"cannot call json_object_keys on an array",
+	"cannot set path in scalar",
 	// Builtins that have funky preconditions
 	"cannot delete from scalar",
 	"lastval is not yet defined",
@@ -425,10 +427,16 @@ var ignoredErrorPatterns = []string{
 	"non-positive substring length",
 	"bit strings of different sizes",
 	"inet addresses with different sizes",
+	"zero length IP",
 	"values of different sizes",
 	"must have even number of elements",
 	"cannot take logarithm of a negative number",
 	"input value must be",
+	"formats are supported for decode",
+	"only available in ccl",
+	"expect comma-separated list of filename",
+	"unknown constraint",
+	"invalid destination encoding name",
 }
 
 var ignoredRegex = regexp.MustCompile(strings.Join(ignoredErrorPatterns, "|"))
@@ -463,7 +471,7 @@ func TestRandomSyntaxSQLSmith(t *testing.T) {
 			if err := db.exec(ctx, "USE defaultdb"); err != nil {
 				t.Fatalf("couldn't reconnect to db after crasher: %v", c)
 			}
-			fmt.Printf("CRASHER:\n%s\ncaused by: %s\nserver stacktrace:\n%s\n\n", s, c.Error(), c.detail)
+			fmt.Printf("CRASHER:\ncaused by: %s\n\nSTATEMENT:\n%s;\n\nserver stacktrace:\n%s\n\n", c.Error(), s, c.detail)
 			return c
 		}
 		if err == nil {
